@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Tincan">
+  <defs>
+    <clipPath id="a-gap"><path clip-rule="evenodd" d="M0 0H256V256H0ZM87 128A71 71 0 0 1 229 128L195 128A37 37 0 0 0 121 128Z"/></clipPath>
+    <clipPath id="b-gap"><path clip-rule="evenodd" d="M0 0H256V256H0ZM27 128A71 71 0 0 0 169 128L135 128A37 37 0 0 1 61 128Z"/></clipPath>
+  </defs>
+  <path d="M49.7 161.8L21.8 214.1L70.3 180.1Z" fill="currentColor"/>
+  <circle cx="98" cy="128" r="54" fill="none" stroke="currentColor" stroke-width="22" clip-path="url(#a-gap)"/>
+  <circle cx="158" cy="128" r="54" fill="none" stroke="currentColor" stroke-width="22" clip-path="url(#b-gap)"/>
+</svg>

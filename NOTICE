@@ -1,0 +1,25 @@
+Tincan bundles third-party software. Their licences apply to the parts
+they cover and are reproduced here as those licences require.
+
+tailcat, tailscale.com — BSD 3-Clause, Copyright (c) 2020 Tailscale Inc
+& contributors. The transport (WireGuard data plane, DERP relaying, NAT
+traversal) comes from these. See LICENSE for the text.
+
+wireguard-go — MIT, Copyright (c) 2017-2023 WireGuard LLC.
+
+gVisor — Apache License 2.0, Copyright The gVisor Authors. The userspace
+TCP/IP stack.
+
+Go standard library and golang.org/x — BSD 3-Clause, Copyright (c) 2009
+The Go Authors.
+
+Flutter and Dart — BSD 3-Clause, Copyright 2014 The Flutter Authors.
+
+Schibsted Grotesk and IBM Plex Mono — SIL Open Font License 1.1.
+
+Flutter packages (archive, ffi, file_selector, flutter_secure_storage,
+flutter_svg, image, local_auth, mobile_scanner, open_filex, path,
+path_provider, qr_flutter, zxing2) — BSD, MIT or Apache 2.0; see each
+package's LICENSE in the Dart package cache or on pub.dev.
+
+Run `flutter pub deps` for the full dependency tree.

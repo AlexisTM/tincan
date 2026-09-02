@@ -1,0 +1,108 @@
+# ── Editors & OS ─────────────────────────────────────────────────────
+*.iml
+*.ipr
+*.iws
+*.swp
+*~
+.DS_Store
+.atom/
+.classpath
+.history
+.idea/
+.project
+.settings/
+.vscode/*
+!.vscode/launch.json
+!.vscode/settings.json
+Thumbs.db
+desktop.ini
+
+# ── Secrets ──────────────────────────────────────────────────────────
+# Never commit an identity: the account file holds a private key.
+*.pem
+*.p12
+*.jks
+*.keystore
+*.env
+.env.*
+tincan-account*.json
+secrets.*
+
+# ── Dart / Flutter ───────────────────────────────────────────────────
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+build/
+coverage/
+doc/api/
+*.class
+*.lock.orig
+# pubspec.lock IS committed: this is an application, not a library.
+
+# ── Go ───────────────────────────────────────────────────────────────
+gobridge/build/
+*.test
+*.out
+vendor/
+
+# Native libraries built by gobridge/build*.sh, not sources.
+android/app/src/main/jniLibs/
+*.so
+*.dylib
+*.dll
+
+# ── Android ──────────────────────────────────────────────────────────
+android/.gradle/
+android/captures/
+android/gradlew
+android/gradlew.bat
+android/gradle/wrapper/gradle-wrapper.jar
+android/local.properties
+android/key.properties
+android/app/debug/
+android/app/profile/
+android/app/release/
+android/**/GeneratedPluginRegistrant.java
+# gradle.properties IS committed: it pins the JDK the Android Gradle
+# plugin needs (see README), which is a build requirement, not a
+# personal preference.
+
+# ── iOS / macOS ──────────────────────────────────────────────────────
+**/ios/Flutter/.last_build_id
+**/ios/Flutter/App.framework
+**/ios/Flutter/Flutter.framework
+**/ios/Flutter/Flutter.podspec
+**/ios/Flutter/Generated.xcconfig
+**/ios/Flutter/ephemeral/
+**/ios/Flutter/flutter_export_environment.sh
+**/ios/ServiceDefinitions.json
+**/ios/Runner/GeneratedPluginRegistrant.*
+**/macos/Flutter/GeneratedPluginRegistrant.swift
+**/macos/Flutter/ephemeral/
+**/Pods/
+**/*.xcworkspace/xcuserdata/
+**/xcuserdata/
+*.moved-aside
+*.pbxuser
+*.perspectivev3
+
+# ── Linux / Windows desktop ──────────────────────────────────────────
+linux/flutter/ephemeral/
+windows/flutter/ephemeral/
+**/generated_plugin_registrant.*
+**/generated_plugins.cmake
+
+# ── Web ──────────────────────────────────────────────────────────────
+lib/generated_plugin_registrant.dart
+
+# ── This project ─────────────────────────────────────────────────────
+# The upstream transport, cloned separately (see README); it carries
+# its own git history and is not ours to vendor.
+/tailcat/
+# Scratch space.
+/scratch/
+*.orig
+*.rej

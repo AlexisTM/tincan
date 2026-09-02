@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Tincan">
+  <defs><clipPath id="under"><rect x="104" y="124" width="48" height="80"/></clipPath></defs>
+  <rect x="16" y="16" width="224" height="224" rx="56" fill="#137C7A"/>
+  <path d="M64.7 151.5L46 198L81.5 166.4Z" fill="#FFFFFF"/>
+  <circle cx="104" cy="124" r="44" fill="none" stroke="#FFFFFF" stroke-width="18"/>
+  <circle cx="152" cy="124" r="44" fill="none" stroke="#F08B3E" stroke-width="18"/>
+  <circle cx="104" cy="124" r="44" fill="none" stroke="#FFFFFF" stroke-width="18" clip-path="url(#under)"/>
+</svg>

@@ -1,0 +1,11 @@
+{
+  "artboards": [
+    { "file": "Main.dc.html", "x": 0, "y": 0, "w": 1280, "h": 820, "title": "Linux desktop — chat" },
+    { "file": "NewChat.dc.html", "x": 1360, "y": 0, "w": 900, "h": 640, "title": "Start a conversation" },
+    { "file": "Mobile.dc.html", "x": 2340, "y": 0, "w": 390, "h": 844, "title": "Mobile — chat + emoji" }
+  ],
+  "annotations": [
+    { "id": "brief", "x": 0, "y": -170, "w": 400, "text": "Tailchat — peer-to-peer chat: end-to-end WireGuard, NAT traversal, DERP relay fallback.\nDirection: “Warm den” — warm paper + copper, dark sidebar, the connection path always visible.\nStatic mockups — Linux desktop first, phone alongside." }
+  ],
+  "launch": { "view": "canvas" }
+}

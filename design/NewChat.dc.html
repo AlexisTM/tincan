@@ -1,0 +1,67 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Schibsted+Grotesk:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
+  <style>
+    body { margin: 0; background: #ece3d4; font-family: 'Schibsted Grotesk', system-ui, sans-serif; }
+    a { color: #a64f26; }
+    a:hover { color: #8a3f1c; }
+    ::placeholder { color: #a49a88; }
+  </style>
+</helmet>
+<div style="position:relative;width:900px;height:640px;background:linear-gradient(180deg,#f0e9db 0%,#e5dac7 100%);color:#262019;overflow:hidden;">
+
+  <div style="position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:660px;background:#fffdf8;border:1px solid #e8dfcd;border-radius:18px;box-shadow:0 24px 64px rgba(60,42,20,0.18);padding:28px;display:flex;flex-direction:column;gap:22px;">
+
+    <div style="display:flex;align-items:flex-start;gap:12px;">
+      <div style="flex:1;display:flex;flex-direction:column;gap:5px;">
+        <span style="font-size:20px;font-weight:700;">Start a conversation</span>
+        <span style="font-size:13px;color:#77705f;">No accounts, no sign-in — you connect straight to a peer.</span>
+      </div>
+      <div style="width:36px;height:36px;display:flex;align-items:center;justify-content:center;border-radius:9px;border:1px solid #e8dfcd;">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#77705f" stroke-width="1.8" stroke-linecap="round">
+          <path d="M6 6l12 12M18 6L6 18"/>
+        </svg>
+      </div>
+    </div>
+
+    <div style="display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));gap:0;">
+      <div style="display:flex;flex-direction:column;gap:12px;padding-right:24px;">
+        <span style="font-size:14px;font-weight:650;">Share your address</span>
+        <div style="background:#f7f1e6;border:1px solid #eadfca;border-radius:12px;padding:12px 14px;font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:12.5px;line-height:1.55;color:#4a4335;word-break:break-all;">tcomFwWCCcjS5nKNqAod034nWoJZW0LZqDhhC8U_dKdnDRYQ8uNGFpGQEu</div>
+        <div style="display:flex;align-items:center;justify-content:center;gap:8px;height:40px;border-radius:10px;background:#b4572b;color:#fff7ef;font-size:13.5px;font-weight:600;">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="9" y="9" width="11" height="11" rx="2"/>
+            <path d="M5 15V6a2 2 0 0 1 2-2h9"/>
+          </svg>
+          <span>Copy address</span>
+        </div>
+        <span style="font-size:12px;line-height:1.5;color:#77705f;">Saved key “default” — this address stays the same across restarts. <a href="#" style="font-weight:600;">Use a one-time address</a></span>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:12px;border-left:1px solid #eee3d0;padding-left:24px;">
+        <span style="font-size:14px;font-weight:650;">Connect to a peer</span>
+        <input placeholder="tc… address or DNS name" style="height:42px;border-radius:10px;border:1px solid #e0d6c2;background:#ffffff;padding:0 14px;font-family:'IBM Plex Mono',ui-monospace,monospace;font-size:12.5px;color:#262019;outline:none;">
+        <div style="display:flex;align-items:center;justify-content:center;height:40px;border-radius:10px;background:#b4572b;color:#fff7ef;font-size:13.5px;font-weight:600;">Connect</div>
+        <span style="font-size:12px;line-height:1.5;color:#77705f;">A DNS name works if it publishes a tailchat TXT record. Anyone with your address can message you — share it like a phone number.</span>
+      </div>
+    </div>
+
+    <div style="display:flex;align-items:center;gap:9px;border-top:1px solid #eee3d0;padding-top:16px;">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#77705f" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="5.5" y="11" width="13" height="9" rx="2"/>
+        <path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3"/>
+      </svg>
+      <span style="font-size:12px;color:#77705f;">End-to-end encrypted over WireGuard. Peer-to-peer when NAT traversal succeeds — otherwise relayed through DERP.</span>
+    </div>
+  </div>
+</div>
+</x-dc>
+</body>
+</html>
