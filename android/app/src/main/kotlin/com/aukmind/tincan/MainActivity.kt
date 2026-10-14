@@ -12,6 +12,7 @@ import android.provider.OpenableColumns
 import androidx.activity.result.contract.ActivityResultContracts
 import io.flutter.embedding.android.FlutterFragmentActivity
 import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
 import java.net.NetworkInterface
@@ -49,6 +50,16 @@ class MainActivity : FlutterFragmentActivity() {
         io.shutdown()
         super.onDestroy()
     }
+
+    // One engine for the process: Back destroys the activity, but the app
+    // must keep handling messages and notifying while the service runs.
+    override fun provideFlutterEngine(context: android.content.Context): FlutterEngine {
+        val cache = FlutterEngineCache.getInstance()
+        return cache.get(ENGINE_ID)
+            ?: FlutterEngine(context.applicationContext).also { cache.put(ENGINE_ID, it) }
+    }
+
+    override fun shouldDestroyEngineWithHost(): Boolean = false
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
@@ -205,5 +216,9 @@ class MainActivity : FlutterFragmentActivity() {
             }
         } catch (_: Exception) {}
         return out
+    }
+
+    companion object {
+        private const val ENGINE_ID = "main"
     }
 }

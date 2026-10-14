@@ -6,6 +6,7 @@ import 'package:tincan/src/app_state.dart';
 import 'package:tincan/src/bridge.dart';
 import 'package:tincan/src/chat_store.dart';
 import 'package:tincan/src/models.dart';
+import 'package:tincan/src/notifier.dart';
 import 'package:tincan/src/settings.dart';
 
 class FakeBridge implements Bridge {
@@ -135,13 +136,36 @@ class FakeBridge implements Bridge {
   Future<List<(String, String)>> listBlocked() async => const [];
 }
 
+class FakeNotifier implements Notifier {
+  final shown = <(String, String, String)>[];
+  final cleared = <String>[];
+
+  @override
+  Future<void> init(void Function(String peer) onOpen) async {}
+
+  @override
+  Future<void> requestPermission() async {}
+
+  @override
+  Future<void> message(String peer, String title, String line) async =>
+      shown.add((peer, title, line));
+
+  @override
+  Future<void> request(String peer, String name) async => shown.add((peer, 'request', name));
+
+  @override
+  Future<void> clear(String peer) async => cleared.add(peer);
+}
+
 void main() {
   late FakeBridge bridge;
+  late FakeNotifier notifier;
   late AppState state;
 
   setUp(() {
     bridge = FakeBridge();
-    state = AppState(bridge);
+    notifier = FakeNotifier();
+    state = AppState(bridge, notifier: notifier);
   });
 
   test('peer lifecycle drives conversation state', () {
@@ -395,5 +419,36 @@ void main() {
 
     expect(await state.saveSettings(Settings(derpHost: 'mine.example')), isNull);
     expect((state.settings.derpHost, state.selfAddress), ('mine.example', 'tcRELAY'));
+  });
+
+  test('incoming messages notify unless that conversation is on screen', () {
+    state.handleEvent({'type': 'peer-added', 'peer': 'nk:1', 'name': 'nia'});
+    state.handleEvent({'type': 'peer-added', 'peer': 'nk:2', 'name': 'sam'});
+    state.select('nk:1');
+
+    state.handleEvent({'type': 'message', 'peer': 'nk:1', 'id': 'a', 'body': 'seen'});
+    state.handleEvent({'type': 'message', 'peer': 'nk:2', 'id': 'b', 'body': 'hi'});
+    state.handleEvent({'type': 'file-begin', 'peer': 'nk:2', 'id': 'c', 'kind': 'image', 'name': 'x.jpg', 'size': 3});
+    expect(notifier.shown, [('nk:2', 'sam', 'hi'), ('nk:2', 'sam', '📷 Photo')]);
+
+    state.foreground = false;
+    state.handleEvent({'type': 'message', 'peer': 'nk:1', 'id': 'd', 'body': 'away'});
+    expect(notifier.shown.last, ('nk:1', 'nia', 'away'));
+  });
+
+  test('opening a conversation clears its notification', () {
+    state.handleEvent({'type': 'peer-added', 'peer': 'nk:1', 'name': 'nia'});
+    state.select('nk:1');
+    expect(notifier.cleared, ['nk:1']);
+  });
+
+  test('contact requests notify only while away, and clear when withdrawn', () {
+    state.handleEvent({'type': 'peer-request', 'peer': 'nk:3', 'name': 'dana'});
+    expect(notifier.shown, isEmpty);
+    state.foreground = false;
+    state.handleEvent({'type': 'peer-request', 'peer': 'nk:4', 'name': ''});
+    expect(notifier.shown.single.$1, 'nk:4');
+    state.handleEvent({'type': 'peer-request-gone', 'peer': 'nk:4'});
+    expect(notifier.cleared, ['nk:4']);
   });
 }

@@ -89,9 +89,9 @@ class TincanService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
         )
         return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("Tincan is connected")
-            .setContentText("Receiving messages in the background")
-            .setSmallIcon(android.R.drawable.stat_notify_chat)
+            .setContentTitle("Tincan is listening")
+            .setContentText("New messages will arrive while you're away")
+            .setSmallIcon(R.drawable.ic_notification)
             .setContentIntent(tap)
             .setOngoing(true)
             .build()

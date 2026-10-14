@@ -17,14 +17,23 @@ import 'chat_store.dart';
 import 'files.dart';
 import 'images.dart';
 import 'models.dart';
+import 'notifier.dart';
 import 'profile.dart';
 import 'settings.dart';
 import 'vault.dart';
 
 class AppState extends ChangeNotifier {
-  AppState(this._bridge);
+  AppState(this._bridge, {Notifier? notifier}) : _notifier = notifier ?? SystemNotifier();
 
   final Bridge _bridge;
+  final Notifier _notifier;
+
+  /// Whether the user is looking at the app. The engine only ever
+  /// starts with its window up.
+  bool _foreground = true;
+
+  @visibleForTesting
+  set foreground(bool v) => _foreground = v;
 
   String? selfAddress;
   String selfName = '';
@@ -152,7 +161,9 @@ class AppState extends ChangeNotifier {
       // The debounced history write must not die with the app.
       _lifecycle = AppLifecycleListener(
         onStateChange: (s) {
-          if (s != AppLifecycleState.resumed) unawaited(_store?.flush());
+          _foreground = s == AppLifecycleState.resumed;
+          if (!_foreground) unawaited(_store?.flush());
+          if (_foreground && selectedId != null) unawaited(_notifier.clear(selectedId!));
         },
         onExitRequested: () async {
           await _store?.flush();
@@ -171,6 +182,8 @@ class AppState extends ChangeNotifier {
         });
         await _feedInterfaces(await _netifChannel.invokeMethod<List<dynamic>>('list'));
       }
+      await _notifier.init(_openFromNotification);
+      unawaited(_notifier.requestPermission());
       _bridge.events.listen(handleEvent);
       unawaited(_startTransport());
     } catch (e, st) {
@@ -431,7 +444,24 @@ class AppState extends ChangeNotifier {
   void select(String? id) {
     selectedId = id;
     conversations[id]?.unread = 0;
+    if (id != null) unawaited(_notifier.clear(id));
     notifyListeners();
+  }
+
+  void _openFromNotification(String peer) {
+    if (conversations.containsKey(peer)) select(peer);
+  }
+
+  /// Unless the user is already reading that conversation.
+  void _notifyIncoming(Conversation convo, ChatMessage msg) {
+    if (_foreground && selectedId == convo.id) return;
+    final line = switch (msg.kind) {
+      MessageKind.text => msg.body,
+      MessageKind.image => '📷 Photo',
+      MessageKind.video => '🎬 Video',
+      _ => '📎 ${msg.name ?? 'File'}',
+    };
+    unawaited(_notifier.message(convo.id, convo.name, line));
   }
 
   /// Dials a raw tc… address or a shared profile blob.
@@ -665,12 +695,15 @@ class AppState extends ChangeNotifier {
 
       case 'peer-request':
         final id = ev['peer'] as String;
+        final request = ChatRequest(peer: id, name: ev['name'] as String? ?? '');
         requests
           ..removeWhere((r) => r.peer == id)
-          ..add(ChatRequest(peer: id, name: ev['name'] as String? ?? ''));
+          ..add(request);
+        if (!_foreground) unawaited(_notifier.request(id, request.displayName));
 
       case 'peer-request-gone':
         requests.removeWhere((r) => r.peer == ev['peer']);
+        unawaited(_notifier.clear(ev['peer'] as String));
 
       case 'peer-pending' || 'peer-accepted':
         convo?.remotePending = ev['type'] == 'peer-pending';
@@ -754,31 +787,31 @@ class AppState extends ChangeNotifier {
       case 'message':
         if (convo == null) return;
         save = true;
-        app = _receive(
-            convo,
-            ChatMessage(
-              id: ev['id'] as String? ?? newMessageId(),
-              outgoing: false,
-              ts: _evTs(ev),
-              kind: MessageKind.text,
-              body: ev['body'] as String? ?? '',
-            ));
+        final msg = ChatMessage(
+          id: ev['id'] as String? ?? newMessageId(),
+          outgoing: false,
+          ts: _evTs(ev),
+          kind: MessageKind.text,
+          body: ev['body'] as String? ?? '',
+        );
+        app = _receive(convo, msg);
+        _notifyIncoming(convo, msg);
 
       case 'file-begin':
         if (convo == null) return;
         save = true;
-        app = _receive(
-            convo,
-            ChatMessage(
-              id: ev['id'] as String,
-              outgoing: false,
-              ts: _evTs(ev),
-              kind: kindFromWire(ev['kind'] as String?),
-              name: ev['name'] as String?,
-              size: (ev['size'] as num?)?.toInt(),
-              progress: 0,
-              status: MessageStatus.sending,
-            ));
+        final msg = ChatMessage(
+          id: ev['id'] as String,
+          outgoing: false,
+          ts: _evTs(ev),
+          kind: kindFromWire(ev['kind'] as String?),
+          name: ev['name'] as String?,
+          size: (ev['size'] as num?)?.toInt(),
+          progress: 0,
+          status: MessageStatus.sending,
+        );
+        app = _receive(convo, msg);
+        _notifyIncoming(convo, msg);
 
       case 'file-progress':
         final msg = convo?.messageById(ev['id'] as String);

@@ -66,12 +66,12 @@ class BackgroundController with WidgetsBindingObserver {
       return;
     }
     if (!_sawResumed) return; // still starting up
-    if (_backgrounded(state)) {
+    // detached: Back closed the activity, but the engine and transport
+    // live on with the process, so it counts as backgrounded.
+    if (_backgrounded(state) || state == AppLifecycleState.detached) {
       // Not debounced: Android only allows starting a foreground service
       // in the short grace period after leaving the foreground.
       _applyBackgroundPolicy();
-    } else if (state == AppLifecycleState.detached) {
-      _stopService();
     }
     // inactive: leave whatever is running alone.
   }
