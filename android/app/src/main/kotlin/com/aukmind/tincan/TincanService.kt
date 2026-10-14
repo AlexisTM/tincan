@@ -46,8 +46,7 @@ class TincanService : Service() {
         try {
             startForeground(NOTIFICATION_ID, buildNotification())
         } catch (e: Exception) {
-            // Out of the daily dataSync allowance, or started from the
-            // background where Android refuses it.
+            // Started from the background, where Android refuses it.
             Log.w("Tincan", "background service refused: $e")
             stopSelf()
             return START_NOT_STICKY
@@ -69,13 +68,6 @@ class TincanService : Service() {
         // Not sticky: a restart after the process dies would hold the
         // notification up with no transport behind it.
         return START_NOT_STICKY
-    }
-
-    // Android 15 ends dataSync services that hit the daily cap here, and
-    // crashes the app if they don't stop promptly.
-    override fun onTimeout(startId: Int, fgsType: Int) {
-        Log.i("Tincan", "background allowance used up, stopping")
-        stopSelf()
     }
 
     override fun onDestroy() {

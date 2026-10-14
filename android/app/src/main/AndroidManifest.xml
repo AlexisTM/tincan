@@ -7,7 +7,7 @@
     <uses-feature android:name="android.hardware.camera" android:required="false"/>
     <!-- Keeping the transport connected while the screen is off. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_REMOTE_MESSAGING"/>
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application
         android:label="Tincan"
@@ -43,7 +43,7 @@
         <service
             android:name=".TincanService"
             android:exported="false"
-            android:foregroundServiceType="dataSync"/>
+            android:foregroundServiceType="remoteMessaging"/>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

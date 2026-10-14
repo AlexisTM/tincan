@@ -3,9 +3,7 @@ import 'package:path/path.dart' as p;
 
 import 'bridge.dart';
 
-/// Android kills an app that holds a foreground service too long, and
-/// caps the dataSync type at a few hours a day, so an unbounded window
-/// is not on offer. An hour also bounds the battery cost.
+/// Bounds the battery cost of holding the connection open.
 const maxBackgroundMinutes = 60;
 
 class Settings {

@@ -77,10 +77,9 @@ Background receiving is a setting (the gear in the sidebar): **Never**,
 or **for up to an hour after leaving the app** (15 minutes by default).
 It runs a foreground service with a quiet ongoing notification, which is
 the only way Android keeps a process alive, and does no work of its own
-beyond holding the connection the transport already has. The hour cap is
-deliberate: Android limits how long a `dataSync` service may run per day
-and kills apps that overstay, so an unbounded option would break rather
-than help.
+beyond holding the connection the transport already has. The service is
+declared as `remoteMessaging`, Android's type for relaying messages
+between devices; the hour cap bounds the battery cost.
 
 The same settings page takes a relay of your own, by hostname or by
 relay-map URL, instead of the default Tailscale-run relays. Changing it
