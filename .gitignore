@@ -106,3 +106,4 @@ lib/generated_plugin_registrant.dart
 /scratch/
 *.orig
 *.rej
+.puffins/
