@@ -7,6 +7,12 @@ import 'package:qr/qr.dart';
 import 'package:tincan/src/profile.dart';
 import 'package:tincan/src/qr_util.dart';
 
+Directory _tempDir(String prefix) {
+  final dir = Directory.systemTemp.createTempSync(prefix);
+  addTearDown(() => dir.deleteSync(recursive: true));
+  return dir;
+}
+
 void main() {
   test('a rendered profile QR decodes back to the same blob', () async {
     const blob = 'tincan:eyJ2IjoxLCJuYW1lIjoibmlhIiwiYWRkciI6InRjWFlaIn0';
@@ -30,7 +36,7 @@ void main() {
         }
       }
     }
-    final path = '${Directory.systemTemp.createTempSync('tcqr').path}/qr.png';
+    final path = '${_tempDir('tcqr').path}/qr.png';
     File(path).writeAsBytesSync(img.encodePng(image));
 
     final decoded = await decodeQrFromImageFile(path);
@@ -56,14 +62,14 @@ void main() {
           x2: rnd.nextInt(900), y2: rnd.nextInt(1600),
           color: img.ColorRgb8(rnd.nextInt(256), rnd.nextInt(256), rnd.nextInt(256)));
     }
-    final path = '${Directory.systemTemp.createTempSync('tcnoqr').path}/noise.png';
+    final path = '${_tempDir('tcnoqr').path}/noise.png';
     File(path).writeAsBytesSync(img.encodePng(noisy));
 
     expect(await decodeQrFromImageFile(path), isNull);
   });
 
   test('a non-image file returns null', () async {
-    final path = '${Directory.systemTemp.createTempSync('tcnotimg').path}/x.png';
+    final path = '${_tempDir('tcnotimg').path}/x.png';
     File(path).writeAsStringSync('definitely not a png');
     expect(await decodeQrFromImageFile(path), isNull);
   });

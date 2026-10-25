@@ -5,6 +5,9 @@ import 'dart:convert';
 class ShareableProfile {
   const ShareableProfile({required this.name, required this.address});
 
+  /// Matches the nickname field.
+  static const maxNameLength = 40;
+
   final String name;
   final String address;
 
@@ -21,8 +24,9 @@ class ShareableProfile {
       final map = jsonDecode(utf8.decode(base64Url.decode(b64)));
       final addr = map['addr'];
       final name = map['name'];
-      if (addr is! String || !addr.startsWith('tc')) return null;
-      return ShareableProfile(name: name is String ? name : '', address: addr);
+      if (addr is! String || !_isAddress(addr)) return null;
+      final n = name is String ? String.fromCharCodes(name.runes.take(maxNameLength)) : '';
+      return ShareableProfile(name: n, address: addr);
     } catch (_) {
       return null;
     }
@@ -33,7 +37,7 @@ class ShareableProfile {
   String toVCard() {
     String esc(String s) => s
         .replaceAll('\\', '\\\\')
-        .replaceAll('\n', '\\n')
+        .replaceAll(RegExp(r'\r\n?|\n'), '\\n')
         .replaceAll(',', '\\,')
         .replaceAll(';', '\\;');
     return [
@@ -45,7 +49,24 @@ class ShareableProfile {
       'NOTE:${esc('Tincan address: $address (paste it into Tincan to start a chat)')}',
       'END:VCARD',
       '',
-    ].join('\r\n');
+    ].map(_fold).join('\r\n');
+  }
+
+  /// Folds at 75 octets as RFC 2425 asks, never inside a UTF-8 sequence.
+  static String _fold(String line) {
+    final out = StringBuffer();
+    var octets = 0;
+    for (final r in line.runes) {
+      final ch = String.fromCharCode(r);
+      final len = utf8.encode(ch).length;
+      if (octets + len > 75) {
+        out.write('\r\n ');
+        octets = 1;
+      }
+      out.write(ch);
+      octets += len;
+    }
+    return out.toString();
   }
 }
 
@@ -57,8 +78,10 @@ class ShareableProfile {
   if (profile != null) {
     return (token: profile.address, name: profile.name.isEmpty ? null : profile.name);
   }
-  if (s.startsWith('tc') && !s.contains(RegExp(r'\s'))) {
+  if (_isAddress(s)) {
     return (token: s, name: null);
   }
   return null;
 }
+
+bool _isAddress(String s) => s.startsWith('tc') && !s.contains(RegExp(r'\s'));

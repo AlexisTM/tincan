@@ -20,7 +20,13 @@ const _android = MethodChannel('tincan/files');
 /// Android that is a private copy of the chosen document.
 Future<String?> pickFile(List<XTypeGroup> groups, {List<String> mimeTypes = const ['*/*']}) async {
   if (Platform.isAndroid) {
-    return _android.invokeMethod<String>('pick', {'mimeTypes': mimeTypes});
+    try {
+      return await _android.invokeMethod<String>('pick', {'mimeTypes': mimeTypes});
+    } on PlatformException catch (e) {
+      // A picker is already open.
+      if (e.code == 'busy') return null;
+      rethrow;
+    }
   }
   return (await openFile(acceptedTypeGroups: groups))?.path;
 }
@@ -52,7 +58,7 @@ class SaveTarget {
     } catch (e) {
       err = '$e';
     } finally {
-      await _scratch?.delete(recursive: true);
+      await _scratch?.delete(recursive: true).then((_) {}, onError: (_) {});
     }
     // The picker already created an empty document; don't leave it.
     if (err != null && _uri != null) {
@@ -71,5 +77,6 @@ Future<SaveTarget?> chooseSaveTarget(String suggestedName, List<XTypeGroup> grou
   final uri = await _android.invokeMethod<String>('create', {'name': suggestedName});
   if (uri == null) return null;
   final scratch = await Directory.systemTemp.createTemp('tincan-save-');
-  return SaveTarget._(p.join(scratch.path, suggestedName), uri, scratch);
+  final safeName = suggestedName.replaceAll(RegExp(r'[/\\]'), '_');
+  return SaveTarget._(p.join(scratch.path, safeName), uri, scratch);
 }

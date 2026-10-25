@@ -12,16 +12,21 @@ import 'images.dart';
 /// The decoder is fussy about scale: full-resolution photos often fail
 /// where a downscaled copy reads fine, so try a few sizes.
 Future<String?> decodeQrFromImageFile(String path) async {
-  final bytes = await File(path).readAsBytes();
-  return Isolate.run(() => _decodeBytes(bytes));
+  try {
+    final bytes = await File(path).readAsBytes();
+    return await Isolate.run(() => _decodeBytes(bytes));
+  } catch (_) {
+    return null;
+  }
 }
 
 String? _decodeBytes(Uint8List bytes) {
   final img.Image? decoded;
   try {
     decoded = img.decodeImage(bytes);
-  } on img.ImageException {
-    // Garbage can sniff as TGA and claim absurd dimensions.
+  } catch (_) {
+    // Garbage can sniff as TGA and claim absurd dimensions, truncated
+    // files throw RangeError.
     return null;
   }
   return decoded == null ? null : decodeQrFromImage(decoded);
@@ -29,6 +34,8 @@ String? _decodeBytes(Uint8List bytes) {
 
 /// As [decodeQrFromImageFile], for an already-decoded image.
 String? decodeQrFromImage(img.Image decoded) {
+  // zxing ignores alpha, so transparent pixels would read as black.
+  decoded = flattenOnWhite(decoded);
   // Full size last: it's the slowest pass and the likeliest to fail.
   for (final maxSide in const [1200, 800, 1600, 0]) {
     final candidate = maxSide == 0
