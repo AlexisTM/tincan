@@ -60,9 +60,14 @@ class DialogScope extends StatelessWidget {
         body: Stack(children: [
           // The scaffold covers the barrier, so it takes over its tap.
           Positioned.fill(
-            child: GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: dismissible ? () => Navigator.of(context).maybePop() : null,
+            child: Semantics(
+              label: dismissible ? MaterialLocalizations.of(context).modalBarrierDismissLabel : null,
+              onDismiss: dismissible ? () => Navigator.of(context).maybePop() : null,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                excludeFromSemantics: true,
+                onTap: dismissible ? () => Navigator.of(context).maybePop() : null,
+              ),
             ),
           ),
           child,

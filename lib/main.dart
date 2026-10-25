@@ -48,7 +48,7 @@ class _Boot extends StatefulWidget {
 
 class _BootState extends State<_Boot> {
   final _bridge = TincanBridge();
-  late final AppState _state = AppState(_bridge);
+  late AppState _state = AppState(_bridge);
 
   String? _stateDir;
   String? _downloadDir;
@@ -119,6 +119,11 @@ class _BootState extends State<_Boot> {
     await _vault!.erase();
     final media = Directory(_downloadDir!);
     if (await media.exists()) await media.delete(recursive: true);
+    if (_open) {
+      // Erased from the relock screen: nothing of the old account carries over.
+      _state.dispose();
+      _state = AppState(_bridge);
+    }
     if (mounted) {
       setState(() {
         _needsSetup = true;
@@ -128,13 +133,7 @@ class _BootState extends State<_Boot> {
   }
 
   Future<void> _start() async {
-    if (_state.locked) {
-      // Erased while locked: the store is new, the app is already up.
-      _state.lockMode = _vault!.mode;
-      await _state.reopen();
-    } else {
-      await _state.init(stateDir: _stateDir!, downloadDir: _downloadDir!, vault: _vault!);
-    }
+    await _state.init(stateDir: _stateDir!, downloadDir: _downloadDir!, vault: _vault!);
     if (mounted) {
       setState(() {
         _needsSetup = false;
@@ -178,7 +177,9 @@ class _BootState extends State<_Boot> {
               onErase: _erase,
             );
           }
-          if (_state.needsName && !_state.starting) return NameStep(state: _state);
+          if (_state.needsName && !_state.starting && _state.startError == null) {
+            return NameStep(state: _state);
+          }
           return HomeScreen(state: _state);
         },
       );

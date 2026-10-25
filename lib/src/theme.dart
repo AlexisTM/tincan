@@ -110,10 +110,6 @@ class TincanColors extends ThemeExtension<TincanColors> {
   final Color relayAmber, relayAmberInk, relayAmberBg, relayAmberBorder;
   final Color offline, danger, dangerInk, dangerBg, dangerBorder, shadow;
 
-  // Contract names.
-  Color get inkSoft => inkMuted;
-  Color get line => border;
-
   /// QR codes scan best dark on white, whatever the theme.
   Color get qrBg => const Color(0xFFFFFFFF);
   Color get qrInk => Tc.brandNavy;
@@ -248,7 +244,66 @@ class TincanColors extends ThemeExtension<TincanColors> {
   TincanColors copyWith() => this;
 
   @override
-  TincanColors lerp(TincanColors? other, double t) => t < 0.5 || other == null ? this : other;
+  TincanColors lerp(TincanColors? other, double t) {
+    if (other == null) return this;
+    Color mix(Color a, Color b) => Color.lerp(a, b, t)!;
+    return TincanColors(
+      bg: mix(bg, other.bg),
+      panel: mix(panel, other.panel),
+      dialog: mix(dialog, other.dialog),
+      border: mix(border, other.border),
+      fieldBorder: mix(fieldBorder, other.fieldBorder),
+      field: mix(field, other.field),
+      fieldFill: mix(fieldFill, other.fieldFill),
+      ink: mix(ink, other.ink),
+      inkMuted: mix(inkMuted, other.inkMuted),
+      inkFaint: mix(inkFaint, other.inkFaint),
+      label: mix(label, other.label),
+      accent: mix(accent, other.accent),
+      accentInk: mix(accentInk, other.accentInk),
+      accentSoft: mix(accentSoft, other.accentSoft),
+      highlight: mix(highlight, other.highlight),
+      disabled: mix(disabled, other.disabled),
+      disabledInk: mix(disabledInk, other.disabledInk),
+      sidebar: mix(sidebar, other.sidebar),
+      sidebarCard: mix(sidebarCard, other.sidebarCard),
+      sidebarCardBorder: mix(sidebarCardBorder, other.sidebarCardBorder),
+      sidebarSelected: mix(sidebarSelected, other.sidebarSelected),
+      sidebarText: mix(sidebarText, other.sidebarText),
+      sidebarMuted: mix(sidebarMuted, other.sidebarMuted),
+      sidebarFaint: mix(sidebarFaint, other.sidebarFaint),
+      sidebarAddress: mix(sidebarAddress, other.sidebarAddress),
+      online: mix(online, other.online),
+      requestBg: mix(requestBg, other.requestBg),
+      requestBorder: mix(requestBorder, other.requestBorder),
+      acceptBg: mix(acceptBg, other.acceptBg),
+      acceptInk: mix(acceptInk, other.acceptInk),
+      refuseBg: mix(refuseBg, other.refuseBg),
+      refuseInk: mix(refuseInk, other.refuseInk),
+      bubbleIn: mix(bubbleIn, other.bubbleIn),
+      bubbleInBorder: mix(bubbleInBorder, other.bubbleInBorder),
+      bubbleOut: mix(bubbleOut, other.bubbleOut),
+      bubbleOutInk: mix(bubbleOutInk, other.bubbleOutInk),
+      mediaOut: mix(mediaOut, other.mediaOut),
+      mediaOutBorder: mix(mediaOutBorder, other.mediaOutBorder),
+      mediaPlaceholder: mix(mediaPlaceholder, other.mediaPlaceholder),
+      videoBg: mix(videoBg, other.videoBg),
+      directGreen: mix(directGreen, other.directGreen),
+      directGreenInk: mix(directGreenInk, other.directGreenInk),
+      directGreenBg: mix(directGreenBg, other.directGreenBg),
+      directGreenBorder: mix(directGreenBorder, other.directGreenBorder),
+      relayAmber: mix(relayAmber, other.relayAmber),
+      relayAmberInk: mix(relayAmberInk, other.relayAmberInk),
+      relayAmberBg: mix(relayAmberBg, other.relayAmberBg),
+      relayAmberBorder: mix(relayAmberBorder, other.relayAmberBorder),
+      offline: mix(offline, other.offline),
+      danger: mix(danger, other.danger),
+      dangerInk: mix(dangerInk, other.dangerInk),
+      dangerBg: mix(dangerBg, other.dangerBg),
+      dangerBorder: mix(dangerBorder, other.dangerBorder),
+      shadow: mix(shadow, other.shadow),
+    );
+  }
 }
 
 /// A button child that turns into a spinner while [busy].

@@ -30,6 +30,9 @@ class Sidebar extends StatefulWidget {
 
 class _SidebarState extends State<Sidebar> {
   final _query = PlainTextEditingController();
+  String? _hitsFor;
+  int? _hitsStamp;
+  List<(Conversation, ChatMessage)> _hits = const [];
 
   AppState get state => widget.state;
   bool get fullWidth => widget.fullWidth;
@@ -38,6 +41,19 @@ class _SidebarState extends State<Sidebar> {
   void dispose() {
     _query.dispose();
     super.dispose();
+  }
+
+  /// Rescans history only when the query or some chat's messages changed.
+  List<(Conversation, ChatMessage)> _search(String q) {
+    final stamp = Object.hashAll([
+      for (final c in state.conversations.values) ...[c.id, c.messages.length, c.messages.lastOrNull?.id],
+    ]);
+    if (q != _hitsFor || stamp != _hitsStamp) {
+      _hitsFor = q;
+      _hitsStamp = stamp;
+      _hits = state.search(q);
+    }
+    return _hits;
   }
 
   void _clearSearch() {
@@ -51,7 +67,7 @@ class _SidebarState extends State<Sidebar> {
     final tc = TincanColors.of(context);
     final ordered = state.ordered;
     final q = _query.text.trim();
-    final hits = q.isEmpty ? const <(Conversation, ChatMessage)>[] : state.search(q);
+    final hits = q.isEmpty ? const <(Conversation, ChatMessage)>[] : _search(q);
     return Container(
       width: fullWidth ? double.infinity : 288,
       color: tc.sidebar,
@@ -281,10 +297,13 @@ class _SearchHit extends StatelessWidget {
   Widget build(BuildContext context) {
     final tc = TincanColors.of(context);
     final text = msg.kind == MessageKind.text ? msg.body : msg.preview;
-    final at = text.toLowerCase().indexOf(query.toLowerCase());
+    final match = RegExp(RegExp.escape(query), caseSensitive: false).firstMatch(text);
+    final at = match?.start ?? -1;
     // Start a little before the match so it's on the first line.
-    final from = at > 24 ? at - 20 : 0;
-    final end = (at + query.length).clamp(0, text.length);
+    var from = at > 24 ? at - 20 : 0;
+    // Never between the halves of a surrogate pair.
+    if (from > 0 && text.codeUnitAt(from) & 0xFC00 == 0xDC00) from--;
+    final end = match?.end ?? 0;
     final base = TextStyle(fontSize: 12, height: 1.35, color: tc.sidebarMuted);
     final snippet = at < 0
         ? TextSpan(text: text, style: base)
@@ -622,13 +641,7 @@ Future<void> showRequestsDialog(BuildContext context, AppState state) {
 }
 
 Future<void> refuseRequest(BuildContext context, AppState state, ChatRequest request) async {
-  if (!await confirmDialog(context,
-          title: 'Block ${request.displayName}?',
-          body: 'They won\'t be able to contact you again. You can undo this later from the blocked peers list.',
-          action: 'Block') ||
-      !context.mounted) {
-    return;
-  }
+  if (!await confirmBlock(context, request.displayName) || !context.mounted) return;
   await showError(context, state.blockPeer(request.peer));
 }
 
@@ -706,13 +719,16 @@ class _RequestBody extends StatelessWidget {
               overflow: TextOverflow.ellipsis,
               style: TextStyle(fontSize: 12, height: 1.35, color: ink)),
         ),
-      Wrap(alignment: WrapAlignment.end, children: [
-        action('Accept', onSidebar ? tc.acceptInk : tc.directGreenInk,
-            () => showError(context, state.acceptRequest(request.peer))),
-        action('Ignore', muted, () => showError(context, state.ignoreRequest(request.peer))),
-        action('Block', onSidebar ? tc.refuseInk : tc.danger,
-            () => refuseRequest(context, state, request)),
-      ]),
+      Align(
+        alignment: Alignment.centerRight,
+        child: Wrap(alignment: WrapAlignment.end, children: [
+          action('Accept', onSidebar ? tc.acceptInk : tc.directGreenInk,
+              () => showError(context, state.acceptRequest(request.peer))),
+          action('Ignore', muted, () => showError(context, state.ignoreRequest(request.peer))),
+          action('Block', onSidebar ? tc.refuseInk : tc.danger,
+              () => refuseRequest(context, state, request)),
+        ]),
+      ),
     ]);
   }
 }
@@ -728,11 +744,22 @@ String linkLabel(Conversation c) => c.blocked
             null => 'connected',
           };
 
-class _ConversationTile extends StatelessWidget {
+class _ConversationTile extends StatefulWidget {
   const _ConversationTile({required this.state, required this.convo});
 
   final AppState state;
   final Conversation convo;
+
+  @override
+  State<_ConversationTile> createState() => _ConversationTileState();
+}
+
+class _ConversationTileState extends State<_ConversationTile> {
+  /// Kept across rebuilds, where the long-press menu opens.
+  Offset? _pressAt;
+
+  AppState get state => widget.state;
+  Conversation get convo => widget.convo;
 
   Future<void> _confirmDelete(BuildContext context) async {
     if (!await confirmDeleteConversation(context, convo.displayName) || !context.mounted) return;
@@ -786,7 +813,6 @@ class _ConversationTile extends StatelessWidget {
             ? tc.relayAmber
             : tc.online;
     final link = linkLabel(convo);
-    Offset? pressAt;
     return Material(
       color: selected ? tc.sidebarSelected : Colors.transparent,
       borderRadius: BorderRadius.circular(10),
@@ -795,8 +821,8 @@ class _ConversationTile extends StatelessWidget {
         child: InkWell(
           borderRadius: BorderRadius.circular(10),
           onTap: () => state.select(convo.id),
-          onTapDown: (d) => pressAt = d.globalPosition,
-          onLongPress: () => _menu(context, pressAt ?? Offset.zero),
+          onTapDown: (d) => _pressAt = d.globalPosition,
+          onLongPress: () => _menu(context, _pressAt ?? Offset.zero),
           onSecondaryTapUp: (d) => _menu(context, d.globalPosition),
           child: Padding(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 9),
@@ -808,27 +834,31 @@ class _ConversationTile extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Row(children: [
-                      Flexible(
-                        child: Text(convo.displayName,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: TextStyle(
-                                fontSize: 13.5,
-                                fontWeight: FontWeight.w600,
-                                color: tc.sidebarText)),
+                      Expanded(
+                        child: Row(children: [
+                          Flexible(
+                            child: Text(convo.displayName,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                    fontSize: 13.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: tc.sidebarText)),
+                          ),
+                          if (convo.verified)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 4),
+                              child: Icon(Icons.verified,
+                                  size: 13, color: tc.online, semanticLabel: 'verified'),
+                            ),
+                          if (convo.muted)
+                            Padding(
+                              padding: const EdgeInsets.only(left: 4),
+                              child: Icon(Icons.notifications_off_outlined,
+                                  size: 13, color: tc.sidebarFaint, semanticLabel: 'muted'),
+                            ),
+                        ]),
                       ),
-                      if (convo.verified)
-                        Padding(
-                          padding: const EdgeInsets.only(left: 4),
-                          child: Icon(Icons.verified, size: 13, color: tc.online, semanticLabel: 'verified'),
-                        ),
-                      if (convo.muted)
-                        Padding(
-                          padding: const EdgeInsets.only(left: 4),
-                          child: Icon(Icons.notifications_off_outlined,
-                              size: 13, color: tc.sidebarFaint, semanticLabel: 'muted'),
-                        ),
-                      const Spacer(),
                       const SizedBox(width: 8),
                       Text(last == null ? '' : formatTime(last.ts),
                           style: TextStyle(fontSize: 10.5, color: tc.sidebarFaint)),

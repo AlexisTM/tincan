@@ -535,13 +535,11 @@ void main() {
   });
 
   group('thread messages', () {
-    late SemanticsHandle semantics;
     Finder inThread(Finder f) => find.descendant(of: find.byType(ThreadView), matching: f);
 
     Future<AppState> openThread(WidgetTester tester) async {
       tester.view.physicalSize = const Size(1280, 820);
       tester.view.devicePixelRatio = 1;
-      semantics = tester.ensureSemantics();
       final state = _populatedState()..select('nk:1');
       await tester.pumpWidget(_app(HomeScreen(state: state)));
       await tester.pump();
@@ -567,7 +565,6 @@ void main() {
       await tester.pump(const Duration(milliseconds: 500));
       expect(state.conversations['nk:1']!.messageById('m1'), isNull);
       expect(inThread(find.text('morning! ⛰️')), findsNothing);
-      semantics.dispose();
     });
 
     testWidgets('reply shows in the composer, then quoted in the bubble', (tester) async {
@@ -584,7 +581,6 @@ void main() {
       expect(sent.replyTo, 'm1');
       expect(find.byTooltip('Cancel reply'), findsNothing);
       expect(find.bySemanticsLabel(RegExp('^Quote from Nia Okafor: morning')), findsOneWidget);
-      semantics.dispose();
     });
 
     testWidgets('reaction chips count, highlight mine, and toggle', (tester) async {
@@ -602,7 +598,6 @@ void main() {
       await tester.pump();
       expect(msg.reactionOf('me'), isNull);
       expect(find.text('❤️ 1'), findsOneWidget);
-      semantics.dispose();
     });
 
     testWidgets('outgoing messages label their delivery state', (tester) async {
@@ -632,7 +627,6 @@ void main() {
       }
       await longPressMessage(tester, 'msg 4');
       expect(find.text('Retry'), findsOneWidget);
-      semantics.dispose();
     });
   });
 }

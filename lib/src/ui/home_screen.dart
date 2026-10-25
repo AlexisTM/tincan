@@ -30,8 +30,12 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _focusSearch() {
     // On a phone the search box lives on the list screen.
-    if (state.selectedId != null && MediaQuery.sizeOf(context).width < 700) state.select(null);
-    WidgetsBinding.instance.addPostFrameCallback((_) => _search.requestFocus());
+    if (state.selectedId != null && MediaQuery.sizeOf(context).width < 700) {
+      state.select(null);
+      WidgetsBinding.instance.addPostFrameCallback((_) => _search.requestFocus());
+    } else {
+      _search.requestFocus();
+    }
   }
 
   void _step(int delta) {
@@ -57,8 +61,9 @@ class _HomeScreenState extends State<HomeScreen> {
           if (canLockNow(state)) state.lockNow();
         },
       },
-      // Something in here must hold focus for the shortcuts to fire.
-      child: Focus(
+      // Something in here must hold focus for the shortcuts to fire; a scope
+      // so fields inside still autofocus and unfocusing lands back here.
+      child: FocusScope(
         autofocus: true,
         child: Scaffold(
           body: ListenableBuilder(
