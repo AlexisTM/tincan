@@ -122,7 +122,8 @@ env -u ANDROID_SDK_HOME ANDROID_USER_HOME=$HOME/.android-user flutter build apk 
 ```sh
 (cd gobridge && go test ./bridge/)   # incl. offline e2e over an in-process DERP
 flutter test                         # state machine, profile blobs, QR roundtrip
-dart run tool/e2e_smoke.dart         # full FFI stack over real DERP (needs network)
+TINCAN_BRIDGE=gobridge/build/libtincan_bridge.so \
+  dart run tool/e2e_smoke.dart       # full FFI stack over real DERP (needs network)
 ```
 
 ## State
@@ -132,11 +133,11 @@ Everything lives under the app support dir (or `$TINCAN_HOME`):
 a fresh identity, or use "Generate a new address" in the app),
 `state/peers.json` (accepted/blocked roster), `state/profile.json` and
 `state/avatar.img` (profile), `state/avatars/` (peers' pictures),
-`state/chats.json` (message history), `media/` (received files).
+`state/chats/` (message history, one file per conversation plus an
+`index.json`; an old `state/chats.json` is migrated on first load),
+`media/` (received files).
 
 ## Notes
 
-- Desktop "QR scanning" reads a QR from an image file (no Linux camera
-  plugin exists); live camera scanning arrives with the mobile builds.
 - "Save contact" writes a vCard (`.vcf`) with the address embedded,
   importable into Google Contacts, Samsung Contacts, iOS Contacts, etc.

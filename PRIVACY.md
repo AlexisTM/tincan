@@ -1,11 +1,11 @@
 # Tincan privacy policy
 
-Last updated: 2 September 2026
+Last updated: 25 October 2026
 
-Tincan is built so this stays basically empty. This is a pure peer to
-peer messaging. In an ideal scenario, with no relay. In complex network,
-it will go through Tailscale public DERP servers (like tailcat) or use 
-your own DERP server if speficied.
+Tincan is built so this stays basically empty. It is a pure
+peer-to-peer messaging app: ideally there is no relay at all. On
+complex networks, traffic goes through Tailscale's public DERP servers
+(like tailcat), or through your own DERP server if you specified one.
 
 The data is encrypted end to end.
 
@@ -87,18 +87,31 @@ new one. The old address stops working immediately and for good.
 ## Permissions
 
 - **Internet** — to reach your peers.
+- **Network state** — to notice when your connection changes, so the
+  app can reconnect to your peers.
 - **Camera** — only while you are scanning a peer's QR code. No image is
   stored or transmitted.
-- **Notifications and background service** — only if you turn on
-  background receiving, and only to keep the connection alive for the
-  time you chose, at most an hour.
+- **Biometrics** — only if you choose them to unlock the app. The check
+  is done by your device; the app never sees your fingerprint or face.
+- **Notifications** — asked for when the app starts, to alert you to
+  new messages and chat requests. Notifications are shown by your
+  device and go nowhere else.
+- **Background service** — only if you turn on background receiving,
+  and only to keep the connection alive for the time you chose, at most
+  an hour.
 
 We do not have, and cannot obtain, a way to read your messages. There is
 no key escrow and no recovery: that is a deliberate trade, and it is why
 losing a password loses the data.
 
-Photos and videos you send are chosen through your system's file picker,
-so the app never gets access to your library.
+Photos, videos and files you send are chosen through your system's file
+picker, dropped onto the window, or pasted from the clipboard, so the
+app never gets access to your library. The clipboard is read only when
+you paste into a chat.
+
+When you share something out of the app, such as your address, it goes
+through your system's share sheet to the app you pick, under that
+app's terms.
 
 ## Children
 

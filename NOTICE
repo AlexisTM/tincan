@@ -17,9 +17,22 @@ Flutter and Dart — BSD 3-Clause, Copyright 2014 The Flutter Authors.
 
 Schibsted Grotesk and IBM Plex Mono — SIL Open Font License 1.1.
 
-Flutter packages (archive, ffi, file_selector, flutter_secure_storage,
-flutter_svg, image, local_auth, mobile_scanner, open_filex, path,
-path_provider, qr_flutter, zxing2) — BSD, MIT or Apache 2.0; see each
-package's LICENSE in the Dart package cache or on pub.dev.
+Flutter packages (archive, desktop_drop, ffi, file_selector,
+flutter_local_notifications, flutter_secure_storage, flutter_svg, fvp,
+image, local_auth, mobile_scanner, open_filex, pasteboard, path,
+path_provider, qr_flutter, share_plus, video_player, zxing2) — BSD, MIT
+or Apache 2.0; see each package's LICENSE in the Dart package cache or
+on pub.dev.
+
+libmdk, Copyright Wang Bin — bundled by fvp for video playback.
+Proprietary licence, free for Flutter apps including commercial ones;
+fvp ships the key. See https://github.com/wang-bin/mdk-sdk.
+
+FFmpeg — GNU LGPL 2.1 or later, Copyright the FFmpeg developers.
+Bundled with libmdk as a separate shared library (libffmpeg), which you
+may replace with your own build. Source: https://ffmpeg.org.
+
+libc++ (LLVM) — Apache License 2.0 with LLVM Exceptions. Bundled with
+libmdk on Linux.
 
 Run `flutter pub deps` for the full dependency tree.
