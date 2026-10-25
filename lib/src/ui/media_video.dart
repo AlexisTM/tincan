@@ -5,9 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
 import '../app_state.dart';
+import '../files.dart';
 import '../models.dart';
 import '../theme.dart';
-import 'image_viewer.dart' show openExternal;
 import 'toast.dart';
 
 /// Bigger videos wait for a tap: each thumbnail costs a plaintext copy
@@ -130,9 +130,7 @@ class _VideoBubbleState extends State<VideoBubble> {
   Future<void> _external() async {
     final sealed = widget.msg.path;
     if (sealed == null) return;
-    final path = await widget.state.decryptForOpen(sealed);
-    if (!mounted) return;
-    await showError(context, path == null ? 'Couldn\'t decrypt this file.' : openExternal(path));
+    await showError(context, openSealed(sealed, widget.state.decryptForOpen));
   }
 
   @override
@@ -144,7 +142,7 @@ class _VideoBubbleState extends State<VideoBubble> {
 
   Widget _bubble(BuildContext context, VideoPlayerController? video) {
     final tc = TincanColors.of(context);
-    const ink = Color(0xFFF4FBFA);
+    final ink = tc.onMedia;
     final width = widget.width;
     var height = width * 0.565;
     if (video != null && video.value.aspectRatio > 0) {
@@ -182,14 +180,14 @@ class _VideoBubbleState extends State<VideoBubble> {
             ),
           ),
           if (_opening)
-            const SizedBox(
+            SizedBox(
                 width: 28, height: 28, child: CircularProgressIndicator(strokeWidth: 2, color: ink))
           else if (_failed)
             Column(mainAxisSize: MainAxisSize.min, children: [
-              const Icon(Icons.videocam_off_outlined, size: 26, color: ink),
+              Icon(Icons.videocam_off_outlined, size: 26, color: ink),
               TextButton(
                 onPressed: _external,
-                child: const Text('Open externally', style: TextStyle(color: ink)),
+                child: Text('Open externally', style: TextStyle(color: ink)),
               ),
             ])
           else if (!playing)
@@ -202,7 +200,7 @@ class _VideoBubbleState extends State<VideoBubble> {
                   shape: BoxShape.circle,
                   border: Border.all(color: const Color(0xD9FFF7EE), width: 1.5),
                 ),
-                child: const Icon(Icons.play_arrow_rounded, size: 30, color: ink),
+                child: Icon(Icons.play_arrow_rounded, size: 30, color: ink),
               ),
             ),
           if (duration != null && duration > Duration.zero)
@@ -237,7 +235,7 @@ class _VideoBubbleState extends State<VideoBubble> {
               child: IconButton(
                 tooltip: 'Open externally',
                 onPressed: _external,
-                icon: const Icon(Icons.open_in_new, size: 16, color: ink),
+                icon: Icon(Icons.open_in_new, size: 16, color: ink),
               ),
             ),
         ]),

@@ -45,3 +45,29 @@ class RadioRow<T> extends StatelessWidget {
     );
   }
 }
+
+/// "Advanced" disclosure row; the caller shows what it hides.
+class AdvancedToggle extends StatelessWidget {
+  const AdvancedToggle({super.key, required this.open, required this.onTap, this.label = 'Advanced'});
+
+  final bool open;
+  final VoidCallback onTap;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    return InkWell(
+      borderRadius: BorderRadius.circular(8),
+      onTap: onTap,
+      child: ConstrainedBox(
+        constraints: BoxConstraints(minHeight: minTap),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(open ? Icons.expand_less : Icons.expand_more, size: 18, color: tc.inkMuted),
+          const SizedBox(width: 4),
+          Text(label, style: TextStyle(fontSize: 12.5, color: tc.inkMuted)),
+        ]),
+      ),
+    );
+  }
+}

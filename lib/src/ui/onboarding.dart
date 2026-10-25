@@ -6,7 +6,7 @@ import '../theme.dart';
 import 'sidebar.dart' show AvatarCircle;
 import 'profile_dialog.dart' show ProfileEditor;
 import 'text_input.dart';
-import 'unlock_screen.dart' show SetupSheet;
+import 'unlock_screen.dart' show PrimaryButton, SetupSheet;
 
 /// What peers will call you. Shown after setup, and to anyone who never
 /// picked a name; the only way past it is to give one.
@@ -63,7 +63,7 @@ class _NameStepState extends State<NameStep> with ProfileEditor {
         const SizedBox(height: 16),
         TextField(
           controller: _name,
-          autofocus: MediaQuery.sizeOf(context).width >= 700,
+          autofocus: isWide(context),
           enabled: !busy,
           maxLength: 40,
           autocorrect: false,
@@ -77,17 +77,7 @@ class _NameStepState extends State<NameStep> with ProfileEditor {
           Text(error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
         ],
         const SizedBox(height: 20),
-        FilledButton(
-          style: FilledButton.styleFrom(
-            minimumSize: const Size.fromHeight(48),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          ),
-          onPressed: ready ? _save : null,
-          child: busyOr(
-              busy,
-              const Text('Continue', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
-              size: 18),
-        ),
+        PrimaryButton(label: 'Continue', busy: busy, onPressed: ready ? _save : null),
       ],
     );
   }

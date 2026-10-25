@@ -100,7 +100,7 @@ class _ProfileDialogState extends State<ProfileDialog> with ProfileEditor {
   Widget build(BuildContext context) {
     final tc = TincanColors.of(context);
     // On a phone the keyboard would cover half the dialog straight away.
-    final wide = MediaQuery.sizeOf(context).width >= 700;
+    final wide = isWide(context);
     return Dialog(
       child: Container(
         width: 460,

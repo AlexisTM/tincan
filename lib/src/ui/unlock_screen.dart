@@ -266,7 +266,7 @@ class _LockPickerState extends State<LockPicker> {
         Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
       ],
       const SizedBox(height: 20),
-      _PrimaryButton(label: widget.action, busy: _busy, onPressed: _submit),
+      PrimaryButton(label: widget.action, busy: _busy, onPressed: _submit),
     ]);
   }
 
@@ -391,7 +391,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
           Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
           const SizedBox(height: 12),
         ],
-        _PrimaryButton(
+        PrimaryButton(
             label: byPassword || !widget.autoUnlock ? 'Unlock' : 'Try again',
             busy: _busy,
             onPressed: _unlock),
@@ -409,65 +409,13 @@ class _UnlockScreenState extends State<UnlockScreen> {
   }
 }
 
-InputDecoration _inputDecoration(String label) => InputDecoration(
-      labelText: label,
-      isDense: true,
-      contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
-    );
-
-/// A password box with a show/hide toggle.
-class PasswordField extends StatefulWidget {
-  const PasswordField({
-    super.key,
-    required this.controller,
-    required this.label,
-    required this.onSubmitted,
-    this.enabled = true,
-    this.autofocus = false,
-  });
-
-  final TextEditingController controller;
-  final String label;
-  final VoidCallback onSubmitted;
-  final bool enabled;
-  final bool autofocus;
-
-  @override
-  State<PasswordField> createState() => _PasswordFieldState();
-}
-
-class _PasswordFieldState extends State<PasswordField> {
-  bool _shown = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final tc = TincanColors.of(context);
-    return TextField(
-      controller: widget.controller,
-      obscureText: !_shown,
-      autofocus: widget.autofocus,
-      enabled: widget.enabled,
-      autocorrect: false,
-      enableSuggestions: false,
-      onSubmitted: (_) => widget.onSubmitted(),
-      decoration: _inputDecoration(widget.label).copyWith(
-        suffixIcon: IconButton(
-          tooltip: _shown ? 'Hide password' : 'Show password',
-          onPressed: () => setState(() => _shown = !_shown),
-          icon: Icon(_shown ? Icons.visibility_off_outlined : Icons.visibility_outlined,
-              size: 19, color: tc.inkMuted),
-        ),
-      ),
-    );
-  }
-}
-
-class _PrimaryButton extends StatelessWidget {
-  const _PrimaryButton({required this.label, required this.busy, required this.onPressed});
+/// The setup screens' full-width main action.
+class PrimaryButton extends StatelessWidget {
+  const PrimaryButton({super.key, required this.label, required this.busy, required this.onPressed});
 
   final String label;
   final bool busy;
-  final VoidCallback onPressed;
+  final VoidCallback? onPressed;
 
   @override
   Widget build(BuildContext context) => FilledButton(

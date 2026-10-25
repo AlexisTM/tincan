@@ -38,6 +38,11 @@ bool get isTouchPlatform =>
 
 double get minTap => isTouchPlatform ? 48 : 40;
 
+/// Below this width the list and the thread take turns on screen.
+const wideBreakpoint = 700.0;
+
+bool isWide(BuildContext context) => MediaQuery.sizeOf(context).width >= wideBreakpoint;
+
 /// Every colour the UI paints with, light and dark.
 @immutable
 class TincanColors extends ThemeExtension<TincanColors> {
@@ -113,6 +118,9 @@ class TincanColors extends ThemeExtension<TincanColors> {
   /// QR codes scan best dark on white, whatever the theme.
   Color get qrBg => const Color(0xFFFFFFFF);
   Color get qrInk => Tc.brandNavy;
+
+  /// Icons and text over photos and video, which stay dark in either theme.
+  Color get onMedia => const Color(0xFFF4F5F7);
 
   static const light = TincanColors(
     bg: Color(0xFFF5F3EF),

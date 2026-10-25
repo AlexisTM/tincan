@@ -13,7 +13,7 @@ import '../profile.dart';
 import '../qr_util.dart';
 import '../theme.dart';
 import 'qr_scan_screen.dart';
-import 'sidebar.dart' show AdvancedToggle;
+import 'radio_row.dart';
 import 'text_input.dart';
 import 'toast.dart';
 
@@ -165,7 +165,7 @@ class _NewChatDialogState extends State<NewChatDialog> {
   @override
   Widget build(BuildContext context) {
     final tc = TincanColors.of(context);
-    final narrow = MediaQuery.sizeOf(context).width < 700;
+    final narrow = !isWide(context);
     return Dialog(
       insetPadding: EdgeInsets.all(narrow ? 14 : 40),
       child: Container(

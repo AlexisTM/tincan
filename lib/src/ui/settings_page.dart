@@ -7,18 +7,13 @@ import '../settings.dart';
 import '../theme.dart';
 import '../vault.dart';
 import 'radio_row.dart';
-import 'sidebar.dart' show AdvancedToggle;
 import 'text_input.dart';
 import 'toast.dart';
-import 'unlock_screen.dart' show LockPicker, PasswordField;
+import 'unlock_screen.dart' show LockPicker;
 
 Future<void> showSettingsDialog(BuildContext context, AppState state) {
   return showTincanDialog(context, (_) => SettingsDialog(state: state));
 }
-
-/// Only a real lock can be locked; an unlocked store would just reopen.
-bool canLockNow(AppState state) =>
-    state.lockMode == LockMode.device || state.lockMode == LockMode.password;
 
 class SettingsDialog extends StatefulWidget {
   const SettingsDialog({super.key, required this.state, this.pickBackup = _pick});
@@ -254,7 +249,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
   @override
   Widget build(BuildContext context) {
     final tc = TincanColors.of(context);
-    final narrow = MediaQuery.sizeOf(context).width < 700;
+    final narrow = !isWide(context);
     final blurb = TextStyle(fontSize: 12.5, height: 1.45, color: tc.inkMuted);
     Widget section(String title) => Padding(
           padding: const EdgeInsets.only(top: 22, bottom: 4),
@@ -338,8 +333,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                     ),
                   ),
                   const SizedBox(width: 8),
-                  // Old unlocked stores; same test as vault.canUpgradeLock.
-                if (widget.state.lockMode == LockMode.none)
+                  if (widget.state.canUpgradeLock)
                     FilledButton(
                       onPressed: _busy ? null : () => _changeLock(context),
                       child: const Text('Set a lock…'),
@@ -351,7 +345,7 @@ class _SettingsDialogState extends State<SettingsDialog> {
                       child: const Text('Change…'),
                     ),
                 ]),
-                if (canLockNow(widget.state)) ...[
+                if (widget.state.canLockNow) ...[
                   const SizedBox(height: 8),
                   OutlinedButton.icon(
                     onPressed: _busy ? null : _lockNow,

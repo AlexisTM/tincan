@@ -23,14 +23,28 @@ class _HomeScreenState extends State<HomeScreen> {
   AppState get state => widget.state;
 
   @override
+  void initState() {
+    super.initState();
+    state.requestsOpened.addListener(_showRequests);
+  }
+
+  @override
   void dispose() {
+    state.requestsOpened.removeListener(_showRequests);
     _search.dispose();
     super.dispose();
   }
 
+  void _showRequests() {
+    if (!mounted || state.requests.isEmpty) return;
+    // On a phone the requests live on the list screen.
+    if (!isWide(context)) state.select(null);
+    showRequestsDialog(context, state);
+  }
+
   void _focusSearch() {
     // On a phone the search box lives on the list screen.
-    if (state.selectedId != null && MediaQuery.sizeOf(context).width < 700) {
+    if (state.selectedId != null && !isWide(context)) {
       state.select(null);
       WidgetsBinding.instance.addPostFrameCallback((_) => _search.requestFocus());
     } else {
@@ -58,7 +72,7 @@ class _HomeScreenState extends State<HomeScreen> {
         const SingleActivator(LogicalKeyboardKey.arrowDown, alt: true): () => _step(1),
         const SingleActivator(LogicalKeyboardKey.keyF, control: true): _focusSearch,
         const SingleActivator(LogicalKeyboardKey.keyL, control: true): () {
-          if (canLockNow(state)) state.lockNow();
+          if (state.canLockNow) state.lockNow();
         },
       },
       // Something in here must hold focus for the shortcuts to fire; a scope
@@ -70,7 +84,7 @@ class _HomeScreenState extends State<HomeScreen> {
             listenable: state,
             builder: (context, _) => LayoutBuilder(builder: (context, constraints) {
               final convo = state.selected;
-              if (constraints.maxWidth < 700) {
+              if (constraints.maxWidth < wideBreakpoint) {
                 // On a phone the list is the screen, and picking a
                 // conversation pushes the thread over it.
                 return convo == null

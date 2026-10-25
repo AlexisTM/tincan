@@ -8,6 +8,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app_state.dart';
+import '../files.dart';
 import '../models.dart';
 import '../theme.dart';
 import 'composer.dart';
@@ -217,7 +218,7 @@ class _ThreadViewState extends State<ThreadView> {
     final peerError = widget.state.peerError(convo.id);
     final thread = ListenableBuilder(listenable: convo, builder: (context, _) {
       final tc = TincanColors.of(context);
-      final gutter = MediaQuery.sizeOf(context).width < 700 ? 12.0 : 28.0;
+      final gutter = isWide(context) ? 28.0 : 12.0;
       final msgs = convo.messages;
       if (_searching) _refreshHits();
       return Column(children: [
@@ -479,7 +480,7 @@ class _Header extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final tc = TincanColors.of(context);
-    final narrow = MediaQuery.sizeOf(context).width < 700;
+    final narrow = !isWide(context);
     final timer = convo.disappearAfter;
     return Container(
       padding: EdgeInsets.only(
@@ -1132,7 +1133,7 @@ class _MediaBubble extends StatelessWidget {
     }
     if (msg.kind != MessageKind.image) {
       // Decrypted only when opened: files can be big.
-      return _placeholder(tc, done: true, onOpen: () => showError(context, _open(sealed)));
+      return _placeholder(tc, done: true, onOpen: () => showError(context, openSealed(sealed, state.decryptForOpen)));
     }
     return ValueListenableBuilder(
       valueListenable: state.plaintext(sealed),
@@ -1157,11 +1158,6 @@ class _MediaBubble extends StatelessWidget {
               ),
             ),
     );
-  }
-
-  Future<String?> _open(String sealed) async {
-    final path = await state.decryptForOpen(sealed);
-    return path == null ? 'Couldn\'t decrypt this file.' : openExternal(path);
   }
 
   Widget _placeholder(TincanColors tc,

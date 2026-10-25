@@ -10,6 +10,7 @@ import '../theme.dart';
 import 'blocked_dialog.dart';
 import 'new_chat_dialog.dart';
 import 'profile_dialog.dart';
+import 'radio_row.dart';
 import 'settings_page.dart';
 import 'text_input.dart';
 import 'thread_view.dart' show showPeerProfileDialog;
@@ -88,7 +89,7 @@ class _SidebarState extends State<Sidebar> {
                     style: TextStyle(
                         fontSize: 17, fontWeight: FontWeight.w700, color: tc.sidebarText)),
               ),
-              if (canLockNow(state))
+              if (state.canLockNow)
                 IconButton(
                   tooltip: 'Lock now (Ctrl+L)',
                   constraints: BoxConstraints(minWidth: minTap, minHeight: minTap),
@@ -506,32 +507,6 @@ class _IdDialogState extends State<_IdDialog> {
           child: const Text('Copy'),
         ),
       ],
-    );
-  }
-}
-
-/// "Advanced" disclosure row; the caller shows what it hides.
-class AdvancedToggle extends StatelessWidget {
-  const AdvancedToggle({super.key, required this.open, required this.onTap, this.label = 'Advanced'});
-
-  final bool open;
-  final VoidCallback onTap;
-  final String label;
-
-  @override
-  Widget build(BuildContext context) {
-    final tc = TincanColors.of(context);
-    return InkWell(
-      borderRadius: BorderRadius.circular(8),
-      onTap: onTap,
-      child: ConstrainedBox(
-        constraints: BoxConstraints(minHeight: minTap),
-        child: Row(mainAxisSize: MainAxisSize.min, children: [
-          Icon(open ? Icons.expand_less : Icons.expand_more, size: 18, color: tc.inkMuted),
-          const SizedBox(width: 4),
-          Text(label, style: TextStyle(fontSize: 12.5, color: tc.inkMuted)),
-        ]),
-      ),
     );
   }
 }

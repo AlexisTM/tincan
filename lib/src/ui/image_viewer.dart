@@ -2,9 +2,9 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:open_filex/open_filex.dart';
 
 import '../files.dart';
+import '../theme.dart';
 import 'toast.dart';
 
 /// Full-screen, zoomable view of a decrypted image. Esc, the close
@@ -124,7 +124,7 @@ class _ImageViewerState extends State<ImageViewer> {
 
   @override
   Widget build(BuildContext context) {
-    const ink = Color(0xFFF4F5F7);
+    final ink = TincanColors.of(context).onMedia;
     return CallbackShortcuts(
       bindings: {const SingleActivator(LogicalKeyboardKey.escape): _close},
       child: Focus(
@@ -161,7 +161,7 @@ class _ImageViewerState extends State<ImageViewer> {
                               label: widget.name,
                               child: Image.file(File(widget.path),
                                   fit: BoxFit.contain,
-                                  errorBuilder: (_, _, _) => const Icon(Icons.broken_image_outlined,
+                                  errorBuilder: (_, _, _) => Icon(Icons.broken_image_outlined,
                                       size: 48, color: ink)),
                             ),
                           ),
@@ -178,24 +178,24 @@ class _ImageViewerState extends State<ImageViewer> {
                     IconButton(
                       tooltip: 'Close',
                       onPressed: _close,
-                      icon: const Icon(Icons.close, color: ink),
+                      icon: Icon(Icons.close, color: ink),
                     ),
                     const SizedBox(width: 4),
                     Expanded(
                       child: Text(widget.name,
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(color: ink, fontSize: 14)),
+                          style: TextStyle(color: ink, fontSize: 14)),
                     ),
                     IconButton(
                       tooltip: 'Open externally',
                       onPressed: _openExternally,
-                      icon: const Icon(Icons.open_in_new, color: ink),
+                      icon: Icon(Icons.open_in_new, color: ink),
                     ),
                     IconButton(
                       tooltip: 'Save as…',
                       onPressed: _saveAs,
-                      icon: const Icon(Icons.download_outlined, color: ink),
+                      icon: Icon(Icons.download_outlined, color: ink),
                     ),
                   ]),
                 ),
@@ -205,16 +205,5 @@ class _ImageViewerState extends State<ImageViewer> {
         ),
       ),
     );
-  }
-}
-
-/// Opens a file with the platform's default handler; the error to
-/// show, if it couldn't.
-Future<String?> openExternal(String path) async {
-  const failed = 'No app could open this file.';
-  try {
-    return (await OpenFilex.open(path)).type == ResultType.done ? null : failed;
-  } catch (_) {
-    return failed;
   }
 }

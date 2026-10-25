@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/services.dart';
+import 'package:open_filex/open_filex.dart';
 import 'package:path/path.dart' as p;
 
 /// Mirrors the bridge's MediaKind, which decides how a file is shown.
@@ -79,4 +80,22 @@ Future<SaveTarget?> chooseSaveTarget(String suggestedName, List<XTypeGroup> grou
   final scratch = await Directory.systemTemp.createTemp('tincan-save-');
   final safeName = suggestedName.replaceAll(RegExp(r'[/\\]'), '_');
   return SaveTarget._(p.join(scratch.path, safeName), uri, scratch);
+}
+
+/// Opens a file with the platform's default handler; the error to
+/// show, if it couldn't.
+Future<String?> openExternal(String path) async {
+  const failed = 'No app could open this file.';
+  try {
+    return (await OpenFilex.open(path)).type == ResultType.done ? null : failed;
+  } catch (_) {
+    return failed;
+  }
+}
+
+/// Decrypts a sealed file with [decrypt] and hands the copy to
+/// [openExternal]; the error to show, if any.
+Future<String?> openSealed(String sealed, Future<String?> Function(String sealed) decrypt) async {
+  final path = await decrypt(sealed);
+  return path == null ? 'Couldn\'t decrypt this file.' : openExternal(path);
 }
