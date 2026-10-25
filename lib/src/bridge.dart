@@ -3,6 +3,7 @@ import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:isolate';
+import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
 import 'package:path/path.dart' as p;
@@ -145,31 +146,44 @@ class BridgeException implements Exception {
 /// I/O, and a dedicated isolate pumps events from the start.
 class TincanBridge implements Bridge {
   TincanBridge() {
+    // Exit comes through the same port as events so it can't overtake
+    // the pump's last word.
     _pumpPort.handler = (Object? raw) {
-      if (raw == _retired) {
-        _pumpRetired = true;
-      } else if (raw is String) {
-        try {
-          _events.add(jsonDecode(raw) as Map<String, dynamic>);
-        } catch (_) {}
+      switch (raw) {
+        case int gen:
+          _pumpGen = gen;
+        case _retired:
+          _pumpRetired = true;
+          _pumpPort.close();
+        case String ev:
+          try {
+            _events.add(jsonDecode(ev) as Map<String, dynamic>);
+          } catch (_) {}
+        case null:
+          // Died unexpectedly; the next one resumes our generation, so it
+          // retires instead of stealing events if a newer engine took over.
+          if (!_pumpRetired) Timer(const Duration(seconds: 1), _spawnPump);
       }
-    };
-    _exitPort.handler = (_) {
-      // Died unexpectedly: start another, unless a newer engine took over.
-      if (!_pumpRetired) Timer(const Duration(seconds: 1), _spawnPump);
     };
     _spawnPump();
   }
 
   final _events = StreamController<Map<String, dynamic>>.broadcast();
   final _pumpPort = RawReceivePort();
-  final _exitPort = RawReceivePort();
   bool _pumpRetired = false;
+  int? _pumpGen;
+  var _spawnFailures = 0;
 
   void _spawnPump() {
-    Isolate.spawn(_eventPump, _pumpPort.sendPort,
-            debugName: 'tincan-events', onExit: _exitPort.sendPort)
-        .ignore();
+    if (_pumpRetired) return;
+    Isolate.spawn(_eventPump, (_pumpPort.sendPort, _pumpGen),
+            debugName: 'tincan-events', onExit: _pumpPort.sendPort)
+        .then((_) => _spawnFailures = 0, onError: (Object e) {
+      if (++_spawnFailures == 5) {
+        _events.add({'type': 'fatal', 'error': 'event pump: $e'});
+      }
+      Timer(Duration(seconds: _spawnFailures < 5 ? _spawnFailures : 5), _spawnPump);
+    });
   }
 
   @override
@@ -354,13 +368,20 @@ class TincanBridge implements Bridge {
 const _slowCalls = {
   'TincanStart', 'TincanSetRelay', 'TincanRestart', 'TincanResetIdentity', 'TincanConnect',
   'TincanLock', 'TincanExportAccount', 'TincanImportAccount', 'TincanSealFile', 'TincanOpenFile',
+  'TincanUnlock', 'TincanVaultCreate', 'TincanChangeSecret',
 };
 
+// Redials fire for every offline contact at once, each up to a minute.
+final _dials = _Gate(4);
+
 /// Non-string args are sent as JSON.
-Future<Map<String, dynamic>> _call(String symbol, [List<Object> args = const []]) async =>
-    _checked(_slowCalls.contains(symbol)
-        ? await _isolated(symbol, [for (final a in args) a is String ? a : jsonEncode(a)])
-        : await _workers.call(symbol, args));
+Future<Map<String, dynamic>> _call(String symbol, [List<Object> args = const []]) async {
+  if (!_slowCalls.contains(symbol)) return _checked(await _workers.call(symbol, args));
+  final strs = [for (final a in args) a is String ? a : jsonEncode(a)];
+  return _checked(symbol == 'TincanConnect'
+      ? await _dials.run(() => _isolated(symbol, strs))
+      : await _isolated(symbol, strs));
+}
 
 // Top-level and alone, so the closure captures nothing but its args.
 Future<Map<String, dynamic>> _isolated(String symbol, List<String> args) =>
@@ -372,13 +393,37 @@ Map<String, dynamic> _checked(Map<String, dynamic> res) {
   return res;
 }
 
+class _Gate {
+  _Gate(this._free);
+  int _free;
+  final _waiting = <Completer<void>>[];
+
+  Future<T> run<T>(Future<T> Function() f) async {
+    if (_free > 0) {
+      _free--;
+    } else {
+      final turn = Completer<void>();
+      _waiting.add(turn);
+      await turn.future;
+    }
+    try {
+      return await f();
+    } finally {
+      if (_waiting.isNotEmpty) {
+        _waiting.removeAt(0).complete();
+      } else {
+        _free++;
+      }
+    }
+  }
+}
+
 final _workers = _WorkerPool(3);
 
 class _Worker {
   _Worker(this.port);
   final Future<SendPort> port;
   final pending = <Completer<Map<String, dynamic>>>{};
-  int busy = 0;
 }
 
 /// Long-lived isolates that run bridge calls, each binding the library
@@ -390,19 +435,25 @@ class _WorkerPool {
   final int size;
   final List<_Worker?> _slots;
 
+  // One port takes the worker's SendPort, its exit and its errors, so a
+  // worker dying during startup fails its callers instead of hanging them.
   _Worker _spawn(int i) {
-    final exit = RawReceivePort();
-    late final _Worker w;
-    w = _Worker(_spawnWorker(i, exit.sendPort));
-    exit.handler = (_) {
-      exit.close();
-      _retire(i, w, 'bridge worker died');
-    };
-    w.port.catchError((Object e) {
-      exit.close();
-      _retire(i, w, '$e');
-      return Future<SendPort>.error(e);
-    }).ignore();
+    final ready = Completer<SendPort>();
+    ready.future.ignore();
+    final w = _Worker(ready.future);
+    final port = RawReceivePort();
+    void fail(String why) {
+      port.close();
+      if (!ready.isCompleted) ready.completeError(BridgeException(why));
+      _retire(i, w, why);
+    }
+
+    port.handler = (Object? msg) => switch (msg) {
+          SendPort p when !ready.isCompleted => ready.complete(p),
+          [final e, _] => fail('bridge worker failed: $e'),
+          _ => fail('bridge worker died'),
+        };
+    _spawnWorker(i, port.sendPort).then((_) {}, onError: (Object e) => fail('$e'));
     return w;
   }
 
@@ -416,14 +467,20 @@ class _WorkerPool {
   Future<Map<String, dynamic>> call(String symbol, List<Object> args) async {
     var pick = 0;
     for (var i = 1; i < size; i++) {
-      if ((_slots[i]?.busy ?? 0) < (_slots[pick]?.busy ?? 0)) pick = i;
+      if ((_slots[i]?.pending.length ?? 0) < (_slots[pick]?.pending.length ?? 0)) pick = i;
     }
     final w = _slots[pick] ??= _spawn(pick);
     final done = Completer<Map<String, dynamic>>();
+    // _retire may fail it while we are still waiting on the port.
+    done.future.ignore();
     final reply = RawReceivePort((Object? r) {
-      if (!done.isCompleted) done.complete(r as Map<String, dynamic>);
+      if (done.isCompleted) return;
+      if (r is Map<String, dynamic>) {
+        done.complete(r);
+      } else {
+        done.completeError(BridgeException('bad reply from bridge worker: $r'));
+      }
     });
-    w.busy++;
     w.pending.add(done);
     try {
       (await w.port).send((symbol, args, reply.sendPort));
@@ -431,7 +488,6 @@ class _WorkerPool {
     } finally {
       reply.close();
       w.pending.remove(done);
-      w.busy--;
     }
   }
 }
@@ -439,16 +495,8 @@ class _WorkerPool {
 // Top-level on purpose: an isolate entry point that closed over `this`
 // would drag the bridge and everything it references into the message,
 // failing with "object is unsendable".
-Future<SendPort> _spawnWorker(int i, SendPort onExit) async {
-  final ready = ReceivePort();
-  try {
-    await Isolate.spawn(_workerMain, ready.sendPort,
-        debugName: 'tincan-bridge-$i', onExit: onExit, onError: onExit);
-    return await ready.first as SendPort;
-  } finally {
-    ready.close();
-  }
-}
+Future<Isolate> _spawnWorker(int i, SendPort port) => Isolate.spawn(_workerMain, port,
+    debugName: 'tincan-bridge-$i', onExit: port, onError: port);
 
 void _workerMain(SendPort ready) {
   final inbox = ReceivePort();
@@ -506,10 +554,23 @@ final _attachEvents = _lib.lookupFunction<Int32 Function(), int Function()>('Tin
 final _nextEvent = _lib.lookupFunction<Pointer<Utf8> Function(Int32, Int32),
     Pointer<Utf8> Function(int, int)>('TincanNextEvent');
 
+// Wiping native buffers is best-effort: the Dart strings and isolate
+// message copies still hold the same bytes until the GC reuses them.
 String _take(Pointer<Utf8> ptr) {
-  final s = ptr.toDartString();
-  _free(ptr);
-  return s;
+  final n = ptr.length;
+  try {
+    return ptr.toDartString(length: n);
+  } finally {
+    ptr.cast<Uint8>().asTypedList(n).fillRange(0, n, 0);
+    _free(ptr);
+  }
+}
+
+Pointer<Utf8> _native(Uint8List bytes) {
+  final ptr = malloc<Uint8>(bytes.length + 1);
+  ptr.asTypedList(bytes.length).setAll(0, bytes);
+  ptr[bytes.length] = 0;
+  return ptr.cast();
 }
 
 final _bound = <String, Function>{};
@@ -520,23 +581,28 @@ Map<String, dynamic> _invoke(String symbol, List<String> args) {
     1 => _lib.lookupFunction<_NativeStr1, _NativeStr1>(symbol),
     2 => _lib.lookupFunction<_NativeStr2, _NativeStr2>(symbol),
     3 => _lib.lookupFunction<_NativeStr3, _NativeStr3>(symbol),
-    _ => _lib.lookupFunction<_NativeStr4, _NativeStr4>(symbol),
+    4 => _lib.lookupFunction<_NativeStr4, _NativeStr4>(symbol),
+    _ => throw ArgumentError('$symbol: ${args.length} args, at most 4 supported'),
   };
-  final ptrs = [for (final a in args) a.toNativeUtf8()];
+  final bytes = [for (final a in args) utf8.encode(a)];
+  final ptrs = [for (final b in bytes) _native(b)];
   try {
     final out = switch (ptrs) {
       [] => (fn as Pointer<Utf8> Function())(),
       [final a] => (fn as _NativeStr1)(a),
       [final a, final b] => (fn as _NativeStr2)(a, b),
       [final a, final b, final c] => (fn as _NativeStr3)(a, b, c),
-      [final a, final b, final c, final d, ...] => (fn as _NativeStr4)(a, b, c, d),
+      [final a, final b, final c, final d] => (fn as _NativeStr4)(a, b, c, d),
+      _ => throw StateError('unreachable'),
     };
     return jsonDecode(_take(out)) as Map<String, dynamic>;
   } finally {
-    for (final ptr in ptrs) {
-      // Args carry secrets and message bodies; don't leave them in freed memory.
-      ptr.cast<Uint8>().asTypedList(ptr.length).fillRange(0, ptr.length, 0);
-      malloc.free(ptr);
+    // Args carry secrets and message bodies; don't leave them in freed memory.
+    for (var i = 0; i < ptrs.length; i++) {
+      final n = bytes[i].length;
+      ptrs[i].cast<Uint8>().asTypedList(n).fillRange(0, n, 0);
+      bytes[i].fillRange(0, n, 0);
+      malloc.free(ptrs[i]);
     }
   }
 }
@@ -545,13 +611,18 @@ const _retired = 'retired';
 
 /// Runs until a newer bridge attaches: Android can replace the engine
 /// while this isolate lives on, and it must not keep taking events.
-/// Other failures are reported once and retried with backoff.
-void _eventPump(SendPort port) {
-  int? gen;
+/// A respawned pump gets the generation its predecessor attached.
+/// Other failures are retried with backoff, and only a run of them is
+/// reported as fatal.
+void _eventPump((SendPort, int?) start) {
+  var (port, gen) = start;
   var failures = 0;
   while (true) {
     try {
-      gen ??= _attachEvents();
+      if (gen == null) {
+        gen = _attachEvents();
+        port.send(gen);
+      }
       // A thread parked forever in a native call wedges VM shutdown.
       final ev = _take(_nextEvent(gen, 500));
       failures = 0;
@@ -566,7 +637,10 @@ void _eventPump(SendPort port) {
       port.send(_retired);
       return;
     } catch (e) {
-      if (failures++ == 0) port.send(jsonEncode({'type': 'fatal', 'error': '$e'}));
+      failures++;
+      if (failures == 1 || failures == 5) {
+        port.send(jsonEncode({'type': failures == 5 ? 'fatal' : 'pump-error', 'error': '$e'}));
+      }
       sleep(Duration(seconds: failures < 5 ? failures : 5));
     }
   }

@@ -1,3 +1,6 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tincan/src/bridge.dart';
 
@@ -11,8 +14,9 @@ import 'package:tincan/src/bridge.dart';
 void main() {
   Future<void> expectSendable(String label, Future<void> Function() call) async {
     try {
-      await call();
+      await call().timeout(const Duration(seconds: 90));
     } catch (e) {
+      expect(e, isNot(isA<TimeoutException>()), reason: '$label hung');
       expect('$e', isNot(contains('unsendable')), reason: '$label captured unsendable state');
       expect('$e', isNot(contains('Illegal argument in isolate message')), reason: label);
     }
@@ -27,5 +31,22 @@ void main() {
     await expectSendable('sendText', () => bridge.sendText('p', 'i', 'b'));
     await expectSendable('listBlocked', () => bridge.listBlocked());
     await expectSendable('setProfile', () => bridge.setProfile(name: 'x'));
+    await expectSendable('sendReaction', () => bridge.sendReaction('p', 'i', 'r', 'x'));
+  });
+
+  test('no slow-path call captures the bridge in its isolate message', () async {
+    final bridge = TincanBridge();
+    bridge.events.listen((_) {});
+    final dir = Directory.systemTemp.createTempSync('tincan-bridge-test');
+    addTearDown(() => dir.deleteSync(recursive: true));
+    final missing = '${dir.path}/missing';
+    final out = '${dir.path}/out';
+
+    await expectSendable('connect', () => bridge.connect('bogus'));
+    await expectSendable('lock', () => bridge.lock());
+    await expectSendable('exportAccount', () => bridge.exportAccount(out, password: 'pw'));
+    await expectSendable('sealFile', () => bridge.sealFile(missing, out, 'pw'));
+    await expectSendable('openFile', () => bridge.openFile(missing, out, 'pw'));
+    await expectSendable('vaultChangeSecret', () => bridge.vaultChangeSecret(secret: 's', mode: 'password'));
   });
 }
