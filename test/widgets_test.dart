@@ -393,6 +393,8 @@ void main() {
     ));
     await tester.pump(const Duration(milliseconds: 400));
     await tester.tap(find.text('Recover an account from a backup…'));
+    // Checking the file for a seal is real IO.
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
     await tester.pump(const Duration(milliseconds: 400));
     expect(find.text('tincan-account.json'), findsOneWidget);
     await _choosePassword(tester);
@@ -415,6 +417,8 @@ void main() {
     ));
     await tester.pump(const Duration(milliseconds: 400));
     await tester.tap(find.text('Recover an account from a backup…'));
+    // Checking the file for a seal is real IO.
+    await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 100)));
     await tester.pump(const Duration(milliseconds: 400));
     await _choosePassword(tester);
     await tester.tap(find.text('Recover account'));
