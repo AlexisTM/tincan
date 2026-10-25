@@ -24,6 +24,12 @@ enum LockMode {
 
   /// What setup and lock changes offer.
   static const choices = [device, password];
+
+  /// Only a real lock can be locked; an unlocked store would just reopen.
+  bool get lockable => this != none;
+
+  /// An old store that opens without asking; Settings offers a real lock.
+  bool get upgradable => this == none;
 }
 
 /// Unlocks the encrypted store. The key never leaves the transport: the
@@ -47,8 +53,7 @@ class VaultManager {
   /// How the store is locked, as last read or set here.
   LockMode? mode;
 
-  /// An old store that opens without asking; Settings offers a real lock.
-  bool get canUpgradeLock => mode == LockMode.none;
+  bool get canUpgradeLock => mode?.upgradable ?? false;
 
   /// Whether a store already exists here, and how it is locked.
   Future<({bool exists, LockMode? mode})> status() async {

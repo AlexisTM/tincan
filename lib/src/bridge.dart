@@ -135,8 +135,11 @@ class FileMeta {
 }
 
 class BridgeException implements Exception {
-  BridgeException(this.message);
+  BridgeException(this.message, {this.code});
   final String message;
+
+  /// 'offline': the peer isn't reachable now, so a send should wait.
+  final String? code;
   @override
   String toString() => message;
 }
@@ -389,7 +392,7 @@ Future<Map<String, dynamic>> _isolated(String symbol, List<String> args) =>
 
 Map<String, dynamic> _checked(Map<String, dynamic> res) {
   final err = res['error'];
-  if (err is String && err.isNotEmpty) throw BridgeException(err);
+  if (err is String && err.isNotEmpty) throw BridgeException(err, code: res['code'] as String?);
   return res;
 }
 
@@ -515,17 +518,20 @@ void _workerMain(SendPort ready) {
 
 String _libFileName() {
   if (Platform.isWindows) return 'tincan_bridge.dll';
-  if (Platform.isMacOS || Platform.isIOS) return 'libtincan_bridge.dylib';
+  if (Platform.isMacOS) return 'libtincan_bridge.dylib';
   return 'libtincan_bridge.so';
 }
 
 DynamicLibrary _openLib() {
+  // Go can't build an iOS dylib; the archive is linked into the app.
+  if (Platform.isIOS) return DynamicLibrary.process();
   final name = _libFileName();
   final exeDir = File(Platform.resolvedExecutable).parent.path;
   final override = Platform.environment['TINCAN_BRIDGE'];
   final candidates = <String>[
     if (override != null && override.isNotEmpty) override,
     p.join(exeDir, 'lib', name), // Linux bundle layout
+    if (Platform.isMacOS) p.join(exeDir, '..', 'Frameworks', name),
     p.join(exeDir, name),
     name, // whatever the linker search path finds
   ];

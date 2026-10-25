@@ -202,8 +202,21 @@ class FakeNotifier implements Notifier {
   final shown = <(String, String, String)>[];
   final cleared = <String>[];
 
+  NotificationTap? launch;
+  int clearedAll = 0;
+
   @override
-  Future<void> init(void Function(String peer) onOpen) async {}
+  Future<void> init(void Function(NotificationTap tap) onOpen) async {}
+
+  @override
+  NotificationTap? takeLaunchTap() {
+    final tap = launch;
+    launch = null;
+    return tap;
+  }
+
+  @override
+  Future<void> clearAll({bool keepShown = false}) async => clearedAll++;
 
   @override
   Future<void> requestPermission() async {}
@@ -892,7 +905,7 @@ void main() {
     state.handleEvent({'type': 'peer-added', 'peer': 'nk:2', 'name': 'sam'});
     bridge
       ..failSends = true
-      ..sendError = BridgeException('No direct path (direct-only mode)');
+      ..sendError = BridgeException('No direct path (direct-only mode)', code: 'offline');
     await state.sendText('nk:2', 'hi');
     expect(state.conversations['nk:2']!.messages.single.status, MessageStatus.queued);
   });

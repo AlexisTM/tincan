@@ -64,6 +64,9 @@ class AppState extends ChangeNotifier {
   Settings settings = Settings();
   late VaultManager vault;
   LockMode? lockMode;
+
+  bool get canLockNow => lockMode?.lockable ?? false;
+  bool get canUpgradeLock => lockMode?.upgradable ?? false;
   late final BackgroundController _background = BackgroundController(settings);
 
   final conversations = <String, Conversation>{};
@@ -74,6 +77,10 @@ class AppState extends ChangeNotifier {
 
   /// A message the open thread should scroll to and flash, as (peer, id).
   final focused = ValueNotifier<(String, String)?>(null);
+
+  /// Bumped when a contact-request notification is tapped; the shell
+  /// shows the requests.
+  final requestsOpened = ValueNotifier<int>(0);
 
   final _reconnectAttempts = <String, int>{};
   final _jitter = Random();
@@ -167,6 +174,9 @@ class AppState extends ChangeNotifier {
   Future<void> _wipeCache({bool forget = false}) async {
     _cacheTimer?.cancel();
     _dropCopies(forget);
+    // The text kept for stacking goes with the cache; what is shown stays
+    // until lock or exit.
+    unawaited(_notifier.clearAll(keepShown: !forget));
     if (_cacheDir case final dir?) {
       try {
         await _freshCache(dir);
@@ -246,9 +256,9 @@ class AppState extends ChangeNotifier {
         },
       );
       selfName = _fallbackName;
-      if (Platform.isAndroid) {
-        // Go can't enumerate interfaces on Android; feed them in first,
-        // then again on every network change.
+      if (Platform.isAndroid || Platform.isIOS) {
+        // Both redial on network changes. Go can't enumerate interfaces
+        // on Android, so there they are fed in first and on every change.
         _netifChannel.setMethodCallHandler((call) async {
           switch (call.method) {
             case 'changed':
@@ -257,12 +267,15 @@ class AppState extends ChangeNotifier {
               dialAll(reset: true);
           }
         });
-        await _feedInterfaces(await _netifChannel.invokeMethod<List<dynamic>>('list'));
+        if (Platform.isAndroid) {
+          await _feedInterfaces(await _netifChannel.invokeMethod<List<dynamic>>('list'));
+        }
       }
       await _notifier.init(_openFromNotification);
       unawaited(_notifier.requestPermission());
       _eventSub = _bridge.events.listen(handleEvent);
       await _open();
+      if (_notifier.takeLaunchTap() case final tap?) _openFromNotification(tap);
     } catch (e, st) {
       _transportError = 'Transport failed to start: $e';
       debugPrint('tincan: start failed: $e\n$st');
@@ -766,8 +779,13 @@ class AppState extends ChangeNotifier {
     focused.value = (peer, msgId);
   }
 
-  void _openFromNotification(String peer) {
-    if (conversations.containsKey(peer)) select(peer);
+  void _openFromNotification(NotificationTap tap) {
+    if (locked) return;
+    if (!tap.request) {
+      if (conversations.containsKey(tap.peer)) select(tap.peer);
+    } else if (requests.any((r) => r.peer == tap.peer)) {
+      requestsOpened.value++;
+    }
   }
 
   bool _onScreen(String peer) => _foreground && selectedId == peer;
@@ -990,7 +1008,7 @@ class AppState extends ChangeNotifier {
     });
   }
 
-  static bool _offline(Object e) => '$e'.contains('no connected peer') || '$e'.contains('No direct path');
+  static bool _offline(Object e) => e is BridgeException && e.code == 'offline';
 
   Future<void> _drain(String peerId, bool resend) async {
     final convo = conversations[peerId];
@@ -1186,11 +1204,9 @@ class AppState extends ChangeNotifier {
           stdout.writeln('tincan: listening at ${ev['address']}');
         }
         selfAddress = ev['address'] as String? ?? selfAddress;
-        if (ev['name'] case final String n when n.isNotEmpty) {
-          selfName = n;
-          // Someone who named themselves before onboarding asked.
-          if (n != _fallbackName) unawaited(_markNamed());
-        }
+        if (ev['name'] case final String n when n.isNotEmpty) selfName = n;
+        // Someone who named themselves before onboarding asked.
+        if (ev['named'] == true) unawaited(_markNamed());
         selfDescription = ev['description'] as String? ?? selfDescription;
         selfStatus = ev['status'] as String? ?? selfStatus;
         final avatar = ev['avatarPath'] as String? ?? '';
@@ -1509,6 +1525,7 @@ class AppState extends ChangeNotifier {
     _background.dispose();
     _store?.dispose();
     focused.dispose();
+    requestsOpened.dispose();
     unawaited(_wipeCache(forget: true));
     super.dispose();
   }
