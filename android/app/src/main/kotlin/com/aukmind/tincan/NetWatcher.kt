@@ -23,19 +23,22 @@ internal val io: ExecutorService = Executors.newSingleThreadExecutor()
  */
 object NetWatcher {
     private val main = Handler(Looper.getMainLooper())
+    // Its own thread, so a network change never waits behind a file copy on io.
+    private val netIo: ExecutorService = Executors.newSingleThreadExecutor()
     // Main thread only.
     private var channel: MethodChannel? = null
     private var lastInterfaces: List<Map<String, Any>>? = null
     private var lastNetwork: Network? = null
+    private var lastAddrs: List<String>? = null
     private var defaultNetwork: Network? = null
+    private var defaultAddrs: List<String>? = null
     private var watching = false
-    private var primed = false
 
     fun attach(context: Context, engine: FlutterEngine) {
         val ch = MethodChannel(engine.dartExecutor.binaryMessenger, "tincan/netifs")
         ch.setMethodCallHandler { call, result ->
             when (call.method) {
-                "list" -> io.execute {
+                "list" -> netIo.execute {
                     val list = listInterfaces()
                     main.post {
                         lastInterfaces = list
@@ -48,38 +51,60 @@ object NetWatcher {
         channel = ch
         if (watching) return
         watching = true
+        val cm = context.applicationContext.getSystemService(ConnectivityManager::class.java)
+        // The network we start on is the baseline, not a change.
+        lastNetwork = cm.activeNetwork
+        lastAddrs = lastNetwork?.let { cm.getLinkProperties(it) }?.let(::addrsOf)
         val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) { main.post { defaultNetwork = network; push() } }
-            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) { main.post { push() } }
+            override fun onAvailable(network: Network) {
+                if (network != defaultNetwork) defaultAddrs = cm.getLinkProperties(network)?.let(::addrsOf)
+                defaultNetwork = network
+                push()
+            }
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                if (network == defaultNetwork) defaultAddrs = addrsOf(lp)
+                push()
+            }
             override fun onLost(network: Network) {
-                main.post {
-                    if (defaultNetwork == network) defaultNetwork = null
-                    push()
+                if (defaultNetwork == network) {
+                    defaultNetwork = null
+                    defaultAddrs = null
                 }
+                push()
             }
         }
-        context.applicationContext.getSystemService(ConnectivityManager::class.java)
-            .registerDefaultNetworkCallback(cb)
+        cm.registerDefaultNetworkCallback(cb, main)
     }
 
+    private fun addrsOf(lp: LinkProperties) = lp.linkAddresses.map { it.toString() }.sorted()
+
     private val send = Runnable {
-        io.execute {
+        netIo.execute {
             val list = listInterfaces()
             main.post {
                 val ch = channel ?: return@post
-                val listChanged = list != lastInterfaces
-                if (listChanged) {
-                    lastInterfaces = list
-                    ch.invokeMethod("changed", list)
-                }
                 // Wi-Fi to cellular can keep both interfaces up, so the
-                // list alone misses it.
-                if (listChanged || defaultNetwork != lastNetwork) {
-                    lastNetwork = defaultNetwork
-                    // The first callback is just the network we started on.
-                    if (primed) ch.invokeMethod("onNetworkChanged", null)
+                // list alone misses it; other interface churn is noise.
+                val networkChanged = defaultNetwork != lastNetwork || defaultAddrs != lastAddrs
+                lastNetwork = defaultNetwork
+                lastAddrs = defaultAddrs
+                val redial = networkChanged && defaultNetwork != null
+                if (list == lastInterfaces) {
+                    if (redial) ch.invokeMethod("onNetworkChanged", null)
+                    return@post
                 }
-                primed = true
+                lastInterfaces = list
+                if (!redial) {
+                    ch.invokeMethod("changed", list)
+                    return@post
+                }
+                // Redial only once Go has the new interfaces.
+                ch.invokeMethod("changed", list, object : MethodChannel.Result {
+                    override fun success(result: Any?) = ch.invokeMethod("onNetworkChanged", null)
+                    override fun error(errorCode: String, errorMessage: String?, errorDetails: Any?) =
+                        ch.invokeMethod("onNetworkChanged", null)
+                    override fun notImplemented() = ch.invokeMethod("onNetworkChanged", null)
+                })
             }
         }
     }

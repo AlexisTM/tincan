@@ -14,8 +14,6 @@ import java.io.File
 // local_auth needs a FragmentActivity; on a plain FlutterActivity every
 // biometric prompt fails before it is shown.
 class MainActivity : FlutterFragmentActivity() {
-    private var pendingPick: MethodChannel.Result? = null
-    private var pendingCreate: MethodChannel.Result? = null
     private val openDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         val result = pendingPick ?: return@registerForActivityResult
         pendingPick = null
@@ -35,6 +33,17 @@ class MainActivity : FlutterFragmentActivity() {
             pickedSwept = true
             io.execute { File(cacheDir, "picked").deleteRecursively() }
         }
+    }
+
+    override fun onDestroy() {
+        // A recreated activity gets the picker's result; a finished one never will.
+        if (isFinishing) {
+            pendingPick?.success(null)
+            pendingCreate?.success(null)
+            pendingPick = null
+            pendingCreate = null
+        }
+        super.onDestroy()
     }
 
     // One engine for the process: Back destroys the activity, but the app
@@ -129,5 +138,8 @@ class MainActivity : FlutterFragmentActivity() {
     companion object {
         private const val ENGINE_ID = "main"
         private var pickedSwept = false
+        // Process-wide like the engine, so a recreated activity can answer.
+        private var pendingPick: MethodChannel.Result? = null
+        private var pendingCreate: MethodChannel.Result? = null
     }
 }
