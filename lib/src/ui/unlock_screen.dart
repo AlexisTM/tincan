@@ -5,6 +5,7 @@ import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 import 'package:path/path.dart' as p;
 
+import '../backup.dart' show isSealedBackup;
 import '../files.dart';
 import '../theme.dart';
 import '../vault.dart';
@@ -35,33 +36,48 @@ class VaultSetupScreen extends StatefulWidget {
 }
 
 class _VaultSetupScreenState extends State<VaultSetupScreen> {
+  final _backupPassword = PlainTextEditingController();
   String? _backup;
+  bool _sealed = false;
 
   @override
   void dispose() {
     // It holds the private key in plaintext.
     unawaited(releasePicked(_backup));
+    _backupPassword.dispose();
     super.dispose();
   }
 
   Future<void> _chooseBackup() async {
     final path = await widget.pickBackup();
     if (path == null || !mounted) return;
+    final sealed = await isSealedBackup(path).catchError((Object _) => false);
+    if (!mounted) return;
     unawaited(releasePicked(_backup));
-    setState(() => _backup = path);
+    _backupPassword.clear();
+    setState(() {
+      _backup = path;
+      _sealed = sealed;
+    });
   }
 
   void _dropBackup() {
     unawaited(releasePicked(_backup));
-    setState(() => _backup = null);
+    _backupPassword.clear();
+    setState(() {
+      _backup = null;
+      _sealed = false;
+    });
   }
 
   Future<String?> _submit(LockMode mode, String password) async {
     final vault = widget.vault;
-    final err = await vault.create(mode, password: password);
     final backup = _backup;
+    final backupPassword = _backupPassword.text;
+    if (backup != null && _sealed && backupPassword.isEmpty) return 'Enter the backup password.';
+    final err = await vault.create(mode, password: password);
     if (err != null || backup == null) return err;
-    final failed = await vault.recover(backup);
+    final failed = await vault.recover(backup, password: backupPassword);
     // Leave no half-made store behind, so setup can simply run again.
     if (failed != null) await vault.erase();
     return failed;
@@ -98,6 +114,10 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
             ]),
           ),
           const SizedBox(height: 12),
+          if (_sealed) ...[
+            PasswordField(controller: _backupPassword, label: 'Backup password', onSubmitted: () {}),
+            const SizedBox(height: 12),
+          ],
         ],
         LockPicker(
           vault: widget.vault,
@@ -450,19 +470,16 @@ class _PrimaryButton extends StatelessWidget {
   final VoidCallback onPressed;
 
   @override
-  Widget build(BuildContext context) => SizedBox(
-        width: double.infinity,
-        child: FilledButton(
-          style: FilledButton.styleFrom(
-            minimumSize: const Size.fromHeight(48),
-            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
-          ),
-          onPressed: busy ? null : onPressed,
-          child: busyOr(
-              busy,
-              Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
-              size: 18),
+  Widget build(BuildContext context) => FilledButton(
+        style: FilledButton.styleFrom(
+          minimumSize: const Size.fromHeight(48),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
         ),
+        onPressed: busy ? null : onPressed,
+        child: busyOr(
+            busy,
+            Text(label, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+            size: 18),
       );
 }
 

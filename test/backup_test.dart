@@ -31,10 +31,10 @@ void main() {
     Future<void> copy(String src, String dst) async =>
         File(src).copySync(dst);
     final zip = '$mediaDst.zip';
-    await exportChats([convo], copy, zip);
+    await exportChats([convo], copy, zip, seal: _noCrypt);
     Future<String> seal(String src, String dir, String name) async =>
         File(src).copySync('$dir/$name').path;
-    final restored = await importChats(zip, mediaDst, seal);
+    final restored = await importChats(zip, mediaDst, seal, open: _noCrypt);
 
     expect(restored, hasLength(1));
     final rc = restored.single;
@@ -48,7 +48,7 @@ void main() {
     expect(media.path, isNot('$mediaSrc/ridge.jpg')); // landed in the new media dir
 
     // Merging the same backup again doesn't duplicate messages.
-    final again = (await importChats(zip, mediaDst, seal)).single;
+    final again = (await importChats(zip, mediaDst, seal, open: _noCrypt)).single;
     rc.mergeFrom(again);
     expect(rc.messages, hasLength(2));
   });
@@ -60,15 +60,19 @@ void main() {
       ..messages.add(ChatMessage(
           id: 'm1', outgoing: true, ts: DateTime(2026), kind: MessageKind.text, body: 'hey',
           status: MessageStatus.delivered));
-    // A byte flip stands in for the sealing.
+    // The bridge's magic plus a byte flip stands in for the sealing.
+    const magic = [0x54, 0x43, 0x42, 0x01];
     Future<void> flip(String src, String dst, String pw) async =>
-        File(dst).writeAsBytesSync([for (final b in File(src).readAsBytesSync()) b ^ pw.length]);
+        File(dst).writeAsBytesSync([...magic, for (final b in File(src).readAsBytesSync()) b ^ pw.length]);
+    Future<void> unflip(String src, String dst, String pw) async => File(dst)
+        .writeAsBytesSync([for (final b in File(src).readAsBytesSync().skip(magic.length)) b ^ pw.length]);
     final out = '${dir.path}/chats.tincan';
     await exportChats([convo], (s, d) async {}, out, password: 'pw', seal: flip);
     Future<String> seal(String src, String d, String name) async => '$d/$name';
 
-    await expectLater(importChats(out, dir.path, seal), throwsFormatException);
-    final back = await importChats(out, dir.path, seal, password: 'pw', open: flip);
+    expect(await isSealedBackup(out), isTrue);
+    await expectLater(importChats(out, dir.path, seal, open: unflip), throwsFormatException);
+    final back = await importChats(out, dir.path, seal, password: 'pw', open: unflip);
     expect(back.single.messages.single.body, 'hey');
     expect(back.single.messages.single.status, MessageStatus.delivered);
   });
@@ -87,3 +91,5 @@ void main() {
     expect(File(out).existsSync(), isFalse);
   });
 }
+
+Future<void> _noCrypt(String src, String dst, String password) => throw StateError('no password given');

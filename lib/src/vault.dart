@@ -69,7 +69,6 @@ class VaultManager {
 
   /// Creates the store. Returns an error message, or null.
   Future<String?> create(LockMode mode, {String password = ''}) async {
-    if (!LockMode.choices.contains(mode)) return 'Pick a device lock or a password.';
     final err = await _withNewSecret(mode, password,
         (secret) => _bridge.vaultCreate(stateDir: _stateDir, secret: secret, mode: mode.name));
     if (err == null) this.mode = mode;
@@ -139,7 +138,6 @@ class VaultManager {
 
   /// Switches how the store is locked, keeping the data.
   Future<String?> changeLock(LockMode mode, {String password = ''}) async {
-    if (!LockMode.choices.contains(mode)) return 'Pick a device lock or a password.';
     final err = await _withNewSecret(
         mode, password, (secret) => _bridge.vaultChangeSecret(secret: secret, mode: mode.name));
     if (err == null) this.mode = mode;
@@ -158,6 +156,7 @@ class VaultManager {
   /// Returns an error message, or null.
   Future<String?> _withNewSecret(
       LockMode mode, String password, Future<void> Function(String secret) apply) async {
+    if (!LockMode.choices.contains(mode)) return 'Pick a device lock or a password.';
     try {
       if (mode == LockMode.password) {
         if (password.isEmpty) return 'Pick a password.';

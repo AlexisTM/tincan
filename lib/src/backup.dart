@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:isolate';
 
 import 'package:archive/archive_io.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import 'models.dart';
@@ -15,6 +16,45 @@ import 'models.dart';
 /// key; only the chat history is assembled here.
 
 const _chatsKind = 'tincan-chats';
+
+/// What the bridge's SealFile writes first.
+const _sealedMagic = [0x54, 0x43, 0x42, 0x01]; // "TCB\x01"
+
+/// Whether [path] is a password-sealed backup, account or chats.
+Future<bool> isSealedBackup(String path) async {
+  final f = await File(path).open();
+  try {
+    final head = await f.read(_sealedMagic.length);
+    return listEquals(head, _sealedMagic);
+  } finally {
+    await f.close();
+  }
+}
+
+/// Scratch dirs hold decrypted history; a killed run leaves them behind.
+bool _sweptScratch = false;
+
+Future<Directory> _scratch(String prefix) async {
+  if (!_sweptScratch) {
+    _sweptScratch = true;
+    try {
+      await for (final e in Directory.systemTemp.list()) {
+        final name = p.basename(e.path);
+        if (e is Directory && (name.startsWith('tincan-export-') || name.startsWith('tincan-import-'))) {
+          await e.delete(recursive: true).then((_) {}, onError: (Object err) {
+            debugPrint('tincan: removing stale ${e.path}: $err');
+          });
+        }
+      }
+    } catch (e) {
+      debugPrint('tincan: sweeping backup scratch: $e');
+    }
+  }
+  return Directory.systemTemp.createTemp(prefix);
+}
+
+Future<void> _dropScratch(Directory scratch) => scratch.delete(recursive: true).then((_) {},
+    onError: (Object e) => debugPrint('tincan: removing ${scratch.path}: $e'));
 
 /// First "name.ext", "name (2).ext", … that [taken] doesn't claim.
 String _uniqueName(String name, bool Function(String) taken) {
@@ -32,17 +72,17 @@ typedef FileCrypt = Future<void> Function(String src, String dst, String passwor
 /// Zips the chat history plus every referenced media file into
 /// [outPath], decrypting each one through [decrypt] on the way out.
 /// Streams through disk so big media never sits in memory. With a
-/// [password] the zip is sealed through [seal].
+/// [password] the zip is sealed through [seal]. [outPath] is only
+/// replaced once the new file is complete.
 Future<void> exportChats(
   Iterable<Conversation> conversations,
   Future<void> Function(String src, String dst) decrypt,
   String outPath, {
   String password = '',
-  FileCrypt? seal,
+  required FileCrypt seal,
 }) async {
-  if (password.isNotEmpty && seal == null) throw ArgumentError('seal is required with a password');
-  final scratch = await Directory.systemTemp.createTemp('tincan-export-');
-  var done = false;
+  final scratch = await _scratch('tincan-export-');
+  final partial = File('$outPath.part');
   try {
     final mediaNames = <String, String>{}; // sealed path -> archive name
     final used = <String>{};
@@ -72,16 +112,16 @@ Future<void> exportChats(
     }
     final index = jsonEncode({'v': 2, 'kind': _chatsKind, 'conversations': convos});
     if (password.isEmpty) {
-      await _zipInIsolate(outPath, files, index);
+      await _zipInIsolate(partial.path, files, index);
     } else {
       final zip = p.join(scratch.path, 'chats.zip');
       await _zipInIsolate(zip, files, index);
-      await seal!(zip, outPath, password);
+      await seal(zip, partial.path, password);
     }
-    done = true;
+    await partial.rename(outPath);
   } finally {
-    await scratch.delete(recursive: true).then((_) {}, onError: (_) {});
-    if (!done) await File(outPath).delete().then((_) {}, onError: (_) {});
+    await _dropScratch(scratch);
+    if (await partial.exists()) await partial.delete().then((_) {}, onError: (_) {});
   }
 }
 
@@ -108,53 +148,54 @@ Future<void> _zip(String outPath, List<(String, String)> files, String index) as
 
 /// Unpacks the chats zip at [zipPath], sealing each media file into
 /// mediaDir through [seal], which picks a free name and returns it. A
-/// [password] backup is opened through [open] first.
+/// sealed backup is opened through [open] with [password] first.
 Future<List<Conversation>> importChats(
   String zipPath,
   String mediaDir,
   Future<String> Function(String src, String dir, String name) seal, {
   String password = '',
-  FileCrypt? open,
+  required FileCrypt open,
 }) async {
-  if (password.isNotEmpty && open == null) throw ArgumentError('open is required with a password');
-  final scratch = await Directory.systemTemp.createTemp('tincan-import-');
+  final sealed = await isSealedBackup(zipPath);
+  if (sealed && password.isEmpty) {
+    throw const FormatException('This chats file is sealed; enter its backup password.');
+  }
+  final scratch = await _scratch('tincan-import-');
   try {
     var zip = zipPath;
-    if (password.isNotEmpty) {
+    if (sealed) {
       zip = p.join(scratch.path, 'chats.zip');
-      await open!(zipPath, zip, password);
+      await open(zipPath, zip, password);
     }
     final (Map index, media) = await _unzipInIsolate(zip, scratch.path).catchError(
-        (Object e) => throw FormatException(password.isEmpty
-            ? 'Not a Tincan chats file, or it needs its password.'
-            : 'Not a Tincan chats file: $e'),
+        (Object e) => throw FormatException('Not a Tincan chats file: $e'),
         test: (e) => e is! FileSystemException);
-    final legacy = (index['v'] as num? ?? 1) < 2;
+    if (sealed) await File(zip).delete();
+
+    final List<Conversation> out;
+    try {
+      final legacy = (index['v'] as num? ?? 1) < 2;
+      out = [
+        for (final cj in (index['conversations'] as List? ?? const []))
+          Conversation.fromJson((cj as Map).cast<String, dynamic>(), legacy: legacy),
+      ];
+    } on TypeError catch (e) {
+      throw FormatException('Not a Tincan chats file: $e');
+    }
+
     final restored = <String, String>{}; // archive name -> sealed path
     for (final (name, tmp) in media) {
       restored[name] = await seal(tmp, mediaDir, p.basename(name));
       await File(tmp).delete();
     }
-
-    final out = <Conversation>[];
-    for (final cj in (index['conversations'] as List? ?? const [])) {
-      final map = (cj as Map).cast<String, dynamic>();
-      for (final m in (map['messages'] as List? ?? const []).cast<Map>()) {
-        final path = m['path'] as String?;
-        if (path != null) {
-          final abs = restored[path];
-          if (abs != null) {
-            m['path'] = abs;
-          } else {
-            m.remove('path');
-          }
-        }
+    for (final c in out) {
+      for (final m in c.messages) {
+        if (m.path != null) m.path = restored[m.path];
       }
-      out.add(Conversation.fromJson(map, legacy: legacy));
     }
     return out;
   } finally {
-    await scratch.delete(recursive: true).then((_) {}, onError: (_) {});
+    await _dropScratch(scratch);
   }
 }
 
