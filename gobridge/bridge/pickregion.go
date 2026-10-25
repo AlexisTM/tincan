@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
+	"net"
 	"net/http"
 	"runtime"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,10 +16,7 @@ import (
 	"tailscale.com/types/logger"
 )
 
-// pickNearestRegion finds the closest DERP region for a first run.
-// tailcat's own picker needs interface enumeration, which Android
-// denies apps and where it nil-panics, so mobile always probes over
-// HTTPS and the rest fall back to it.
+// pickNearestRegion finds the closest DERP region; mobile skips netcheck for HTTPS probes.
 func pickNearestRegion(ctx context.Context, mapURL string, logf logger.Logf) (*tailcfg.DERPRegion, error) {
 	dm, err := tailcat.FetchDERPMap(ctx, derpOpts(mapURL)...)
 	if err != nil {
@@ -46,6 +45,7 @@ func derpOpts(mapURL string) []any {
 // pickViaNetcheck measures over STUN. It fails rather than guess when
 // nothing answers: a guessed region would be pinned for good.
 func pickViaNetcheck(ctx context.Context, dm *tailcfg.DERPMap) (reg *tailcfg.DERPRegion, err error) {
+	// Only catches panics on this goroutine, not in netcheck's own.
 	defer func() {
 		if r := recover(); r != nil {
 			err = fmt.Errorf("netcheck panicked: %v", r)
@@ -63,7 +63,7 @@ func pickViaNetcheck(ctx context.Context, dm *tailcfg.DERPMap) (reg *tailcfg.DER
 
 const probeGrace = 150 * time.Millisecond
 
-// probeRegionsHTTP races one /derp/probe round-trip per region.
+// probeRegionsHTTP races a /derp/probe round-trip to every DERP node.
 func probeRegionsHTTP(ctx context.Context, dm *tailcfg.DERPMap) (*tailcfg.DERPRegion, error) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
@@ -76,40 +76,25 @@ func probeRegionsHTTP(ctx context.Context, dm *tailcfg.DERPMap) (*tailcfg.DERPRe
 	var wg sync.WaitGroup
 	probes := 0
 	for _, reg := range dm.Regions {
-		if len(reg.Nodes) == 0 || reg.Avoid {
+		if reg.Avoid || reg.NoMeasureNoHome {
 			continue
 		}
-		probes++
-		wg.Add(1)
-		go func(reg *tailcfg.DERPRegion) {
-			defer wg.Done()
-			node := reg.Nodes[0]
-			port := node.DERPPort
-			if port == 0 {
-				port = 443
+		for _, node := range reg.Nodes {
+			if node.STUNOnly {
+				continue
 			}
-			client := &http.Client{
-				Transport: &http.Transport{
-					TLSClientConfig: &tls.Config{InsecureSkipVerify: node.InsecureForTests},
-				},
-			}
-			defer client.CloseIdleConnections()
-			url := fmt.Sprintf("https://%s:%d/derp/probe", node.HostName, port)
-			req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-			if err != nil {
-				return
-			}
-			t0 := time.Now()
-			resp, err := client.Do(req)
-			if err != nil {
-				return
-			}
-			resp.Body.Close()
-			select {
-			case results <- answer{reg, time.Since(t0)}:
-			case <-ctx.Done():
-			}
-		}(reg)
+			probes++
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if rtt, ok := probeNode(ctx, node); ok {
+					select {
+					case results <- answer{reg, rtt}:
+					case <-ctx.Done():
+					}
+				}
+			}()
+		}
 	}
 	if probes == 0 {
 		return nil, fmt.Errorf("DERP map has no usable regions")
@@ -145,4 +130,27 @@ collect:
 		return nil, fmt.Errorf("no DERP region answered an HTTPS probe")
 	}
 	return best.reg, nil
+}
+
+func probeNode(ctx context.Context, node *tailcfg.DERPNode) (time.Duration, bool) {
+	port := node.DERPPort
+	if port == 0 {
+		port = 443
+	}
+	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.TLSClientConfig = &tls.Config{InsecureSkipVerify: node.InsecureForTests}
+	client := &http.Client{Transport: tr}
+	defer client.CloseIdleConnections()
+	url := "https://" + net.JoinHostPort(node.HostName, strconv.Itoa(port)) + "/derp/probe"
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return 0, false
+	}
+	t0 := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, false
+	}
+	resp.Body.Close()
+	return time.Since(t0), resp.StatusCode >= 200 && resp.StatusCode < 300
 }

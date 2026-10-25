@@ -8,9 +8,7 @@ import (
 	"tailscale.com/net/netmon"
 )
 
-// Android denies netlink interface enumeration to apps, so the host
-// feeds the list in from Java and netmon reads that instead of
-// net.Interfaces.
+// Android denies apps netlink enumeration, so the host feeds netmon the interface list.
 
 // NetInterface is one interface as reported by the host.
 type NetInterface struct {

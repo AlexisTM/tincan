@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
@@ -25,9 +26,9 @@ func TestProbeRegionsHTTP(t *testing.T) {
 	}
 	regionFor := func(id int, s *httptest.Server) *tailcfg.DERPRegion {
 		host, port, _ := net.SplitHostPort(s.Listener.Addr().String())
-		var portNum int
-		if _, err := net.LookupPort("tcp", port); err == nil {
-			portNum = mustAtoi(t, port)
+		portNum, err := strconv.Atoi(port)
+		if err != nil {
+			t.Fatal(err)
 		}
 		return &tailcfg.DERPRegion{
 			RegionID: tailcfg.DERPRegionID(id),
@@ -59,21 +60,12 @@ func TestProbeRegionsHTTP(t *testing.T) {
 	}
 }
 
-func mustAtoi(t *testing.T, s string) int {
-	t.Helper()
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			t.Fatalf("bad port %q", s)
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n
-}
-
 // A netcheck that hears nothing must fail, not hand back a guess that
 // would be pinned as the user's region.
 func TestNetcheckWithoutAnswersFails(t *testing.T) {
+	if testing.Short() {
+		t.Skip("real STUN round-trip")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	dm := &tailcfg.DERPMap{Regions: map[tailcfg.DERPRegionID]*tailcfg.DERPRegion{

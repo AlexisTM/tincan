@@ -32,17 +32,18 @@ func (m *Manager) readRoster() (rosterData, error) {
 	return r, err
 }
 
-// saveRoster persists the roster as it is now. Writers queue on saveMu
-// and each snapshots after getting it, so the last write is the latest.
-func (m *Manager) saveRoster() {
+// saveRoster snapshots under saveMu, so the last write is the latest.
+func (m *Manager) saveRoster() error {
 	m.saveMu.Lock()
 	defer m.saveMu.Unlock()
 	m.mu.Lock()
 	r := rosterData{maps.Clone(m.accepted), maps.Clone(m.blocked), maps.Clone(m.verified)}
 	m.mu.Unlock()
-	if err := m.saveJSON(rosterFile, r); err != nil {
+	err := m.saveJSON(rosterFile, r)
+	if err != nil {
 		m.logf("tincan: saving roster: %v", err)
 	}
+	return err
 }
 
 // Accept turns a pending request into a conversation and replays
@@ -57,6 +58,8 @@ func (m *Manager) Accept(peerID string) error {
 	delete(m.pending, peerID)
 	drop := m.installPeerLocked(p, false)
 	live := m.peers[peerID]
+	name, known := m.accepted[peerID]
+	changed := !known || name != p.name
 	mapSet(&m.accepted, peerID, p.name)
 	texts := p.pendingTexts
 	p.pendingTexts = nil
@@ -64,7 +67,9 @@ func (m *Manager) Accept(peerID string) error {
 	p.pendingProfile = nil
 	m.mu.Unlock()
 
-	m.saveRoster()
+	if changed {
+		m.saveRoster()
+	}
 	drop.close()
 	m.emit(m.peerAddedEvent(live))
 	if profile != nil {
@@ -73,16 +78,31 @@ func (m *Manager) Accept(peerID string) error {
 	for _, t := range texts {
 		m.emit(messageEvent(p, t))
 	}
+	// The accept is committed; a dead conn just means they hear on redial.
 	if live == p {
 		if err := p.writeMsg(&wireMsg{T: "accepted"}); err != nil {
-			return err
+			m.logf("tincan: telling %v they're accepted: %v", peerID, err)
 		}
 	}
-	// Acks go on whichever connection survived the tie-break.
+	// A dial racing this can tie-break live away, so follow the survivor.
 	go func() {
-		live.writeMsg(m.profileMsg())
-		for _, t := range texts {
-			live.writeMsg(&wireMsg{T: "ack", Ref: t.ID})
+		for to := live; to != nil; {
+			err := to.writeMsg(m.profileMsg())
+			for _, t := range texts {
+				if err == nil {
+					err = to.writeMsg(&wireMsg{T: "ack", Ref: t.ID})
+				}
+			}
+			if err == nil {
+				return
+			}
+			m.mu.Lock()
+			next := m.peers[peerID]
+			m.mu.Unlock()
+			if next == to {
+				return
+			}
+			to = next
 		}
 	}()
 	return nil
@@ -92,9 +112,7 @@ func (m *Manager) Accept(peerID string) error {
 func (m *Manager) Ignore(peerID string) error {
 	m.mu.Lock()
 	p := m.pending[peerID]
-	if p != nil {
-		delete(m.pending, peerID)
-	}
+	delete(m.pending, peerID)
 	m.mu.Unlock()
 	if p == nil {
 		return fmt.Errorf("no pending request from %v", peerID)
@@ -107,14 +125,17 @@ func (m *Manager) Ignore(peerID string) error {
 // number.
 func (m *Manager) SetVerified(peerID string, verified bool) error {
 	m.mu.Lock()
+	if m.verified[peerID] == verified {
+		m.mu.Unlock()
+		return nil
+	}
 	if verified {
 		mapSet(&m.verified, peerID, true)
 	} else {
 		delete(m.verified, peerID)
 	}
 	m.mu.Unlock()
-	m.saveRoster()
-	return nil
+	return m.saveRoster()
 }
 
 // Block refuses a peer for good: everything open is closed and future
@@ -132,12 +153,12 @@ func (m *Manager) Block(peerID string) error {
 	delete(m.accepted, peerID)
 	mapSet(&m.blocked, peerID, name)
 	m.mu.Unlock()
-	m.saveRoster()
+	err := m.saveRoster()
 
 	live.close()
 	pend.close()
 	m.emit(map[string]any{"type": "peer-blocked", "peer": peerID, "name": name})
-	return nil
+	return err
 }
 
 // Unblock lets a peer request a chat again.
@@ -149,9 +170,9 @@ func (m *Manager) Unblock(peerID string) error {
 	}
 	delete(m.blocked, peerID)
 	m.mu.Unlock()
-	m.saveRoster()
+	err := m.saveRoster()
 	m.emit(map[string]any{"type": "peer-unblocked", "peer": peerID})
-	return nil
+	return err
 }
 
 // BlockedPeer is one entry of ListBlocked.
