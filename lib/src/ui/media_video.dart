@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:video_player/video_player.dart';
 
@@ -9,8 +10,9 @@ import '../theme.dart';
 import 'image_viewer.dart' show openExternal;
 import 'toast.dart';
 
-/// Bigger videos wait for a tap before being decrypted for a thumbnail.
-const _autoDecryptBytes = 300 << 20;
+/// Bigger videos wait for a tap: each thumbnail costs a plaintext copy
+/// and a decoder.
+const _autoDecryptBytes = 32 << 20;
 
 /// A received or sent video: first frame and duration, played inline.
 class VideoBubble extends StatefulWidget {
@@ -25,36 +27,51 @@ class VideoBubble extends StatefulWidget {
 }
 
 class _VideoBubbleState extends State<VideoBubble> {
-  String? _path;
   bool _opening = false;
+  bool _playWhenReady = false;
   bool _failed = false;
   VideoPlayerController? _video;
+  ValueListenable<String?>? _plain;
+
+  bool get _small => (widget.msg.size ?? 0) <= _autoDecryptBytes;
 
   @override
   void initState() {
     super.initState();
-    if ((widget.msg.size ?? 0) <= _autoDecryptBytes) _load(play: false);
+    if (_small) _load(play: false);
   }
 
   @override
   void dispose() {
-    _video?.dispose();
+    _plain?.removeListener(_cacheChanged);
+    _drop();
     super.dispose();
+  }
+
+  // Disposed after the frame, so nothing still painting it sees it go.
+  void _drop() {
+    final video = _video;
+    _video = null;
+    if (video == null) return;
+    video.removeListener(_checkError);
+    WidgetsBinding.instance.addPostFrameCallback((_) => video.dispose());
   }
 
   Future<void> _load({required bool play}) async {
     final sealed = widget.msg.path;
-    if (sealed == null || _opening) return;
-    setState(() => _opening = true);
-    final path = _path ??= await widget.state.decryptForOpen(sealed);
-    if (!mounted) return;
-    if (path == null) {
-      setState(() {
-        _opening = false;
-        _failed = true;
-      });
+    if (sealed == null) return;
+    if (_opening) {
+      _playWhenReady |= play;
       return;
     }
+    _playWhenReady = play;
+    setState(() {
+      _opening = true;
+      _failed = false;
+    });
+    final path = await widget.state.decryptForOpen(sealed);
+    if (!mounted) return;
+    if (path == null) return _fail();
     final video = VideoPlayerController.file(File(path));
     try {
       await video.initialize();
@@ -62,31 +79,43 @@ class _VideoBubbleState extends State<VideoBubble> {
       await video.seekTo(Duration.zero);
     } catch (_) {
       await video.dispose();
-      if (mounted) {
-        setState(() {
-          _opening = false;
-          _failed = true;
-        });
-      }
+      if (mounted) _fail();
       return;
     }
     if (!mounted) {
       await video.dispose();
       return;
     }
-    video.addListener(_tick);
+    video.addListener(_checkError);
     setState(() {
       _video = video;
       _opening = false;
     });
-    if (play) await video.play();
+    // Tells this bubble when the cache wipe deletes the copy it plays.
+    _plain ??= widget.state.plaintext(sealed)..addListener(_cacheChanged);
+    if (_playWhenReady) await video.play();
   }
 
-  bool _wasPlaying = false;
+  void _fail() => setState(() {
+        _opening = false;
+        _failed = true;
+      });
 
-  void _tick() {
-    final playing = _video?.value.isPlaying ?? false;
-    if (playing != _wasPlaying && mounted) setState(() => _wasPlaying = playing);
+  void _cacheChanged() {
+    if (!mounted) return;
+    if (_plain?.value == null) {
+      if (_video != null) setState(_drop);
+    } else if (_video == null && !_opening && !_failed && _small) {
+      _load(play: false);
+    }
+  }
+
+  void _checkError() {
+    if (!(_video?.value.hasError ?? false) || !mounted) return;
+    setState(() {
+      _drop();
+      _failed = true;
+    });
   }
 
   Future<void> _toggle() async {
@@ -94,23 +123,28 @@ class _VideoBubbleState extends State<VideoBubble> {
     if (video == null) return _load(play: true);
     final v = video.value;
     if (v.isPlaying) return video.pause();
-    if (v.position >= v.duration) await video.seekTo(Duration.zero);
+    if (v.isCompleted) await video.seekTo(Duration.zero);
     await video.play();
   }
 
   Future<void> _external() async {
     final sealed = widget.msg.path;
     if (sealed == null) return;
-    final path = _path ??= await widget.state.decryptForOpen(sealed);
+    final path = await widget.state.decryptForOpen(sealed);
     if (!mounted) return;
     await showError(context, path == null ? 'Couldn\'t decrypt this file.' : openExternal(path));
   }
 
   @override
   Widget build(BuildContext context) {
+    final video = _video;
+    if (video == null) return _bubble(context, null);
+    return ListenableBuilder(listenable: video, builder: (context, _) => _bubble(context, video));
+  }
+
+  Widget _bubble(BuildContext context, VideoPlayerController? video) {
     final tc = TincanColors.of(context);
     const ink = Color(0xFFF4FBFA);
-    final video = _video;
     final width = widget.width;
     var height = width * 0.565;
     if (video != null && video.value.aspectRatio > 0) {
@@ -140,7 +174,11 @@ class _VideoBubbleState extends State<VideoBubble> {
           Positioned.fill(
             child: Material(
               type: MaterialType.transparency,
-              child: InkWell(onTap: _failed ? _external : _toggle),
+              child: Semantics(
+                button: true,
+                label: _failed ? 'Retry video' : playing ? 'Pause video' : 'Play video',
+                child: InkWell(onTap: _toggle),
+              ),
             ),
           ),
           if (_opening)
@@ -164,8 +202,7 @@ class _VideoBubbleState extends State<VideoBubble> {
                   shape: BoxShape.circle,
                   border: Border.all(color: const Color(0xD9FFF7EE), width: 1.5),
                 ),
-                child: const Icon(Icons.play_arrow_rounded,
-                    size: 30, color: ink, semanticLabel: 'Play video'),
+                child: const Icon(Icons.play_arrow_rounded, size: 30, color: ink),
               ),
             ),
           if (duration != null && duration > Duration.zero)
@@ -177,12 +214,9 @@ class _VideoBubbleState extends State<VideoBubble> {
                   padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
                   decoration: BoxDecoration(
                       color: const Color(0x99000000), borderRadius: BorderRadius.circular(6)),
-                  child: ValueListenableBuilder(
-                    valueListenable: video!,
-                    builder: (_, v, _) => Text(
-                        playing ? '${formatDuration(v.position)} / ${formatDuration(duration)}' : formatDuration(duration),
-                        style: Tc.mono(11, ink)),
-                  ),
+                  child: Text(
+                      playing ? '${formatDuration(video!.value.position)} / ${formatDuration(duration)}' : formatDuration(duration),
+                      style: Tc.mono(11, ink)),
                 ),
               ),
             ),

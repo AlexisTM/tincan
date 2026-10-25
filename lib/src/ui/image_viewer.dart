@@ -8,7 +8,7 @@ import '../files.dart';
 import 'toast.dart';
 
 /// Full-screen, zoomable view of a decrypted image. Esc, the close
-/// button or a vertical swipe at rest closes it.
+/// button, a tap beside the image or a vertical swipe at rest closes it.
 Future<void> showImageViewer(BuildContext context, {required String path, required String name}) {
   return Navigator.of(context).push(PageRouteBuilder<void>(
     opaque: false,
@@ -32,8 +32,13 @@ class ImageViewer extends StatefulWidget {
 
 class _ImageViewerState extends State<ImageViewer> {
   late final _zoom = TransformationController()..addListener(_zoomed);
+  final _scaffold = GlobalKey();
   double _drag = 0;
   bool _atRest = true;
+  bool _swiping = false;
+  int _pointers = 0;
+  // A second finger at any point makes the touch a pinch until all lift.
+  bool _multi = false;
 
   // Swipe-to-close only at rest, so it never fights panning a zoomed image.
   void _zoomed() {
@@ -49,19 +54,72 @@ class _ImageViewerState extends State<ImageViewer> {
 
   void _close() => Navigator.of(context).maybePop();
 
+  void _toast(String message) {
+    final ctx = _scaffold.currentContext;
+    if (ctx != null) showToast(ctx, message);
+  }
+
+  void _pointerDown(PointerDownEvent _) {
+    if (++_pointers > 1) {
+      _multi = true;
+      _stopSwipe();
+    }
+  }
+
+  void _pointerUp(PointerEvent _) {
+    if (--_pointers <= 0) {
+      _pointers = 0;
+      _multi = false;
+    }
+  }
+
+  void _stopSwipe() {
+    _swiping = false;
+    if (_drag != 0) setState(() => _drag = 0);
+  }
+
+  void _swipeStart(ScaleStartDetails d) => _swiping = _atRest && !_multi && d.pointerCount == 1;
+
+  void _swipeUpdate(ScaleUpdateDetails d) {
+    if (!_swiping) return;
+    if (d.pointerCount > 1 || !_atRest) return _stopSwipe();
+    setState(() => _drag += d.focalPointDelta.dy);
+  }
+
+  void _swipeEnd(ScaleEndDetails d) {
+    if (!_swiping) return;
+    // Still touching: another finger came down, not a release.
+    if (d.pointerCount > 0) return _stopSwipe();
+    _swiping = false;
+    if (_drag.abs() > 120 || d.velocity.pixelsPerSecond.dy.abs() > 900) {
+      _close();
+    } else {
+      setState(() => _drag = 0);
+    }
+  }
+
+  /// The cache wipe may have deleted the copy while the viewer stayed open.
+  Future<bool> _stillThere() async {
+    if (await File(widget.path).exists()) return true;
+    _toast('This image was cleared from the cache. Close and reopen it.');
+    return false;
+  }
+
   Future<void> _saveAs() async {
+    if (!await _stillThere()) return;
     final target = await chooseSaveTarget(widget.name, const [imageTypes]);
     if (target == null) return;
     final err = await target.write((dst) async {
       await File(widget.path).copy(dst);
       return null;
     });
-    if (mounted) showToast(context, err == null ? 'Saved' : 'Couldn\'t save: $err');
+    if (mounted) _toast(err == null ? 'Saved' : 'Couldn\'t save: $err');
   }
 
   Future<void> _openExternally() async {
+    if (!await _stillThere()) return;
     final err = await openExternal(widget.path);
-    if (err != null && mounted) showToast(context, err);
+    if (err != null && mounted) _toast(err);
   }
 
   @override
@@ -73,33 +131,40 @@ class _ImageViewerState extends State<ImageViewer> {
         autofocus: true,
         child: ScaffoldMessenger(
           child: Scaffold(
+            key: _scaffold,
             backgroundColor: Colors.transparent,
             body: Stack(children: [
               Positioned.fill(
-                child: GestureDetector(
-                  onVerticalDragUpdate:
-                      _atRest ? (d) => setState(() => _drag += d.delta.dy) : null,
-                  onVerticalDragEnd: !_atRest ? null : (d) {
-                    if (_drag.abs() > 120 || d.velocity.pixelsPerSecond.dy.abs() > 900) {
-                      _close();
-                    } else {
-                      setState(() => _drag = 0);
-                    }
-                  },
-                  child: Transform.translate(
-                    offset: Offset(0, _drag),
-                    child: InteractiveViewer(
-                      transformationController: _zoom,
-                      minScale: 1,
-                      maxScale: 6,
-                      child: Center(
-                        child: Semantics(
-                          image: true,
-                          label: widget.name,
-                          child: Image.file(File(widget.path),
-                              fit: BoxFit.contain,
-                              errorBuilder: (_, _, _) => const Icon(Icons.broken_image_outlined,
-                                  size: 48, color: ink)),
+                child: Listener(
+                  onPointerDown: _pointerDown,
+                  onPointerUp: _pointerUp,
+                  onPointerCancel: _pointerUp,
+                  child: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _close,
+                    child: Transform.translate(
+                      offset: Offset(0, _drag),
+                      child: InteractiveViewer(
+                        transformationController: _zoom,
+                        minScale: 1,
+                        maxScale: 6,
+                        onInteractionStart: _swipeStart,
+                        onInteractionUpdate: _swipeUpdate,
+                        onInteractionEnd: _swipeEnd,
+                        child: Center(
+                          // Takes taps on the image itself, so only the letterbox closes.
+                          child: GestureDetector(
+                            onTap: () {},
+                            excludeFromSemantics: true,
+                            child: Semantics(
+                              image: true,
+                              label: widget.name,
+                              child: Image.file(File(widget.path),
+                                  fit: BoxFit.contain,
+                                  errorBuilder: (_, _, _) => const Icon(Icons.broken_image_outlined,
+                                      size: 48, color: ink)),
+                            ),
+                          ),
                         ),
                       ),
                     ),
