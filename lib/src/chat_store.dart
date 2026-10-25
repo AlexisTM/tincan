@@ -75,7 +75,6 @@ class ChatStore {
   /// file falls back to its .bak, or is moved aside, one that can't be
   /// read right now is left for later, and [error] says so.
   Future<void> load() async {
-    await _quietly(Directory(_dir).create(recursive: true));
     final ids = <String>{};
     try {
       final (index, fromBak) = await _readIndex();
@@ -87,12 +86,10 @@ class ChatStore {
     }
     // The index can lag behind, or be lost; the files are the truth.
     try {
-      await for (final f in Directory(_dir).list()) {
-        if (_idFromFile(f.path) case final id?) ids.add(id);
+      for (final name in await _bridge.listState(_dir)) {
+        if (_idFromFile(name) case final id?) ids.add(id);
       }
-    } on PathNotFoundException {
-      // Nothing saved yet.
-    } on FileSystemException catch (e) {
+    } catch (e) {
       _problems['dir'] = 'the chat folder ($e)';
     }
     // Sized to the bridge's worker pool.
@@ -191,8 +188,8 @@ class ChatStore {
         fromBak = convo != null;
       } on _Broken catch (e) {
         _problems['aside:$id'] = 'a chat (${broken ?? e})';
-        await _moveAside(path, broken?.decoded);
-        await _moveAside('$path.bak', e.decoded);
+        if (broken != null) await _moveAside(path);
+        await _moveAside('$path.bak');
         return null;
       } catch (e) {
         return _cantRead(id, e);
@@ -201,7 +198,7 @@ class ChatStore {
     if (convo == null) {
       if (broken != null) {
         _problems['aside:$id'] = 'a chat ($broken)';
-        await _moveAside(path, broken.decoded);
+        await _moveAside(path);
       }
       return null;
     }
@@ -227,7 +224,7 @@ class ChatStore {
     try {
       raw = await _bridge.readState(path);
     } catch (e) {
-      if (_isBroken(e)) throw _Broken(e, null);
+      if (_isBroken(e)) throw _Broken(e);
       rethrow;
     }
     if (raw == null) return null;
@@ -235,7 +232,7 @@ class ChatStore {
       if (raw is! Map) throw const FormatException('not a chat');
       return Conversation.fromJson(raw.cast<String, dynamic>());
     } catch (e) {
-      throw _Broken(e, raw);
+      throw _Broken(e);
     }
   }
 
@@ -251,33 +248,14 @@ class ChatStore {
   static bool _isBroken(Object e) =>
       e is FormatException || e is BridgeException && _brokenSeal.any(e.message.contains);
 
-  /// Seals are bound to their path, so what still decodes is resealed
-  /// under the new name rather than renamed into garbage.
-  Future<void> _moveAside(String path, Object? decoded) async {
-    final aside = '$path.corrupt-${DateTime.now().millisecondsSinceEpoch}';
-    if (decoded != null) {
-      try {
-        await _bridge.writeState(aside, jsonEncode(decoded));
-        await _quietly(File(path).delete());
-        return;
-      } catch (_) {}
-    }
-    await _quietly(File(path).rename(aside));
-  }
+  Future<void> _moveAside(String path) => _quietly(
+      _bridge.renameState(path, '$path.corrupt-${DateTime.now().millisecondsSinceEpoch}'));
 
   static Future<void> _quietly(Future<Object?> f) => f.then((_) {}, onError: (_) {});
 
   /// Whether path is gone.
-  static Future<bool> _delete(String path) async {
-    try {
-      await File(path).delete();
-    } on PathNotFoundException {
-      // Already gone.
-    } on FileSystemException {
-      return false;
-    }
-    return true;
-  }
+  Future<bool> _delete(String path) =>
+      _bridge.deleteState(path).then((_) => true, onError: (_) => false);
 
   static String _indexJson(Set<String> ids) => jsonEncode({'v': 2, 'ids': ids.toList()});
 
@@ -363,7 +341,7 @@ class ChatStore {
     }
     if (failure == null && _legacyPending) {
       _legacyPending = false;
-      await _quietly(File(_legacy).delete());
+      await _quietly(_bridge.deleteState(_legacy));
     }
     if (failure != null) {
       stderr.writeln('tincan: saving chat history: $failure');
@@ -400,11 +378,8 @@ class ChatStore {
 
 /// A file that will never read: a bad seal or bad JSON.
 class _Broken implements Exception {
-  _Broken(this.error, this.decoded);
+  _Broken(this.error);
   final Object error;
-
-  /// What did decode, to keep.
-  final Object? decoded;
 
   @override
   String toString() => '$error';

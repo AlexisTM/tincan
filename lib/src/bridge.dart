@@ -103,6 +103,15 @@ abstract class Bridge {
   Future<Object?> readState(String path);
   Future<void> writeState(String path, Object json);
 
+  /// Deletes a state file; one already gone is fine.
+  Future<void> deleteState(String path);
+
+  /// Names of the files in dir; none when it doesn't exist.
+  Future<List<String>> listState(String dir);
+
+  /// Moves a state file, resealing it since seals are bound to paths.
+  Future<void> renameState(String src, String dst);
+
   /// Writes the plaintext of a received file to dst, for display or for
   /// handing to another app.
   Future<void> decryptMedia(String src, String dst);
@@ -348,6 +357,16 @@ class TincanBridge implements Bridge {
   @override
   Future<void> writeState(String path, Object json) =>
       _call('TincanWriteState', [path, json]);
+
+  @override
+  Future<void> deleteState(String path) => _call('TincanDeleteState', [path]);
+
+  @override
+  Future<List<String>> listState(String dir) async =>
+      ((await _call('TincanListState', [dir]))['names'] as List? ?? const []).cast<String>();
+
+  @override
+  Future<void> renameState(String src, String dst) => _call('TincanRenameState', [src, dst]);
 
   @override
   Future<void> decryptMedia(String src, String dst) =>

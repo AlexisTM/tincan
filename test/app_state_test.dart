@@ -134,6 +134,21 @@ class FakeBridge implements Bridge {
   Future<void> writeState(String path, Object json) async => states[path] = json;
 
   @override
+  Future<void> deleteState(String path) async => states.remove(path);
+
+  @override
+  Future<List<String>> listState(String dir) async => [
+        for (final k in states.keys)
+          if (k.startsWith('$dir/') && !k.substring(dir.length + 1).contains('/'))
+            k.substring(dir.length + 1),
+      ];
+
+  @override
+  Future<void> renameState(String src, String dst) async {
+    if (states.remove(src) case final v?) states[dst] = v;
+  }
+
+  @override
   Future<void> decryptMedia(String src, String dst) async {}
 
   @override
@@ -764,6 +779,23 @@ void main() {
     final again = <String, Conversation>{};
     await ChatStore(bridge, '/s', again).load();
     expect(again.keys, ['a']); // b's file is gone, the index alone doesn't bring it back
+  });
+
+  test('deleted chats and unreadable files are handled inside the store', () async {
+    final convos = <String, Conversation>{};
+    final store = ChatStore(bridge, '/s', convos);
+    await store.load();
+    convos['a'] = Conversation(id: 'a', name: 'nia');
+    await store.flush();
+    bridge.states['${store.fileFor('a')}.bak'] = bridge.states[store.fileFor('a')]!;
+    convos.remove('a');
+    await store.flush();
+    expect(bridge.states.keys.where((k) => k.contains(store.fileFor('a'))), isEmpty);
+
+    bridge.states[store.fileFor('x')] = '[1]';
+    await ChatStore(bridge, '/s', <String, Conversation>{}).load();
+    expect(bridge.states.containsKey(store.fileFor('x')), isFalse);
+    expect(bridge.states.keys.where((k) => k.startsWith('${store.fileFor('x')}.corrupt-')), hasLength(1));
   });
 
   test('old single-file history migrates, its sent messages count as delivered', () async {

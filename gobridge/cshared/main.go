@@ -183,6 +183,31 @@ func TincanWriteState(path, content *C.char) *C.char {
 	})
 }
 
+// TincanDeleteState, TincanListState and TincanRenameState cover the
+// rest of what the host does with its state files.
+//
+//export TincanDeleteState
+func TincanDeleteState(path *C.char) *C.char {
+	return withVault(func(v *bridge.Vault) (map[string]any, error) {
+		return nil, v.RemoveFile(C.GoString(path))
+	})
+}
+
+//export TincanListState
+func TincanListState(dir *C.char) *C.char {
+	return withVault(func(v *bridge.Vault) (map[string]any, error) {
+		names, err := v.ListDir(C.GoString(dir))
+		return map[string]any{"names": names}, err
+	})
+}
+
+//export TincanRenameState
+func TincanRenameState(src, dst *C.char) *C.char {
+	return withVault(func(v *bridge.Vault) (map[string]any, error) {
+		return nil, v.RenameFile(C.GoString(src), C.GoString(dst))
+	})
+}
+
 // TincanDecryptMedia writes the plaintext of a received file to dst,
 // for display or for handing to another app.
 //

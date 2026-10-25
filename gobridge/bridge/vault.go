@@ -494,6 +494,55 @@ func (v *Vault) ReadFile(path string) ([]byte, error) {
 	return plain, err
 }
 
+// RemoveFile deletes a state file; one already gone is fine.
+func (v *Vault) RemoveFile(path string) error {
+	return v.withKey(func([]byte) error {
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	})
+}
+
+// ListDir names the files in dir; a missing dir has none.
+func (v *Vault) ListDir(dir string) ([]string, error) {
+	names := []string{}
+	err := v.withKey(func([]byte) error {
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil
+		}
+		for _, e := range entries {
+			if e.Type().IsRegular() {
+				names = append(names, e.Name())
+			}
+		}
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	return names, nil
+}
+
+// RenameFile moves a state file, resealing it for its new path since
+// seals are bound to where they live. One that won't open is moved as
+// is: it was unreadable already.
+func (v *Vault) RenameFile(src, dst string) error {
+	plain, err := v.ReadFile(src)
+	if errors.Is(err, errLocked) || errors.Is(err, fs.ErrNotExist) {
+		return err
+	}
+	if err != nil {
+		return os.Rename(src, dst)
+	}
+	defer clear(plain)
+	if err := v.WriteFile(dst, plain, 0600); err != nil {
+		return err
+	}
+	return os.Remove(src)
+}
+
 func (v *Vault) String() string {
 	v.mu.RLock()
 	defer v.mu.RUnlock()

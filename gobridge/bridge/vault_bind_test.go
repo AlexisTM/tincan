@@ -329,3 +329,45 @@ func TestCheckAvatar(t *testing.T) {
 		t.Error("garbage accepted")
 	}
 }
+
+func TestStateFileOps(t *testing.T) {
+	v := newTestVault(t)
+	dir := filepath.Join(v.dir, "chats")
+	if names, err := v.ListDir(dir); err != nil || len(names) != 0 {
+		t.Fatalf("missing dir: %v, %v", names, err)
+	}
+	a, b := filepath.Join(dir, "a.json"), filepath.Join(dir, "b.json")
+	if err := v.WriteFile(a, []byte(`{"x":1}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	os.Mkdir(filepath.Join(dir, "sub"), 0700)
+	if names, _ := v.ListDir(dir); len(names) != 1 || names[0] != "a.json" {
+		t.Errorf("listed %v, want just a.json", names)
+	}
+	if err := v.RenameFile(a, b); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := v.ReadFile(b); err != nil || string(got) != `{"x":1}` {
+		t.Errorf("renamed file reads %q, %v", got, err)
+	}
+	if _, err := os.Stat(a); !errors.Is(err, os.ErrNotExist) {
+		t.Error("rename left the source")
+	}
+	os.WriteFile(a, []byte("garbage"), 0600)
+	if err := v.RenameFile(a, b+".corrupt"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(b + ".corrupt"); string(got) != "garbage" {
+		t.Error("an unreadable file should move as is")
+	}
+	if err := v.RemoveFile(b); err != nil {
+		t.Fatal(err)
+	}
+	if err := v.RemoveFile(b); err != nil {
+		t.Errorf("removing a missing file: %v", err)
+	}
+	v.Lock()
+	if _, err := v.ListDir(dir); !errors.Is(err, errLocked) {
+		t.Errorf("locked list: %v", err)
+	}
+}

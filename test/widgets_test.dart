@@ -127,6 +127,21 @@ class _NullBridge implements Bridge {
   Future<void> writeState(String path, Object json) async => states[path] = json;
 
   @override
+  Future<void> deleteState(String path) async => states.remove(path);
+
+  @override
+  Future<List<String>> listState(String dir) async => [
+        for (final k in states.keys)
+          if (k.startsWith('$dir/') && !k.substring(dir.length + 1).contains('/'))
+            k.substring(dir.length + 1),
+      ];
+
+  @override
+  Future<void> renameState(String src, String dst) async {
+    if (states.remove(src) case final v?) states[dst] = v;
+  }
+
+  @override
   Future<void> decryptMedia(String src, String dst) async {}
 
   @override
