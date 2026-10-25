@@ -51,6 +51,9 @@ class ChatMessage {
 
   bool get isMedia => kind != MessageKind.text;
 
+  /// Ours, with something to send again: text, or a sealed copy.
+  bool get resendable => outgoing && (kind == MessageKind.text || path != null);
+
   ValueNotifier<double?>? _progress;
 
   /// 0..1 while a transfer is running. Its own notifier, so a progress
@@ -187,15 +190,15 @@ class Conversation extends ChangeNotifier {
 
   String get initials => initialsOf(displayName);
 
-  String? _encoded;
+  /// Bumped on every change history stores.
+  int revision = 0;
 
-  /// This conversation as the history file stores it, encoded once per
-  /// change rather than on every save.
-  String get encoded => _encoded ??= jsonEncode(toJson());
+  /// This conversation as the history file stores it.
+  String get encoded => jsonEncode(toJson());
 
   /// Repaints, and marks what history stores as changed.
   void changed() {
-    _encoded = null;
+    revision++;
     notifyListeners();
   }
 
@@ -255,17 +258,44 @@ class Conversation extends ChangeNotifier {
     return c;
   }
 
-  /// Folds in another copy of this conversation, by message id.
+  /// Folds in another copy of this conversation, by message id. What
+  /// either side knows wins over what neither does.
   void mergeFrom(Conversation other) {
-    final have = {for (final m in messages) m.id};
+    final have = {for (final m in messages) m.id: m};
     for (final m in other.messages) {
-      if (!have.contains(m.id)) messages.add(m);
+      final mine = have[m.id];
+      if (mine == null) {
+        messages.add(m);
+        continue;
+      }
+      if (_rank(m.status) > _rank(mine.status)) mine.status = m.status;
+      mine.path ??= m.path;
+      for (final MapEntry(key: emoji, value: who) in m.reactions.entries) {
+        for (final w in who) {
+          if (mine.reactionOf(w) == null) mine.setReaction(w, emoji);
+        }
+      }
     }
     messages.sort((a, b) => a.ts.compareTo(b.ts));
     token ??= other.token;
     nickname ??= other.nickname;
     if (name == 'peer' && other.name.isNotEmpty) name = other.name;
+    if (description.isEmpty) description = other.description;
+    if (statusText.isEmpty) statusText = other.statusText;
+    avatarPath ??= other.avatarPath;
+    if (fp.isEmpty) fp = other.fp;
+    verified = verified || other.verified;
+    muted = muted || other.muted;
+    disappearAfter ??= other.disappearAfter;
   }
+
+  static int _rank(MessageStatus s) => switch (s) {
+        MessageStatus.failed || MessageStatus.interrupted => 0,
+        MessageStatus.queued => 1,
+        MessageStatus.sending => 2,
+        MessageStatus.sent => 3,
+        MessageStatus.delivered => 4,
+      };
 }
 
 /// An incoming peer waiting for the user to accept or refuse them.

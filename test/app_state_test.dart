@@ -67,9 +67,13 @@ class FakeBridge implements Bridge {
     timers.add((peer, id, seconds));
   }
 
+  final sentFiles = <(String, String)>[];
+
   @override
-  Future<FileMeta> sendFile(String peer, String id, String path) async =>
-      const FileMeta('pic.png', 'image', 42, '/media/pic.png');
+  Future<FileMeta> sendFile(String peer, String id, String path) async {
+    sentFiles.add((peer, id));
+    return const FileMeta('pic.png', 'image', 42, '/media/pic.png');
+  }
 
   final accepted = <String>[];
   final blocked = <String>[];
@@ -118,8 +122,12 @@ class FakeBridge implements Bridge {
   @override
   Future<void> vaultChangeSecret({required String secret, required String mode}) async {}
 
+  // Like the real bridge, hands back parsed JSON.
   @override
-  Future<Object?> readState(String path) async => states[path];
+  Future<Object?> readState(String path) async => switch (states[path]) {
+        final String text => jsonDecode(text),
+        final v => v,
+      };
 
   @override
   Future<void> writeState(String path, Object json) async => states[path] = json;
@@ -231,7 +239,7 @@ class _FlakyBridge extends FakeBridge {
 
   @override
   Future<Object?> readState(String path) async {
-    if (unreadable.contains(path)) throw BridgeException('bad seal');
+    if (unreadable.contains(path)) throw BridgeException('chacha20poly1305: message authentication failed');
     return super.readState(path);
   }
 
@@ -255,6 +263,8 @@ void main() {
     notifier = FakeNotifier();
     state = AppState(bridge, notifier: notifier);
   });
+
+  tearDown(() => state.dispose());
 
   ChatMessage text(String id, String body, {bool out = false, DateTime? ts}) => ChatMessage(
       id: id, outgoing: out, ts: ts ?? DateTime(2026), kind: MessageKind.text, body: body);
@@ -696,8 +706,7 @@ void main() {
     final a = convos['a'] = Conversation(id: 'a', name: 'nia');
     convos['b'] = Conversation(id: 'b', name: 'sam');
     await store.flush();
-    final first = a.encoded;
-    expect(identical(a.encoded, first), isTrue);
+    expect(store.error, isNull);
     expect(bridge.states.containsKey(store.fileFor('b')), isTrue);
 
     bridge.states.remove(store.fileFor('b'));
@@ -899,8 +908,10 @@ void main() {
     expect(bridge.cancels, [('nk:1', 'f1')]);
     expect(out.status, MessageStatus.failed);
     expect(out.progress.value, isNull);
+    final sends = bridge.sentFiles.length;
     await state.retry('nk:1', out);
-    expect(out.status, isNot(MessageStatus.failed));
+    expect(out.status, MessageStatus.sending);
+    expect(bridge.sentFiles.skip(sends), [('nk:1', 'f1')]);
 
     state.handleEvent({'type': 'file-begin', 'peer': 'nk:1', 'id': 'f2', 'name': 'a.jpg', 'size': 9, 'kind': 'image'});
     await state.cancelTransfer('nk:1', 'f2');

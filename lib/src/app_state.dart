@@ -47,6 +47,8 @@ class AppState extends ChangeNotifier {
 
   /// lockNow ran: the store is shut until [reopen].
   bool locked = false;
+  bool _locking = false;
+  bool _disposed = false;
 
   /// Another device is running this identity.
   bool identityConflict = false;
@@ -77,6 +79,9 @@ class AppState extends ChangeNotifier {
   final _jitter = Random();
   final _reconnectTimers = <String, Timer>{};
   final _dialing = <String>{};
+
+  /// Deleted while a redial was in flight; their peer-added is refused.
+  final _abandoned = <String>{};
   final _peerErrors = <String, String>{};
 
   /// Each peer's outbox drain, run one at a time and in order.
@@ -104,28 +109,29 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Decrypted copies of sealed files live here, wiped on lock, on exit
-  /// and once backgrounded past the window, so plaintext doesn't outlive
-  /// its use. Sealed paths never change content (avatars are named by
-  /// it), so a copy is made only once.
+  /// Plaintext copies of sealed files, wiped on lock, exit and long backgrounding.
   String? _cacheDir;
   String? _dataDir;
   final _decrypted = <String, Future<String?>>{};
-  final _media = <String, ValueNotifier<String?>>{};
+  final _media = <String, _Media>{};
   static final _noMedia = ValueNotifier<String?>(null);
   var _cacheGen = 0;
-  bool _cacheWiped = false;
+
+  /// Wiped copies, decrypted again only once something shows them.
+  final _stale = <String>{};
 
   /// The displayable copy of a sealed file, null until it lands or if it
   /// can't be read. Each path has its own notifier, so only what shows
   /// that file repaints.
   ValueListenable<String?> plaintext(String? sealed) {
     if (sealed == null || sealed.isEmpty) return _noMedia;
-    return _media.putIfAbsent(sealed, () {
-      final n = ValueNotifier<String?>(null);
-      _fill(sealed, n);
+    if (_media[sealed] case final n?) {
+      if (_stale.remove(sealed)) _fill(sealed, n);
       return n;
-    });
+    }
+    final n = _media[sealed] = _Media();
+    _fill(sealed, n);
+    return n;
   }
 
   void _fill(String sealed, ValueNotifier<String?> n) {
@@ -160,13 +166,7 @@ class AppState extends ChangeNotifier {
   /// unless [forget], which is for lock.
   Future<void> _wipeCache({bool forget = false}) async {
     _cacheTimer?.cancel();
-    _cacheGen++;
-    _decrypted.clear();
-    for (final n in _media.values) {
-      n.value = null;
-    }
-    if (forget) _media.clear();
-    _cacheWiped = _media.isNotEmpty;
+    _dropCopies(forget);
     if (_cacheDir case final dir?) {
       try {
         await _freshCache(dir);
@@ -174,17 +174,37 @@ class AppState extends ChangeNotifier {
         debugPrint('tincan: wiping the cache: $e');
       }
     }
+    // A decrypt that landed meanwhile wrote into the old dir.
+    _dropCopies(forget);
+    if (_foreground && !forget) _refillCache();
   }
 
+  void _dropCopies(bool forget) {
+    _cacheGen++;
+    _decrypted.clear();
+    for (final n in _media.values) {
+      n.value = null;
+    }
+    if (forget) _media.clear();
+    _stale
+      ..clear()
+      ..addAll(_media.keys);
+  }
+
+  /// Only what is on screen; the rest waits for its next [plaintext].
   void _refillCache() {
-    if (!_cacheWiped) return;
-    _cacheWiped = false;
-    _media.forEach(_fill);
+    for (final sealed in _stale.toList()) {
+      final n = _media[sealed];
+      if (n == null || !n.watched) continue;
+      _stale.remove(sealed);
+      _fill(sealed, n);
+    }
   }
 
   /// Forgets a sealed file's plaintext copy, which goes with it.
   void _forgetPlaintext(String sealed) {
     final copy = _decrypted.remove(sealed);
+    _stale.remove(sealed);
     _media.remove(sealed)?.value = null;
     unawaited(copy?.then((path) async {
       if (path != null) await File(path).delete();
@@ -254,7 +274,7 @@ class AppState extends ChangeNotifier {
   /// Loads what the unlocked store holds and brings the transport up.
   Future<void> _open() async {
     await _freshCache(_cacheDir!);
-    _cacheWiped = false;
+    _stale.clear();
     _store = ChatStore(_bridge, _stateDir!, conversations, onError: notifyListeners);
     final (loaded, _) = await (Settings.load(_bridge, _stateDir!), _store!.load()).wait;
     settings = loaded;
@@ -272,8 +292,9 @@ class AppState extends ChangeNotifier {
     _foreground = s == AppLifecycleState.resumed;
     // The debounced history write must not die with the app.
     if (!_foreground) unawaited(_store?.flush());
+    // The engine can come back with the same widgets, so their notifiers stay.
     if (s == AppLifecycleState.detached) {
-      unawaited(_wipeCache(forget: true));
+      unawaited(_wipeCache());
     } else if (s == AppLifecycleState.paused || s == AppLifecycleState.hidden) {
       _armCacheWipe();
     }
@@ -348,33 +369,39 @@ class AppState extends ChangeNotifier {
 
   // Lock
 
-  /// Shuts the store: flushes history, stops the transport, forgets the
-  /// key and every plaintext copy. The UI shows the unlock screen while
-  /// [locked], then calls [reopen].
+  /// Saves and shuts everything until the UI calls [reopen].
   Future<void> lockNow() async {
-    if (locked) return;
-    await _store?.flush();
+    if (locked || _locking) return;
+    _locking = true;
+    final store = _store;
+    await store?.flush();
+    // Its timers must not fire on the emptied conversations.
+    await store?.close();
     _store = null;
     _sweepTimer?.cancel();
-    for (final t in _reconnectTimers.values) {
-      t.cancel();
-    }
-    _reconnectTimers.clear();
-    _reconnectAttempts.clear();
+    _cancelAllReconnects();
     try {
       await _bridge.lock();
     } catch (e) {
       debugPrint('tincan: locking: $e');
     }
     locked = true;
+    _locking = false;
     await _wipeCache(forget: true);
     conversations.clear();
     requests.clear();
     blockedPeers.clear();
     _peerErrors.clear();
     _sources.clear();
+    _drains.clear();
+    _abandoned.clear();
+    _searchMemo = null;
     selectedId = null;
     selfAddress = null;
+    focused.value = null;
+    identityConflict = false;
+    _transportError = null;
+    _fatal = null;
     notifyListeners();
   }
 
@@ -448,22 +475,32 @@ class AppState extends ChangeNotifier {
 
   /// Persists settings and applies them. Changing the relay restarts
   /// the transport, which changes the address; if the new relay fails
-  /// while the old one works, the bridge keeps it and nothing is saved.
+  /// while the old one works, the bridge keeps it. What did apply is
+  /// saved even when a later part fails.
   Future<String?> saveSettings(Settings next) async {
+    String? err;
     try {
       if (next.relay != settings.relay) {
         handleEvent(await _bridge.setRelay(next.relay));
+        settings = settings.copyWith(relay: next.relay);
       }
-      if (next.directOnly != settings.directOnly) await _applyDirectOnly(next.directOnly);
+      if (next.directOnly != settings.directOnly) {
+        await _applyDirectOnly(next.directOnly);
+        settings = settings.copyWith(directOnly: next.directOnly);
+      }
       next.named = next.named || settings.named;
       settings = next;
-      if (_stateDir case final dir?) await next.save(_bridge, dir);
-      _background.update(next);
-      notifyListeners();
-      return null;
     } catch (e) {
-      return '$e';
+      err = '$e';
     }
+    try {
+      if (_stateDir case final dir?) await settings.save(_bridge, dir);
+    } catch (e) {
+      err ??= '$e';
+    }
+    _background.update(settings);
+    notifyListeners();
+    return err;
   }
 
   /// Chat only over direct paths; the relay just introduces peers.
@@ -611,6 +648,7 @@ class AppState extends ChangeNotifier {
     } on BridgeException catch (e) {
       return e.message;
     } finally {
+      if (_dialing.contains(peer)) _abandoned.add(peer);
       final convo = conversations.remove(peer);
       requests.removeWhere((r) => r.peer == peer);
       if (selectedId == peer) selectedId = null;
@@ -804,12 +842,9 @@ class AppState extends ChangeNotifier {
   /// shows it twice.
   Future<void> retry(String peerId, ChatMessage msg) async {
     final convo = conversations[peerId];
-    final resendable = msg.kind == MessageKind.text || msg.path != null || _sources.containsKey(msg.id);
-    if (convo == null ||
-        !msg.outgoing ||
-        msg.status != MessageStatus.failed ||
-        !resendable ||
-        !convo.messages.contains(msg)) {
+    final src = _sources[msg.id];
+    final resendable = msg.resendable || msg.outgoing && src != null && await File(src).exists();
+    if (convo == null || msg.status != MessageStatus.failed || !resendable || !convo.messages.contains(msg)) {
       return;
     }
     msg.status = MessageStatus.queued;
@@ -842,10 +877,17 @@ class AppState extends ChangeNotifier {
     await _deleteMedia([msg]);
   }
 
+  (String, List<(Conversation, int)>, List<(Conversation, ChatMessage)>)? _searchMemo;
+
   /// Messages matching q in any chat, newest first.
   List<(Conversation, ChatMessage)> search(String q) {
     final needle = q.trim().toLowerCase();
     if (needle.isEmpty) return const [];
+    final seen = [for (final c in conversations.values) (c, c.revision)];
+    if (_searchMemo case (final memoQ, final memoSeen, final memoHits)
+        when memoQ == needle && listEquals(memoSeen, seen)) {
+      return memoHits;
+    }
     final hits = [
       for (final c in conversations.values)
         for (final m in c.messages)
@@ -854,7 +896,9 @@ class AppState extends ChangeNotifier {
             (c, m),
     ];
     hits.sort((a, b) => b.$2.ts.compareTo(a.$2.ts));
-    return hits;
+    final out = List<(Conversation, ChatMessage)>.unmodifiable(hits);
+    _searchMemo = (needle, seen, out);
+    return out;
   }
 
   Future<void> attachAndSendFile(String peerId) async {
@@ -913,14 +957,22 @@ class AppState extends ChangeNotifier {
   }
 
   /// Seals the picked file into the store, since the original may go.
+  /// The source stays listed until then, so a drain meanwhile can use it.
   Future<void> _keepCopy(Conversation convo, ChatMessage msg) async {
-    final src = _sources.remove(msg.id);
+    final src = _sources[msg.id];
     if (src == null || msg.path != null) return;
     try {
-      msg.path = await _bridge.importMedia(src, _downloadDir ?? p.dirname(src), p.basename(src));
+      final kept = await _bridge.importMedia(src, _downloadDir ?? p.dirname(src), p.basename(src));
+      if (msg.path == null) {
+        msg.path = kept;
+      } else {
+        // A drain sent it meanwhile, which made its own sealed copy.
+        await File(kept).delete().then((_) {}, onError: (_) {});
+      }
+      _sources.remove(msg.id);
     } catch (e) {
-      debugPrint('tincan: keeping a queued file: $e');
-      msg.status = MessageStatus.failed;
+      debugPrint('tincan: keeping a file: $e');
+      if (msg.path == null && msg.status == MessageStatus.queued) msg.status = MessageStatus.failed;
     }
     convo.changed();
     _store?.scheduleSave();
@@ -951,14 +1003,16 @@ class AppState extends ChangeNotifier {
         _store?.scheduleSave();
       } catch (e) {
         debugPrint('tincan: sending timer: $e');
-        return;
+        // Retried next drain; it mustn't hold up the messages.
+        if (_offline(e) || !convo.connected) return;
       }
     }
-    for (final msg in List.of(convo.messages)) {
-      if (!msg.outgoing) continue;
-      final due = msg.status == MessageStatus.queued ||
-          (resend && (msg.status == MessageStatus.sending || msg.status == MessageStatus.sent));
-      if (!due || !convo.messages.contains(msg)) continue;
+    bool due(ChatMessage m) =>
+        m.outgoing &&
+        (m.status == MessageStatus.queued ||
+            (resend && (m.status == MessageStatus.sending || m.status == MessageStatus.sent)));
+    for (final msg in [for (final m in convo.messages) if (due(m)) m]) {
+      if (!due(msg) || !convo.messages.contains(msg)) continue;
       if (!convo.connected) return;
       msg.status = MessageStatus.sending;
       convo.changed();
@@ -970,6 +1024,8 @@ class AppState extends ChangeNotifier {
           final src = msg.path ?? _sources[msg.id];
           if (src == null) {
             msg.status = MessageStatus.failed;
+            convo.changed();
+            _store?.scheduleSave();
             continue;
           }
           msg.setProgress(0);
@@ -988,10 +1044,9 @@ class AppState extends ChangeNotifier {
         msg.status = gone ? MessageStatus.queued : MessageStatus.failed;
         convo.changed();
         _store?.scheduleSave();
-        if (gone) {
-          if (msg.path == null && _sources.containsKey(msg.id)) await _keepCopy(convo, msg);
-          return;
-        }
+        // The picked file may go once sendFile returns; a retry needs a copy.
+        if (msg.path == null && _sources.containsKey(msg.id)) await _keepCopy(convo, msg);
+        if (gone) return;
         continue;
       }
       convo.changed();
@@ -1022,9 +1077,7 @@ class AppState extends ChangeNotifier {
     return _redial(peerId);
   }
 
-  /// Delay before redialing a dropped peer, given how many redials have
-  /// already failed: 2s, 4s … 64s, then every 5 minutes while the app is
-  /// in front.
+  /// 2s, 4s … 64s after each failed redial, then every 5 minutes in front.
   static Duration reconnectDelay(int attempt) =>
       attempt < 6 ? Duration(seconds: 2 << attempt) : const Duration(minutes: 5);
 
@@ -1045,7 +1098,7 @@ class AppState extends ChangeNotifier {
     final convo = conversations[peerId];
     final token = convo?.token;
     if (convo == null || token == null || convo.blocked || convo.connected) return null;
-    if (!_dialing.add(peerId)) return null;
+    if (_disposed || !_dialing.add(peerId)) return null;
     convo
       ..reconnecting = true
       ..repaint();
@@ -1053,10 +1106,11 @@ class AppState extends ChangeNotifier {
       await _bridge.connect(token);
       return null;
     } catch (e) {
-      conversations[peerId]?.awaitingDirect = false;
+      _abandoned.remove(peerId);
+      convo.awaitingDirect = false;
       _reconnectAttempts[peerId] = (_reconnectAttempts[peerId] ?? 0) + 1;
       _scheduleReconnect(peerId);
-      conversations[peerId]?.repaint();
+      convo.repaint();
       return e is BridgeException ? e.message : '$e';
     } finally {
       _dialing.remove(peerId);
@@ -1065,7 +1119,7 @@ class AppState extends ChangeNotifier {
 
   void _scheduleReconnect(String peerId) {
     final convo = conversations[peerId];
-    if (convo == null || convo.token == null || convo.blocked || locked) return;
+    if (convo == null || convo.token == null || convo.blocked || locked || _disposed) return;
     final attempt = _reconnectAttempts[peerId] ?? 0;
     _reconnectTimers.remove(peerId)?.cancel();
     // Slow retries are for when the user is looking; resume redials.
@@ -1093,6 +1147,14 @@ class AppState extends ChangeNotifier {
     _reconnectAttempts.remove(peerId);
   }
 
+  void _cancelAllReconnects() {
+    for (final t in _reconnectTimers.values) {
+      t.cancel();
+    }
+    _reconnectTimers.clear();
+    _reconnectAttempts.clear();
+  }
+
   @visibleForTesting
   bool hasReconnectTimer(String peerId) => _reconnectTimers.containsKey(peerId);
 
@@ -1112,7 +1174,7 @@ class AppState extends ChangeNotifier {
 
   @visibleForTesting
   void handleEvent(Map<String, dynamic> ev) {
-    if (locked) return;
+    if (locked || _disposed) return;
     var convo = conversations[ev['peer']];
     var app = true; // repaint app-wide, not just convo
     var save = false; // history changed
@@ -1149,6 +1211,10 @@ class AppState extends ChangeNotifier {
 
       case 'peer-added':
         final id = ev['peer'] as String;
+        if (_abandoned.remove(id)) {
+          unawaited(_bridge.disconnect(id).then((_) {}, onError: (_) {}));
+          return;
+        }
         final c = convo ??= conversations[id] = Conversation(id: id, name: '');
         final name = ev['name'] as String? ?? '';
         final token = ev['token'] as String? ?? '';
@@ -1256,7 +1322,7 @@ class AppState extends ChangeNotifier {
         convo.markOffline();
         // Cut off mid-send: it goes again, same id, on reconnect.
         for (final m in convo.messages) {
-          if (m.outgoing && m.status == MessageStatus.sending && (m.kind == MessageKind.text || m.path != null)) {
+          if (m.resendable && m.status == MessageStatus.sending) {
             m
               ..status = MessageStatus.queued
               ..setProgress(null);
@@ -1400,8 +1466,11 @@ class AppState extends ChangeNotifier {
           ..setProgress(null)
           ..status = switch (ev['type']) {
             'recv-error' => MessageStatus.interrupted,
-            // Dropped with the connection: it resumes on reconnect.
-            _ when !convo!.connected && msg.path != null => MessageStatus.queued,
+            // Dropped with the connection: it resumes on reconnect. Go
+            // reports it before peer-removed.
+            _ when msg.path != null &&
+                    (!convo!.connected || '${ev['error']}'.contains('connection closed')) =>
+              MessageStatus.queued,
             _ => MessageStatus.failed,
           };
 
@@ -1425,10 +1494,14 @@ class AppState extends ChangeNotifier {
   }
 
   @override
+  void notifyListeners() {
+    if (!_disposed) super.notifyListeners();
+  }
+
+  @override
   void dispose() {
-    for (final t in _reconnectTimers.values) {
-      t.cancel();
-    }
+    _disposed = true;
+    _cancelAllReconnects();
     _sweepTimer?.cancel();
     _cacheTimer?.cancel();
     unawaited(_eventSub?.cancel());
@@ -1439,4 +1512,10 @@ class AppState extends ChangeNotifier {
     unawaited(_wipeCache(forget: true));
     super.dispose();
   }
+}
+
+class _Media extends ValueNotifier<String?> {
+  _Media() : super(null);
+
+  bool get watched => hasListeners;
 }

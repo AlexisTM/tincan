@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
@@ -27,19 +28,32 @@ class ChatStore {
   /// Called when [error] changes.
   final VoidCallback? onError;
 
-  /// What each conversation's file holds, by id.
-  final _saved = <String, String>{};
+  /// The revision each conversation's file holds, by id.
+  final _saved = <String, int>{};
+
+  /// Ids with a file on disk, which a delete has to remove.
+  final _onDisk = <String>{};
+
+  /// Files that failed for a reason that may pass; left alone and
+  /// read again on the next save.
+  final _unreadable = <String>{};
+
+  /// What couldn't be read, by what it is about; dropped once repaired.
+  final _problems = <String, String>{};
   Set<String>? _indexed;
   bool _legacyPending = false;
   bool _loaded = false;
+  bool _closed = false;
   Timer? _pending;
+  bool _backingOff = false;
   Future<void> _writing = Future.value();
   int _failures = 0;
-  String? _loadError;
   String? _saveError;
 
   /// Why some history couldn't be read or saved; null when all is well.
-  String? get error => _saveError ?? _loadError;
+  String? get error =>
+      _saveError ??
+      (_problems.isEmpty ? null : 'Some chat history couldn\'t be read: ${_problems.values.join('; ')}');
 
   String get _indexPath => p.join(_dir, 'index.json');
 
@@ -57,44 +71,40 @@ class ChatStore {
     }
   }
 
-  /// Reads the history into the conversations. Never throws: a file
-  /// that can't be read falls back to its .bak, or is moved aside, and
-  /// [error] says so. Saving works either way.
+  /// Reads the history into the conversations. Never throws: a broken
+  /// file falls back to its .bak, or is moved aside, one that can't be
+  /// read right now is left for later, and [error] says so.
   Future<void> load() async {
-    final problems = <String>[];
-    await Directory(_dir).create(recursive: true).then((_) {}, onError: (_) {});
+    await _quietly(Directory(_dir).create(recursive: true));
     final ids = <String>{};
     try {
-      final (index, _) = await _read(_indexPath, problems);
+      final (index, fromBak) = await _readIndex();
       if (index is Map) ids.addAll((index['ids'] as List? ?? const []).cast<String>());
-      if (index != null) _indexed = {...ids};
+      // One restored from its .bak stays unset, so the next save rewrites it.
+      if (index != null && !fromBak) _indexed = {...ids};
     } catch (e) {
-      problems.add('the chat index ($e)');
+      _problems['index'] = 'the chat index ($e)';
     }
     // The index can lag behind, or be lost; the files are the truth.
     try {
       await for (final f in Directory(_dir).list()) {
         if (_idFromFile(f.path) case final id?) ids.add(id);
       }
-    } on FileSystemException {
-      // No dir yet.
+    } on PathNotFoundException {
+      // Nothing saved yet.
+    } on FileSystemException catch (e) {
+      _problems['dir'] = 'the chat folder ($e)';
     }
-    for (final id in ids) {
-      final path = fileFor(id);
-      try {
-        final (raw, fromBak) = await _read(path, problems, label: 'a chat');
-        if (raw is! Map) continue;
-        final convo = Conversation.fromJson(raw.cast<String, dynamic>());
-        _conversations[convo.id] = convo;
-        // One restored from its .bak is rewritten.
-        if (!fromBak) _saved[convo.id] = convo.encoded;
-      } catch (e) {
-        problems.add('a chat ($e)');
-        await _moveAside(path);
+    // Sized to the bridge's worker pool.
+    final all = ids.toList();
+    for (var i = 0; i < all.length; i += 3) {
+      final batch = await Future.wait(all.sublist(i, min(i + 3, all.length)).map(_loadChat));
+      for (final c in batch) {
+        if (c != null) _conversations[c.id] = c;
       }
     }
     try {
-      final raw = _decoded(await _bridge.readState(_legacy));
+      final raw = await _bridge.readState(_legacy);
       if (raw is Map) {
         for (final c in (raw['conversations'] as List? ?? const [])) {
           final convo = Conversation.fromJson((c as Map).cast<String, dynamic>(), legacy: true);
@@ -111,40 +121,45 @@ class ChatStore {
       }
     } catch (e) {
       // Left where it is, for a later version or by hand.
-      problems.add('the old history file ($e)');
+      _problems['legacy'] = 'the old history file ($e)';
     }
     _loaded = true;
-    if (problems.isNotEmpty) {
-      _loadError = 'Some chat history couldn\'t be read: ${problems.join('; ')}';
-      onError?.call();
-    }
-    if (_legacyPending || _saved.length != _conversations.length) {
+    if (_problems.isNotEmpty) onError?.call();
+    if (_legacyPending || _conversations.values.any((c) => _saved[c.id] != c.revision)) {
       scheduleSave();
     }
-    // Every good read becomes the new .bak.
+    // Every good read becomes the new .bak, unless the .bak has it already.
     _writing = _writing.then((_) async {
       for (final id in _saved.keys.toList()) {
-        await _bridge.writeState('${fileFor(id)}.bak', _saved[id]!).then((_) {}, onError: (_) {});
+        final c = _conversations[id];
+        if (c == null || !await _bakStale(fileFor(id))) continue;
+        await _quietly(_bridge.writeState('${fileFor(id)}.bak', c.encoded));
       }
-      if (_indexed != null) {
-        await _bridge.writeState('$_indexPath.bak', _indexJson(_indexed!)).then((_) {}, onError: (_) {});
+      if (_indexed case final ids? when await _bakStale(_indexPath)) {
+        await _quietly(_bridge.writeState('$_indexPath.bak', _indexJson(ids)));
       }
     });
   }
 
-  /// The file, or its .bak when the file is missing or broken, and
+  /// Unless the .bak was written after the file last changed.
+  static Future<bool> _bakStale(String path) async {
+    final (file, bak) = await (FileStat.stat(path), FileStat.stat('$path.bak')).wait;
+    return bak.type == FileSystemEntityType.notFound || !bak.modified.isAfter(file.modified);
+  }
+
+  /// The index, or its .bak when the index is missing or broken, and
   /// whether it came from the .bak. Null when neither exists.
-  Future<(Object?, bool)> _read(String path, List<String> problems, {String? label}) async {
+  Future<(Object?, bool)> _readIndex() async {
     Object? first;
     try {
-      final v = _decoded(await _bridge.readState(path));
+      final v = await _bridge.readState(_indexPath);
       if (v != null) return (v, false);
     } catch (e) {
       first = e;
     }
     final Object? bak;
     try {
-      bak = _decoded(await _bridge.readState('$path.bak'));
+      bak = await _bridge.readState('$_indexPath.bak');
     } catch (e) {
       throw first ?? e;
     }
@@ -152,18 +167,116 @@ class ChatStore {
       if (first != null) throw first;
       return (null, false);
     }
-    if (first != null) problems.add('${label ?? 'the chat index'} (restored from backup)');
+    if (first != null) _problems['index'] = 'the chat index (restored from backup)';
     return (bak, true);
   }
 
-  // Written as JSON text; a store that hands the text back gets it parsed.
-  static Object? _decoded(Object? v) => v is String ? jsonDecode(v) : v;
-
-  Future<void> _moveAside(String path) async {
-    final stamp = DateTime.now().millisecondsSinceEpoch;
-    for (final f in [path, '$path.bak']) {
-      await File(f).rename('$f.corrupt-$stamp').then((_) {}, onError: (_) {});
+  /// One chat's file, or its .bak when the file is missing or broken for
+  /// good. Null when there is nothing to show.
+  Future<Conversation?> _loadChat(String id) async {
+    final path = fileFor(id);
+    _Broken? broken;
+    Conversation? convo;
+    try {
+      convo = await _readChat(path);
+    } on _Broken catch (e) {
+      broken = e;
+    } catch (e) {
+      return _cantRead(id, e);
     }
+    var fromBak = false;
+    if (convo == null) {
+      try {
+        convo = await _readChat('$path.bak');
+        fromBak = convo != null;
+      } on _Broken catch (e) {
+        _problems['aside:$id'] = 'a chat (${broken ?? e})';
+        await _moveAside(path, broken?.decoded);
+        await _moveAside('$path.bak', e.decoded);
+        return null;
+      } catch (e) {
+        return _cantRead(id, e);
+      }
+    }
+    if (convo == null) {
+      if (broken != null) {
+        _problems['aside:$id'] = 'a chat ($broken)';
+        await _moveAside(path, broken.decoded);
+      }
+      return null;
+    }
+    _onDisk.add(id);
+    // One restored from its .bak stays unsaved, so it gets rewritten.
+    if (!fromBak) {
+      _saved[id] = convo.revision;
+    } else if (broken != null) {
+      _problems['chat:$id'] = 'a chat (restored from backup)';
+    }
+    return convo;
+  }
+
+  Conversation? _cantRead(String id, Object e) {
+    _unreadable.add(id);
+    _problems['chat:$id'] = 'a chat ($e)';
+    return null;
+  }
+
+  /// Null when there is no file; throws [_Broken] when it will never read.
+  Future<Conversation?> _readChat(String path) async {
+    final Object? raw;
+    try {
+      raw = await _bridge.readState(path);
+    } catch (e) {
+      if (_isBroken(e)) throw _Broken(e, null);
+      rethrow;
+    }
+    if (raw == null) return null;
+    try {
+      if (raw is! Map) throw const FormatException('not a chat');
+      return Conversation.fromJson(raw.cast<String, dynamic>());
+    } catch (e) {
+      throw _Broken(e, raw);
+    }
+  }
+
+  // Go's words for a seal or JSON that won't ever open; anything else,
+  // a locked vault or a dead worker say, may pass.
+  static const _brokenSeal = [
+    'message authentication failed',
+    'not a sealed file',
+    'ciphertext truncated',
+    'MarshalJSON',
+  ];
+
+  static bool _isBroken(Object e) =>
+      e is FormatException || e is BridgeException && _brokenSeal.any(e.message.contains);
+
+  /// Seals are bound to their path, so what still decodes is resealed
+  /// under the new name rather than renamed into garbage.
+  Future<void> _moveAside(String path, Object? decoded) async {
+    final aside = '$path.corrupt-${DateTime.now().millisecondsSinceEpoch}';
+    if (decoded != null) {
+      try {
+        await _bridge.writeState(aside, jsonEncode(decoded));
+        await _quietly(File(path).delete());
+        return;
+      } catch (_) {}
+    }
+    await _quietly(File(path).rename(aside));
+  }
+
+  static Future<void> _quietly(Future<Object?> f) => f.then((_) {}, onError: (_) {});
+
+  /// Whether path is gone.
+  static Future<bool> _delete(String path) async {
+    try {
+      await File(path).delete();
+    } on PathNotFoundException {
+      // Already gone.
+    } on FileSystemException {
+      return false;
+    }
+    return true;
   }
 
   static String _indexJson(Set<String> ids) => jsonEncode({'v': 2, 'ids': ids.toList()});
@@ -171,8 +284,11 @@ class ChatStore {
   /// Bursts of changes collapse into one write, taken from the live
   /// conversations when the timer fires.
   void scheduleSave() {
-    if (!_loaded) return;
+    if (!_loaded || _closed) return;
+    // A failure streak keeps its backoff; the retry takes this change too.
+    if (_backingOff && (_pending?.isActive ?? false)) return;
     _pending?.cancel();
+    _backingOff = false;
     _pending = Timer(const Duration(seconds: 1), flush);
   }
 
@@ -181,43 +297,74 @@ class ChatStore {
   Future<void> flush() {
     _pending?.cancel();
     _pending = null;
-    if (!_loaded) return _writing;
+    _backingOff = false;
+    if (!_loaded || _closed) return _writing;
     return _writing = _writing.then((_) => _save());
   }
 
+  /// Reads again what failed before, folding it into the live chat.
+  Future<void> _retryUnreadable() async {
+    for (final id in _unreadable.toList()) {
+      _unreadable.remove(id);
+      _problems.remove('chat:$id');
+      final c = await _loadChat(id);
+      if (c == null) continue;
+      final live = _conversations[c.id];
+      if (live == null) {
+        _conversations[c.id] = c;
+      } else {
+        live
+          ..mergeFrom(c)
+          ..changed();
+      }
+    }
+  }
+
   Future<void> _save() async {
-    // Each conversation caches its own encoding until it changes.
-    final snapshot = {for (final c in _conversations.values) c.id: c.encoded};
+    final before = error;
+    await _retryUnreadable();
+    final live = _conversations.values.toList();
+    final ids = {for (final c in live) c.id};
     Object? failure;
-    for (final MapEntry(key: id, value: json) in snapshot.entries) {
-      if (_saved[id] == json) continue;
+    for (final c in live) {
+      final rev = c.revision;
+      if (_saved[c.id] == rev) continue;
+      // Its file holds history this copy lacks.
+      if (_unreadable.contains(c.id)) {
+        failure ??= 'a chat couldn\'t be read yet';
+        continue;
+      }
       try {
-        await _bridge.writeState(fileFor(id), json);
-        _saved[id] = json;
+        await _bridge.writeState(fileFor(c.id), c.encoded);
+        _saved[c.id] = rev;
+        _onDisk.add(c.id);
+        _problems.remove('chat:${c.id}');
       } catch (e) {
         failure = e;
       }
     }
-    for (final id in _saved.keys.where((id) => !snapshot.containsKey(id)).toList()) {
-      _saved.remove(id);
-      for (final f in [fileFor(id), '${fileFor(id)}.bak']) {
-        await File(f).delete().then((_) {}, onError: (_) {});
+    for (final id in _onDisk.where((id) => !ids.contains(id)).toList()) {
+      if (await _delete(fileFor(id)) && await _delete('${fileFor(id)}.bak')) {
+        _onDisk.remove(id);
+        _saved.remove(id);
+        _problems.remove('chat:$id');
+      } else {
+        failure ??= 'couldn\'t delete a chat';
       }
     }
-    final ids = snapshot.keys.toSet();
     if (_indexed == null || !setEquals(_indexed, ids)) {
       try {
         await _bridge.writeState(_indexPath, _indexJson(ids));
         _indexed = ids;
+        _problems.remove('index');
       } catch (e) {
         failure = e;
       }
     }
     if (failure == null && _legacyPending) {
       _legacyPending = false;
-      await File(_legacy).delete().then((_) {}, onError: (_) {});
+      await _quietly(File(_legacy).delete());
     }
-    final before = _saveError;
     if (failure != null) {
       stderr.writeln('tincan: saving chat history: $failure');
       _saveError = 'Chat history isn\'t saving: $failure';
@@ -225,13 +372,40 @@ class ChatStore {
       final delay = Duration(seconds: 2 << _failures.clamp(0, 5));
       _failures++;
       _pending?.cancel();
-      _pending = Timer(delay, flush);
+      if (!_closed) {
+        _pending = Timer(delay, flush);
+        _backingOff = true;
+      }
     } else {
       _failures = 0;
       _saveError = null;
     }
-    if (before != _saveError) onError?.call();
+    if (before != error) onError?.call();
   }
 
-  void dispose() => unawaited(flush());
+  /// Stops saving for good; completes once queued writes land. The
+  /// conversations must not change before then.
+  Future<void> close() {
+    _closed = true;
+    _pending?.cancel();
+    _pending = null;
+    return _writing;
+  }
+
+  void dispose() {
+    unawaited(flush());
+    unawaited(close());
+  }
+}
+
+/// A file that will never read: a bad seal or bad JSON.
+class _Broken implements Exception {
+  _Broken(this.error, this.decoded);
+  final Object error;
+
+  /// What did decode, to keep.
+  final Object? decoded;
+
+  @override
+  String toString() => '$error';
 }

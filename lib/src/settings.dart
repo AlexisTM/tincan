@@ -28,9 +28,11 @@ class Settings {
   /// Chat only over direct paths; the relay just introduces peers.
   bool directOnly;
 
+  /// Any window snaps to a nonzero preset; only 0 is off.
   static int snapBackground(int minutes) {
-    var best = backgroundPresets.first;
-    for (final p in backgroundPresets) {
+    if (minutes <= 0) return 0;
+    var best = backgroundPresets.firstWhere((p) => p > 0);
+    for (final p in backgroundPresets.where((p) => p > 0)) {
       if ((p - minutes).abs() < (best - minutes).abs()) best = p;
     }
     return best;
@@ -47,7 +49,7 @@ class Settings {
   Map<String, dynamic> toJson() => {
         'backgroundMinutes': backgroundMinutes,
         if (relay.isNotEmpty) 'relay': relay,
-        if (named) 'named': true,
+        'named': named,
         if (directOnly) 'directOnly': true,
       };
 
@@ -55,7 +57,8 @@ class Settings {
         // receiveInBackground predates backgroundMinutes.
         backgroundMinutes: j['receiveInBackground'] == false ? 0 : (j['backgroundMinutes'] as num?)?.toInt() ?? 15,
         relay: _relayFrom(j['relay'] as String?, j['derpHost'] as String?, j['derpMapUrl'] as String?),
-        named: j['named'] == true,
+        // Files from before naming was asked for have no key, and a name.
+        named: j['named'] as bool? ?? true,
         directOnly: j['directOnly'] == true,
       );
 
