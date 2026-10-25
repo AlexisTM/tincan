@@ -127,11 +127,53 @@ if(NOT CMAKE_BUILD_TYPE MATCHES "Debug")
     COMPONENT Runtime)
 endif()
 
-# Bundle the tincan Go transport bridge (built by gobridge/build.sh).
-set(TINCAN_BRIDGE_SO "${CMAKE_CURRENT_SOURCE_DIR}/../gobridge/build/libtincan_bridge.so")
-if(EXISTS "${TINCAN_BRIDGE_SO}")
-  install(FILES "${TINCAN_BRIDGE_SO}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
-    COMPONENT Runtime)
-else()
-  message(WARNING "libtincan_bridge.so not found; run gobridge/build.sh first")
+# Build the tincan Go transport bridge, rebuilt whenever its sources change.
+find_program(GO_EXECUTABLE go)
+if(NOT GO_EXECUTABLE)
+  message(FATAL_ERROR "go not found; the tincan bridge needs Go to build")
 endif()
+
+if(NOT FLUTTER_TARGET_PLATFORM)
+  if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)$")
+    set(FLUTTER_TARGET_PLATFORM "linux-arm64")
+  else()
+    set(FLUTTER_TARGET_PLATFORM "linux-x64")
+  endif()
+endif()
+if(FLUTTER_TARGET_PLATFORM STREQUAL "linux-arm64")
+  set(TINCAN_BRIDGE_GOARCH "arm64")
+elseif(FLUTTER_TARGET_PLATFORM STREQUAL "linux-x64")
+  set(TINCAN_BRIDGE_GOARCH "amd64")
+else()
+  message(FATAL_ERROR "unsupported target ${FLUTTER_TARGET_PLATFORM} for the tincan bridge")
+endif()
+
+# cgo needs a C compiler for the target; reuse Flutter's clang when cross-building.
+set(TINCAN_BRIDGE_CC "")
+if(CMAKE_CXX_COMPILER_TARGET)
+  string(REGEX REPLACE "\\+\\+$" "" TINCAN_BRIDGE_CLANG "${CMAKE_CXX_COMPILER}")
+  set(TINCAN_BRIDGE_CC "CC=${TINCAN_BRIDGE_CLANG} --target=${CMAKE_CXX_COMPILER_TARGET}")
+  if(CMAKE_SYSROOT)
+    string(APPEND TINCAN_BRIDGE_CC " --sysroot=${CMAKE_SYSROOT}")
+  endif()
+endif()
+
+set(TINCAN_BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../gobridge")
+file(GLOB_RECURSE TINCAN_BRIDGE_DEPS CONFIGURE_DEPENDS
+  "${TINCAN_BRIDGE_SRC}/*.go" "${TINCAN_BRIDGE_SRC}/go.mod" "${TINCAN_BRIDGE_SRC}/go.sum")
+list(FILTER TINCAN_BRIDGE_DEPS EXCLUDE REGEX "_test\\.go$")
+set(TINCAN_BRIDGE_SO "${CMAKE_BINARY_DIR}/tincan_bridge/libtincan_bridge.so")
+add_custom_command(
+  OUTPUT "${TINCAN_BRIDGE_SO}"
+  COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 GOOS=linux
+    GOARCH=${TINCAN_BRIDGE_GOARCH} ${TINCAN_BRIDGE_CC}
+    "${GO_EXECUTABLE}" build -trimpath -ldflags "-s -w" -buildmode=c-shared
+    -o "${TINCAN_BRIDGE_SO}" ./cshared
+  WORKING_DIRECTORY "${TINCAN_BRIDGE_SRC}"
+  DEPENDS ${TINCAN_BRIDGE_DEPS}
+  COMMENT "Building libtincan_bridge.so (${TINCAN_BRIDGE_GOARCH})"
+  VERBATIM)
+add_custom_target(tincan_bridge ALL DEPENDS "${TINCAN_BRIDGE_SO}")
+add_dependencies(${BINARY_NAME} tincan_bridge)
+install(FILES "${TINCAN_BRIDGE_SO}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime)

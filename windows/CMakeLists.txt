@@ -106,3 +106,44 @@ install(DIRECTORY "${PROJECT_BUILD_DIR}/${FLUTTER_ASSET_DIR_NAME}"
 install(FILES "${AOT_LIBRARY}" DESTINATION "${INSTALL_BUNDLE_DATA_DIR}"
   CONFIGURATIONS Profile;Release
   COMPONENT Runtime)
+
+# Build the tincan Go transport bridge, rebuilt whenever its sources change.
+find_program(GO_EXECUTABLE go)
+if(NOT GO_EXECUTABLE)
+  message(FATAL_ERROR "go not found; the tincan bridge needs Go to build")
+endif()
+# cgo can't use MSVC; it needs a MinGW-w64 gcc or clang on PATH, or CC set.
+if(NOT DEFINED ENV{CC})
+  find_program(TINCAN_BRIDGE_GCC gcc)
+  if(NOT TINCAN_BRIDGE_GCC)
+    message(FATAL_ERROR "no C compiler for cgo; put MinGW-w64 gcc on PATH or set CC")
+  endif()
+endif()
+
+if(NOT FLUTTER_TARGET_PLATFORM OR FLUTTER_TARGET_PLATFORM STREQUAL "windows-x64")
+  set(TINCAN_BRIDGE_GOARCH "amd64")
+elseif(FLUTTER_TARGET_PLATFORM STREQUAL "windows-arm64")
+  set(TINCAN_BRIDGE_GOARCH "arm64")
+else()
+  message(FATAL_ERROR "unsupported target ${FLUTTER_TARGET_PLATFORM} for the tincan bridge")
+endif()
+
+set(TINCAN_BRIDGE_SRC "${CMAKE_CURRENT_SOURCE_DIR}/../gobridge")
+file(GLOB_RECURSE TINCAN_BRIDGE_DEPS CONFIGURE_DEPENDS
+  "${TINCAN_BRIDGE_SRC}/*.go" "${TINCAN_BRIDGE_SRC}/go.mod" "${TINCAN_BRIDGE_SRC}/go.sum")
+list(FILTER TINCAN_BRIDGE_DEPS EXCLUDE REGEX "_test\\.go$")
+set(TINCAN_BRIDGE_DLL "${CMAKE_BINARY_DIR}/tincan_bridge/tincan_bridge.dll")
+add_custom_command(
+  OUTPUT "${TINCAN_BRIDGE_DLL}"
+  COMMAND ${CMAKE_COMMAND} -E env CGO_ENABLED=1 GOOS=windows
+    GOARCH=${TINCAN_BRIDGE_GOARCH}
+    "${GO_EXECUTABLE}" build -trimpath -ldflags "-s -w" -buildmode=c-shared
+    -o "${TINCAN_BRIDGE_DLL}" ./cshared
+  WORKING_DIRECTORY "${TINCAN_BRIDGE_SRC}"
+  DEPENDS ${TINCAN_BRIDGE_DEPS}
+  COMMENT "Building tincan_bridge.dll (${TINCAN_BRIDGE_GOARCH})"
+  VERBATIM)
+add_custom_target(tincan_bridge ALL DEPENDS "${TINCAN_BRIDGE_DLL}")
+add_dependencies(${BINARY_NAME} tincan_bridge)
+install(FILES "${TINCAN_BRIDGE_DLL}" DESTINATION "${INSTALL_BUNDLE_LIB_DIR}"
+  COMPONENT Runtime)
