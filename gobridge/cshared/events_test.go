@@ -1,13 +1,24 @@
 package main
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"tincan.dev/gobridge/bridge"
 )
 
+func resetPumps(t *testing.T) {
+	t.Cleanup(func() {
+		pumpMu.Lock()
+		pumpGen = 0
+		pumpCut = make(chan struct{})
+		pumpMu.Unlock()
+	})
+}
+
 func TestNewerPumpRetiresOlder(t *testing.T) {
+	resetPumps(t)
 	old := attachEvents()
 	done := make(chan string)
 	go func() { done <- nextEvent(old, 10*time.Second) }()
@@ -29,8 +40,17 @@ func TestNewerPumpRetiresOlder(t *testing.T) {
 	}
 }
 
-func TestQueuedEventGoesToNewPump(t *testing.T) {
-	m := bridge.New(bridge.Config{})
+func TestRetiredPumpLeavesEventForNewer(t *testing.T) {
+	resetPumps(t)
+	dir := t.TempDir()
+	if err := bridge.CreateVault(dir, "pw", "password"); err != nil {
+		t.Fatal(err)
+	}
+	v, err := bridge.OpenVault(dir, "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := bridge.New(bridge.Config{Vault: v, StateDir: dir})
 	mu.Lock()
 	mgr = m
 	mu.Unlock()
@@ -38,14 +58,31 @@ func TestQueuedEventGoesToNewPump(t *testing.T) {
 		mu.Lock()
 		mgr = nil
 		mu.Unlock()
+		m.Close()
 	})
+
 	old := attachEvents()
-	m.Requeue(`{"type":"message"}`)
-	cur := attachEvents()
-	if ev := nextEvent(old, time.Millisecond); ev != staleEvent {
-		t.Fatalf("old pump got %q", ev)
+	done := make(chan string)
+	go func() { done <- nextEvent(old, 10*time.Second) }()
+	time.Sleep(50 * time.Millisecond)
+	// Retire it without cutting it loose, so it wakes for the event.
+	pumpMu.Lock()
+	pumpGen++
+	cur := pumpGen
+	pumpMu.Unlock()
+	m.Block("x")
+	select {
+	case ev := <-done:
+		if ev != "" {
+			t.Fatalf("retired pump took %q", ev)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("retired pump kept waiting")
 	}
-	if ev := nextEvent(cur, time.Millisecond); ev != `{"type":"message"}` {
-		t.Fatalf("got %q", ev)
+	if ev := nextEvent(old, time.Millisecond); ev != staleEvent {
+		t.Fatalf("old pump got %q, want %q", ev, staleEvent)
+	}
+	if ev := nextEvent(cur, time.Second); !strings.Contains(ev, `"peer-blocked"`) {
+		t.Fatalf("current pump got %q, want the peer-blocked event", ev)
 	}
 }

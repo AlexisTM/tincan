@@ -8,6 +8,7 @@ require (
 	github.com/fxamacker/cbor/v2 v2.9.0
 	github.com/tailscale/tailcat v0.0.0-00010101000000-000000000000
 	golang.org/x/crypto v0.55.0
+	golang.org/x/image v0.47.0
 	tailscale.com v1.103.0-pre.0.20260830144538-72780705eda8
 )
 
@@ -50,7 +51,6 @@ require (
 	go4.org/mem v0.0.0-20240501181205-ae6ca9944745 // indirect
 	go4.org/netipx v0.0.0-20260823151212-3075585bcbeb // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/image v0.47.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.24.0 // indirect
 	golang.org/x/sys v0.49.0 // indirect

@@ -26,6 +26,10 @@ var (
 	mu    sync.Mutex // not reentrant
 	mgr   *bridge.Manager
 	vault *bridge.Vault
+
+	// life keeps Lock from closing a Manager while a call is bringing
+	// its server up; taken before mu.
+	life sync.Mutex
 )
 
 func result(v map[string]any, err error) *C.char {
@@ -42,8 +46,7 @@ func result(v map[string]any, err error) *C.char {
 	return C.CString(string(j))
 }
 
-// decodeArg parses a JSON arg, wiping the copy it parsed: some carry
-// secrets.
+// decodeArg parses a JSON arg and wipes its copy; decoded strings linger.
 func decodeArg[T any](s *C.char) (T, error) {
 	var v T
 	b := cBytes(s)
@@ -60,6 +63,13 @@ func withManager(f func(m *bridge.Manager) (map[string]any, error)) *C.char {
 		return result(nil, errors.New("bridge not started"))
 	}
 	return result(f(m))
+}
+
+// withLive runs a call that replaces the server, so Lock waits for it.
+func withLive(f func(m *bridge.Manager) (map[string]any, error)) *C.char {
+	life.Lock()
+	defer life.Unlock()
+	return withManager(f)
 }
 
 func withVault(f func(v *bridge.Vault) (map[string]any, error)) *C.char {
@@ -170,6 +180,9 @@ func TincanDecryptMedia(src, dst *C.char) *C.char {
 
 // cBytes copies a C string into bytes we can zero, unlike a Go string.
 func cBytes(s *C.char) []byte {
+	if s == nil {
+		return nil
+	}
 	return C.GoBytes(unsafe.Pointer(s), C.int(C.strlen(s)))
 }
 
@@ -232,14 +245,14 @@ func TincanStart(cfgJSON *C.char) *C.char {
 		DownloadDir string `json:"downloadDir"`
 		Name        string `json:"name"`
 		Relay       string `json:"relay"`
-		DERPHost    string `json:"derpHost"` // before relay
-		DERPMapURL  string `json:"derpMapUrl"`
 		DirectOnly  bool   `json:"directOnly"`
 		Verbose     bool   `json:"verbose"`
 	}](cfgJSON)
 	if err != nil {
 		return result(nil, err)
 	}
+	life.Lock()
+	defer life.Unlock()
 	mu.Lock()
 	if m := mgr; m != nil {
 		// The process outlives its UI: Android recreates the activity
@@ -254,16 +267,14 @@ func TincanStart(cfgJSON *C.char) *C.char {
 		mu.Unlock()
 		return result(nil, errors.New("locked: unlock before starting"))
 	}
-	if cfg.Relay != "" {
-		cfg.DERPHost, cfg.DERPMapURL = bridge.ParseRelay(cfg.Relay)
-	}
+	derpHost, derpMapURL := bridge.ParseRelay(cfg.Relay)
 	bcfg := bridge.Config{
 		Vault:       v,
 		StateDir:    cfg.StateDir,
 		DownloadDir: cfg.DownloadDir,
 		Name:        cfg.Name,
-		DERPHost:    cfg.DERPHost,
-		DERPMapURL:  cfg.DERPMapURL,
+		DERPHost:    derpHost,
+		DERPMapURL:  derpMapURL,
 		DirectOnly:  cfg.DirectOnly,
 	}
 	if cfg.Verbose {
@@ -335,16 +346,15 @@ func nextEvent(gen int, d time.Duration) string {
 		}
 		return ""
 	}
-	ev, ok := m.NextEventTimeout(d, cut)
+	// Checked as the event is taken, so a pump retired meanwhile leaves
+	// it for the newer one, in order.
+	ev, ok := m.NextEventIf(d, cut, func() bool {
+		pumpMu.Lock()
+		defer pumpMu.Unlock()
+		return gen == pumpGen
+	})
 	if !ok {
 		return ""
-	}
-	pumpMu.Lock()
-	defer pumpMu.Unlock()
-	if gen != pumpGen {
-		// Taken just as a newer pump attached; it gets it next.
-		m.Requeue(ev)
-		return staleEvent
 	}
 	return ev
 }
@@ -412,8 +422,12 @@ func TincanCancelTransfer(peer, id *C.char) *C.char {
 //
 //export TincanSetDirectOnly
 func TincanSetDirectOnly(on *C.char) *C.char {
+	b, err := strconv.ParseBool(C.GoString(on))
+	if err != nil {
+		return result(nil, err)
+	}
 	return withManager(func(m *bridge.Manager) (map[string]any, error) {
-		m.SetDirectOnly(C.GoString(on) == "true")
+		m.SetDirectOnly(b)
 		return nil, nil
 	})
 }
@@ -442,19 +456,19 @@ func TincanSetProfile(profileJSON *C.char) *C.char {
 //export TincanSetRelay
 func TincanSetRelay(relay *C.char) *C.char {
 	host, mapURL := bridge.ParseRelay(C.GoString(relay))
-	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+	return withLive(func(m *bridge.Manager) (map[string]any, error) {
 		return m.SetRelay(host, mapURL)
 	})
 }
 
 //export TincanRestart
 func TincanRestart() *C.char {
-	return withManager((*bridge.Manager).Restart)
+	return withLive((*bridge.Manager).Restart)
 }
 
 //export TincanResetIdentity
 func TincanResetIdentity() *C.char {
-	return withManager((*bridge.Manager).ResetIdentity)
+	return withLive((*bridge.Manager).ResetIdentity)
 }
 
 //export TincanAccept
@@ -487,8 +501,12 @@ func TincanIgnore(peer *C.char) *C.char {
 
 //export TincanSetVerified
 func TincanSetVerified(peer, verified *C.char) *C.char {
+	b, err := strconv.ParseBool(C.GoString(verified))
+	if err != nil {
+		return result(nil, err)
+	}
 	return withManager(func(m *bridge.Manager) (map[string]any, error) {
-		return nil, m.SetVerified(C.GoString(peer), C.GoString(verified) == "true")
+		return nil, m.SetVerified(C.GoString(peer), b)
 	})
 }
 
@@ -507,6 +525,8 @@ func TincanSetActivePeer(peer *C.char) *C.char {
 //
 //export TincanLock
 func TincanLock() *C.char {
+	life.Lock()
+	defer life.Unlock()
 	mu.Lock()
 	m, v := mgr, vault
 	mgr, vault = nil, nil
