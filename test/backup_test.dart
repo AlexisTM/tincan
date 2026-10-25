@@ -5,91 +5,75 @@ import 'package:tincan/src/backup.dart';
 import 'package:tincan/src/models.dart';
 
 void main() {
-  test('chats backup round-trips messages and media across devices', () async {
-    final mediaSrc = Directory.systemTemp.createTempSync('tc-chats-src').path;
-    final mediaDst = Directory.systemTemp.createTempSync('tc-chats-dst').path;
-    File('$mediaSrc/ridge.jpg').writeAsBytesSync(List.generate(100, (i) => i));
+  late Directory dir;
+  setUp(() => dir = Directory.systemTemp.createTempSync('tc-chats'));
+  tearDown(() => dir.delete(recursive: true));
 
-    final convo = Conversation(id: 'nk:1', name: 'nia', token: 'tcX');
-    convo.messages.add(ChatMessage(
-        id: 'm1',
-        outgoing: false,
-        ts: DateTime.fromMillisecondsSinceEpoch(1000),
-        kind: MessageKind.text,
-        body: 'hey'));
-    convo.messages.add(ChatMessage(
-        id: 'f1',
-        outgoing: false,
-        ts: DateTime.fromMillisecondsSinceEpoch(2000),
-        kind: MessageKind.image,
-        name: 'ridge.jpg',
-        size: 100,
-        path: '$mediaSrc/ridge.jpg'));
+  ChatMessage media(String id, String path) => ChatMessage(
+      id: id, outgoing: false, ts: DateTime(2026), kind: MessageKind.image, name: 'x', path: path);
 
-    // With encryption the media hops through these two callbacks; a
-    // plain copy stands in for the vault here.
-    Future<void> copy(String src, String dst) async =>
-        File(src).copySync(dst);
-    final zip = '$mediaDst.zip';
-    await exportChats([convo], copy, zip, seal: _noCrypt);
-    Future<String> seal(String src, String dir, String name) async =>
-        File(src).copySync('$dir/$name').path;
-    final restored = await importChats(zip, mediaDst, seal, open: _noCrypt);
+  test('chats backup carries the history and maps media through the bridge', () async {
+    Directory('${dir.path}/a').createSync();
+    for (final f in ['ridge.jpg', 'a/ridge.jpg']) {
+      File('${dir.path}/$f').writeAsStringSync(f);
+    }
+    final convo = Conversation(id: 'nk:1', name: 'nia', token: 'tcX')
+      ..messages.addAll([
+        ChatMessage(id: 'm1', outgoing: false, ts: DateTime(2026), kind: MessageKind.text, body: 'hey'),
+        media('f1', '${dir.path}/ridge.jpg'),
+        media('f2', '${dir.path}/a/ridge.jpg'),
+        media('f3', '${dir.path}/ridge.jpg'),
+        media('gone', '${dir.path}/missing.jpg'),
+      ]);
 
-    expect(restored, hasLength(1));
+    late String index;
+    late List<(String, String)> sent;
+    var pw = '';
+    await exportChats([convo], '${dir.path}/out', password: 'pw',
+        write: (dst, i, m, {String password = ''}) async {
+      index = i;
+      sent = m;
+      pw = password;
+    });
+    expect(pw, 'pw');
+    expect(sent, [
+      ('${dir.path}/ridge.jpg', 'media/ridge.jpg'),
+      ('${dir.path}/a/ridge.jpg', 'media/ridge (2).jpg'),
+    ]);
+
+    final restored = await importChats('${dir.path}/out', '/media', password: 'pw',
+        read: (src, mediaDir, {String password = ''}) async => (
+              index: index,
+              media: {for (final (_, name) in sent) name: '$mediaDir/${name.substring(6)}'},
+            ));
     final rc = restored.single;
-    expect(rc.id, 'nk:1');
     expect(rc.token, 'tcX');
-    expect(rc.messages, hasLength(2));
     expect(rc.messages.first.body, 'hey');
-    final media = rc.messages.last;
-    expect(media.kind, MessageKind.image);
-    expect(File(media.path!).readAsBytesSync(), List.generate(100, (i) => i));
-    expect(media.path, isNot('$mediaSrc/ridge.jpg')); // landed in the new media dir
-
-    // Merging the same backup again doesn't duplicate messages.
-    final again = (await importChats(zip, mediaDst, seal, open: _noCrypt)).single;
-    rc.mergeFrom(again);
-    expect(rc.messages, hasLength(2));
+    expect([for (final m in rc.messages.skip(1)) m.path],
+        ['/media/ridge.jpg', '/media/ridge (2).jpg', '/media/ridge.jpg', null]);
   });
 
   test('a password-sealed chats backup needs its password', () async {
-    final dir = Directory.systemTemp.createTempSync('tc-chats-pw');
-    addTearDown(() => dir.delete(recursive: true));
-    final convo = Conversation(id: 'nk:1', name: 'nia')
-      ..messages.add(ChatMessage(
-          id: 'm1', outgoing: true, ts: DateTime(2026), kind: MessageKind.text, body: 'hey',
-          status: MessageStatus.delivered));
-    // The bridge's magic plus a byte flip stands in for the sealing.
-    const magic = [0x54, 0x43, 0x42, 0x01];
-    Future<void> flip(String src, String dst, String pw) async =>
-        File(dst).writeAsBytesSync([...magic, for (final b in File(src).readAsBytesSync()) b ^ pw.length]);
-    Future<void> unflip(String src, String dst, String pw) async => File(dst)
-        .writeAsBytesSync([for (final b in File(src).readAsBytesSync().skip(magic.length)) b ^ pw.length]);
-    final out = '${dir.path}/chats.tincan';
-    await exportChats([convo], (s, d) async {}, out, password: 'pw', seal: flip);
-    Future<String> seal(String src, String d, String name) async => '$d/$name';
+    final out = File('${dir.path}/chats.tincan')..writeAsBytesSync([0x54, 0x43, 0x42, 0x01, 9]);
+    var reads = 0;
+    Future<({String index, Map<String, String> media})> read(String src, String mediaDir,
+        {String password = ''}) async {
+      reads++;
+      return (index: '{"v":2,"kind":"tincan-chats","conversations":[]}', media: <String, String>{});
+    }
 
-    expect(await isSealedBackup(out), isTrue);
-    await expectLater(importChats(out, dir.path, seal, open: unflip), throwsFormatException);
-    final back = await importChats(out, dir.path, seal, password: 'pw', open: unflip);
-    expect(back.single.messages.single.body, 'hey');
-    expect(back.single.messages.single.status, MessageStatus.delivered);
+    expect(await isSealedBackup(out.path), isTrue);
+    await expectLater(importChats(out.path, dir.path, read: read), throwsFormatException);
+    expect(reads, 0);
+    expect(await importChats(out.path, dir.path, password: 'pw', read: read), isEmpty);
   });
 
-  test('a failed export leaves no half-written file', () async {
-    final dir = Directory.systemTemp.createTempSync('tc-chats-fail');
-    addTearDown(() => dir.delete(recursive: true));
-    final out = '${dir.path}/chats.tincan';
-    Future<void> broken(String src, String dst, String pw) async {
-      File(dst).writeAsStringSync('partial');
-      throw const FileSystemException('disk full');
-    }
+  test('a history that is not a chats backup is refused', () async {
+    final out = File('${dir.path}/chats.zip')..writeAsStringSync('PK');
     await expectLater(
-        exportChats([Conversation(id: 'a', name: 'nia')], (s, d) async {}, out, password: 'pw', seal: broken),
-        throwsA(isA<FileSystemException>()));
-    expect(File(out).existsSync(), isFalse);
+        importChats(out.path, dir.path,
+            read: (src, mediaDir, {String password = ''}) async =>
+                (index: '{"v":2,"conversations":[1]}', media: <String, String>{})),
+        throwsFormatException);
   });
 }
-
-Future<void> _noCrypt(String src, String dst, String password) => throw StateError('no password given');

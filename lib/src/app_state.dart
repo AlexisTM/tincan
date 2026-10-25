@@ -576,8 +576,8 @@ class AppState extends ChangeNotifier {
 
   Future<String?> exportChats(String path, {String password = ''}) async {
     try {
-      await backup.exportChats(conversations.values, _bridge.decryptMedia, path,
-          password: password, seal: _bridge.sealFile);
+      await backup.exportChats(conversations.values, path,
+          password: password, write: _bridge.exportChats);
       return null;
     } catch (e) {
       return '$e';
@@ -586,8 +586,8 @@ class AppState extends ChangeNotifier {
 
   Future<String?> importChats(String path, {String password = ''}) async {
     try {
-      final imported = await backup.importChats(path, _downloadDir!, _bridge.importMedia,
-          password: password, open: _bridge.openFile);
+      final imported = await backup.importChats(path, _downloadDir!,
+          password: password, read: _bridge.importChats);
       for (final c in imported) {
         final existing = conversations[c.id];
         if (existing == null) {

@@ -45,8 +45,8 @@ void main() {
     await expectSendable('connect', () => bridge.connect('bogus'));
     await expectSendable('lock', () => bridge.lock());
     await expectSendable('exportAccount', () => bridge.exportAccount(out, password: 'pw'));
-    await expectSendable('sealFile', () => bridge.sealFile(missing, out, 'pw'));
-    await expectSendable('openFile', () => bridge.openFile(missing, out, 'pw'));
+    await expectSendable('exportChats', () => bridge.exportChats(out, '{}', [(missing, 'm')], password: 'pw'));
+    await expectSendable('importChats', () => bridge.importChats(missing, dir.path, password: 'pw'));
     await expectSendable('vaultChangeSecret', () => bridge.vaultChangeSecret(secret: 's', mode: 'password'));
   });
 }

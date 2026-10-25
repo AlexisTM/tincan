@@ -125,9 +125,16 @@ abstract class Bridge {
   Future<void> exportAccount(String dst, {String password = ''});
   Future<void> importAccount(String src, {String password = ''});
 
-  /// Password-wraps an arbitrary file (chat backups), and back.
-  Future<void> sealFile(String src, String dst, String password);
-  Future<void> openFile(String src, String dst, String password);
+  /// Chats backup: zips [index] with [media] (sealed path, name in the
+  /// backup), decrypting as it streams, sealed under a password if one
+  /// is given. No plaintext copy touches disk.
+  Future<void> exportChats(String dst, String index, List<(String, String)> media,
+      {String password = ''});
+
+  /// Seals a chats backup's media into [mediaDir], returning its index
+  /// and where each entry landed.
+  Future<({String index, Map<String, String> media})> importChats(String src, String mediaDir,
+      {String password = ''});
 
   /// Switches the relay. If it fails the old one stays in use, unless
   /// the transport is down: then the new one is kept and retried, and
@@ -385,12 +392,26 @@ class TincanBridge implements Bridge {
       _call('TincanImportAccount', [src, password]);
 
   @override
-  Future<void> sealFile(String src, String dst, String password) =>
-      _call('TincanSealFile', [src, dst, password]);
+  Future<void> exportChats(String dst, String index, List<(String, String)> media,
+          {String password = ''}) =>
+      _call('TincanExportChats', [
+        dst,
+        password,
+        {
+          'index': index,
+          'media': [for (final (path, name) in media) {'path': path, 'name': name}],
+        }
+      ]);
 
   @override
-  Future<void> openFile(String src, String dst, String password) =>
-      _call('TincanOpenFile', [src, dst, password]);
+  Future<({String index, Map<String, String> media})> importChats(String src, String mediaDir,
+      {String password = ''}) async {
+    final res = await _call('TincanImportChats', [src, password, mediaDir]);
+    return (
+      index: res['index'] as String,
+      media: (res['media'] as Map? ?? const {}).cast<String, String>(),
+    );
+  }
 
   @override
   Future<Map<String, dynamic>> setRelay(String relay) => _call('TincanSetRelay', [relay]);
@@ -414,7 +435,7 @@ class TincanBridge implements Bridge {
 const _slowCalls = {
   'TincanStart', 'TincanSetRelay', 'TincanRestart', 'TincanResetIdentity', 'TincanConnect',
   'TincanLock', 'TincanStopTransport', 'TincanExportAccount', 'TincanImportAccount',
-  'TincanSealFile', 'TincanOpenFile', 'TincanUnlock', 'TincanVaultCreate', 'TincanChangeSecret',
+  'TincanExportChats', 'TincanImportChats', 'TincanUnlock', 'TincanVaultCreate', 'TincanChangeSecret',
 };
 
 // Redials fire for every offline contact at once, each up to a minute.

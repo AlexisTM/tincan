@@ -279,40 +279,6 @@ func TestImportAccountValidatesBeforeWriting(t *testing.T) {
 	}
 }
 
-func TestSealFileRoundTrip(t *testing.T) {
-	dir := t.TempDir()
-	data := make([]byte, chunkSize*2+3)
-	rand.Read(data)
-	src, sealed, out := filepath.Join(dir, "a"), filepath.Join(dir, "b"), filepath.Join(dir, "c")
-	os.WriteFile(src, data, 0600)
-	if err := SealFile(src, sealed, []byte("pw")); err != nil {
-		t.Fatal(err)
-	}
-	if err := OpenFile(sealed, out, nil); !errors.Is(err, ErrPasswordRequired) {
-		t.Errorf("no password: %v", err)
-	}
-	if err := OpenFile(sealed, out, []byte("bad")); !errors.Is(err, errWrongPassword) {
-		t.Errorf("bad password: %v", err)
-	}
-	if err := OpenFile(sealed, out, []byte("pw")); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := os.ReadFile(out); !bytes.Equal(got, data) {
-		t.Error("round trip changed the data")
-	}
-	if err := OpenFile(src, out, nil); err != nil {
-		t.Fatal(err)
-	}
-	if got, _ := os.ReadFile(out); !bytes.Equal(got, data) {
-		t.Error("an unsealed file should copy through")
-	}
-	b, _ := os.ReadFile(sealed)
-	os.WriteFile(sealed, b[:len(b)-50], 0600)
-	if err := OpenFile(sealed, out, []byte("pw")); err == nil {
-		t.Error("a truncated backup should not open")
-	}
-}
-
 func TestCheckAvatar(t *testing.T) {
 	encode := func(w, h int) []byte {
 		var b bytes.Buffer
@@ -369,5 +335,61 @@ func TestStateFileOps(t *testing.T) {
 	v.Lock()
 	if _, err := v.ListDir(dir); !errors.Is(err, errLocked) {
 		t.Errorf("locked list: %v", err)
+	}
+}
+
+func TestChatsBackupRoundTrip(t *testing.T) {
+	v := newTestVault(t)
+	dir := t.TempDir()
+	big := make([]byte, chunkSize*2+3)
+	rand.Read(big)
+	sealed := filepath.Join(dir, "big.jpg")
+	if err := v.WriteMedia(sealed, big, 0600); err != nil {
+		t.Fatal(err)
+	}
+	index := []byte(`{"v":2,"kind":"tincan-chats","conversations":[]}`)
+	media := []ChatsMedia{{Path: sealed, Name: "media/big.jpg"}}
+	for _, pw := range []string{"", "pw"} {
+		out := filepath.Join(dir, "chats-"+pw)
+		if err := v.ExportChats(out, []byte(pw), index, media); err != nil {
+			t.Fatal(err)
+		}
+		raw, _ := os.ReadFile(out)
+		if bytes.Contains(raw, big[:64]) == (pw != "") {
+			t.Errorf("password %q: media should be in the clear only without one", pw)
+		}
+		if pw != "" {
+			if _, _, err := v.ImportChats(out, nil, dir); !errors.Is(err, ErrPasswordRequired) {
+				t.Errorf("no password: %v", err)
+			}
+			if _, _, err := v.ImportChats(out, []byte("bad"), dir); !errors.Is(err, errWrongPassword) {
+				t.Errorf("bad password: %v", err)
+			}
+		}
+		gotIndex, got, err := v.ImportChats(out, []byte(pw), filepath.Join(dir, "in"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(gotIndex, index) {
+			t.Errorf("index came back as %s", gotIndex)
+		}
+		back, err := v.ReadMedia(got["media/big.jpg"])
+		if err != nil || !bytes.Equal(back, big) {
+			t.Errorf("password %q: media didn't round-trip: %v", pw, err)
+		}
+	}
+	if spills, _ := filepath.Glob(filepath.Join(v.dir, spillGlob)); len(spills) != 0 {
+		t.Errorf("spills left behind: %v", spills)
+	}
+
+	out := filepath.Join(dir, "chats-pw")
+	b, _ := os.ReadFile(out)
+	os.WriteFile(out, b[:len(b)-50], 0600)
+	if _, _, err := v.ImportChats(out, []byte("pw"), dir); err == nil {
+		t.Error("a truncated backup should not open")
+	}
+	os.WriteFile(out, []byte("not a zip"), 0600)
+	if _, _, err := v.ImportChats(out, nil, dir); !errors.Is(err, errNotChats) {
+		t.Errorf("garbage: %v", err)
 	}
 }

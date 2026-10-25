@@ -1040,46 +1040,6 @@ func openStream(r io.Reader, password []byte) (io.Reader, []byte, error) {
 	return &chunkReader{key: staticKey(key), bind: backupBind(salt), r: r, firstErr: errWrongPassword}, key, nil
 }
 
-// SealFile encrypts src into dst under password, streaming.
-func SealFile(src, dst string, password []byte) error {
-	if len(password) == 0 {
-		return ErrPasswordRequired
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	return sealStream(dst, password, func(w io.Writer) error {
-		_, err := io.Copy(w, in)
-		return err
-	})
-}
-
-// OpenFile decrypts a SealFile output into dst, or copies an unsealed
-// file as is, so callers can ask for a password on ErrPasswordRequired.
-func OpenFile(src, dst string, password []byte) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	var magic [len(backupMagic)]byte
-	n, err := io.ReadFull(in, magic[:])
-	var r io.Reader = io.MultiReader(bytes.NewReader(magic[:n]), in)
-	if err == nil && string(magic[:]) == backupMagic {
-		var key []byte
-		if r, key, err = openStream(in, password); err != nil {
-			return err
-		}
-		defer clear(key)
-	}
-	return writeFileAtomic(dst, 0600, func(w io.Writer) error {
-		_, err := io.Copy(w, r)
-		return err
-	})
-}
-
 // AccountBackup is the portable form of an account, readable on
 // another device: plain JSON, or sealed under a password when one is
 // given. It carries the private key.

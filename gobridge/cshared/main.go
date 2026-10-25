@@ -260,22 +260,40 @@ func TincanImportAccount(src, password *C.char) *C.char {
 	})
 }
 
-// TincanSealFile and TincanOpenFile password-wrap a file such as a
-// chat backup. Opening an unsealed file copies it, so an empty password
-// works until the error says "password required".
+// TincanExportChats writes a chats backup: manifest holds the history
+// index the host built and the media to decrypt into it.
 //
-//export TincanSealFile
-func TincanSealFile(src, dst, password *C.char) *C.char {
+//export TincanExportChats
+func TincanExportChats(dst, password, manifest *C.char) *C.char {
 	pw := cBytes(password)
 	defer clear(pw)
-	return result(nil, bridge.SealFile(C.GoString(src), C.GoString(dst), pw))
+	m, err := decodeArg[struct {
+		Index string              `json:"index"`
+		Media []bridge.ChatsMedia `json:"media"`
+	}](manifest)
+	if err != nil {
+		return result(nil, err)
+	}
+	return withVault(func(v *bridge.Vault) (map[string]any, error) {
+		return nil, v.ExportChats(C.GoString(dst), pw, []byte(m.Index), m.Media)
+	})
 }
 
-//export TincanOpenFile
-func TincanOpenFile(src, dst, password *C.char) *C.char {
+// TincanImportChats seals a chats backup's media into mediaDir and
+// returns its index with where each entry landed. A sealed one with an
+// empty password fails with "password required".
+//
+//export TincanImportChats
+func TincanImportChats(src, password, mediaDir *C.char) *C.char {
 	pw := cBytes(password)
 	defer clear(pw)
-	return result(nil, bridge.OpenFile(C.GoString(src), C.GoString(dst), pw))
+	return withVault(func(v *bridge.Vault) (map[string]any, error) {
+		index, media, err := v.ImportChats(C.GoString(src), pw, C.GoString(mediaDir))
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{"index": string(index), "media": media}, nil
+	})
 }
 
 // TincanImportMedia seals src into dir under a free variant of name.

@@ -66,10 +66,13 @@ class _NullBridge implements Bridge {
   Future<void> lock() async {}
 
   @override
-  Future<void> sealFile(String src, String dst, String password) async {}
+  Future<void> exportChats(String dst, String index, List<(String, String)> media,
+      {String password = ''}) async {}
 
   @override
-  Future<void> openFile(String src, String dst, String password) async {}
+  Future<({String index, Map<String, String> media})> importChats(String src, String mediaDir,
+          {String password = ''}) async =>
+      (index: '{"v":2,"kind":"tincan-chats","conversations":[]}', media: <String, String>{});
 
   @override
   Future<FileMeta> sendFile(String peer, String id, String path) async =>
