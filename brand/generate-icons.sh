@@ -1,5 +1,5 @@
 #!/bin/sh
-# Regenerates app icons and in-app assets from brand/logo-color.svg
+# Regenerates Android and iOS app icons and in-app assets from brand/logo-color.svg
 # (the tile) and brand/logo-mono.svg. Needs rsvg-convert and ImageMagick.
 set -e
 cd "$(dirname "$0")/.."
@@ -33,6 +33,16 @@ for spec in "mdpi 108" "hdpi 162" "xhdpi 216" "xxhdpi 324" "xxxhdpi 432"; do
 	dir="$RES/mipmap-$1"
 	layer "$TMP/foreground.svg" "$2" "$dir/ic_launcher_foreground.png"
 	layer "$TMP/mono.svg" "$2" "$dir/ic_launcher_monochrome.png"
+done
+
+# iOS masks the corners itself and rejects alpha, so it gets the tile full bleed.
+IOS=ios/Runner/Assets.xcassets/AppIcon.appiconset
+sed -e 's/viewBox="0 0 256 256"/viewBox="16 16 224 224"/' -e 's/rx="56"/rx="0"/' \
+	brand/logo-color.svg > "$TMP/ios.svg"
+for f in "$IOS"/Icon-App-*.png; do
+	px=$(basename "$f" .png | sed -E 's/Icon-App-([0-9.]+)x[0-9.]+@([0-9])x/\1*\2/' | awk -F'*' '{ printf "%d", $1 * $2 + 0.5 }')
+	rsvg-convert -w "$px" -h "$px" "$TMP/ios.svg" -o "$TMP/ios.png"
+	magick "$TMP/ios.png" -alpha off "PNG24:$f"
 done
 
 mkdir -p assets
