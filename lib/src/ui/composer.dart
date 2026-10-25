@@ -68,8 +68,6 @@ class _ComposerState extends State<Composer> {
     super.dispose();
   }
 
-  bool get _wide => MediaQuery.sizeOf(context).width >= 700;
-
   @override
   void initState() {
     super.initState();
@@ -218,13 +216,13 @@ class _ComposerState extends State<Composer> {
   void _insertEmoji(String emoji) {
     _replaceSelection(emoji);
     // On a phone that would throw the keyboard over the picker.
-    if (_wide) _focus.requestFocus();
+    if (isWide(context)) _focus.requestFocus();
   }
 
   void _toggleEmoji() {
     final open = !_showEmoji;
     setState(() => _showEmoji = open);
-    if (open && !_wide) {
+    if (open && !isWide(context)) {
       _focus.unfocus();
     } else {
       _focus.requestFocus();
@@ -288,7 +286,7 @@ class _ComposerState extends State<Composer> {
                     focusNode: _focus,
                     enabled: !convo.blocked,
                     // Phones would throw the keyboard up on every thread open.
-                    autofocus: _wide,
+                    autofocus: isWide(context),
                     minLines: 1,
                     maxLines: 5,
                     keyboardType: TextInputType.multiline,
