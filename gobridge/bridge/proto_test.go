@@ -3,12 +3,9 @@ package bridge
 import (
 	"bytes"
 	"encoding/json"
-	"io"
-	"net"
 	"os"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"testing"
 	"time"
 
@@ -163,39 +160,6 @@ func TestEventsCoalesceButNeverDropMessages(t *testing.T) {
 	}
 }
 
-func TestDuplicateIdentityNeedsAReturningInstance(t *testing.T) {
-	m := New(Config{})
-	id := key.NewNode().Public().String()
-	conn := func(inst string) *peer {
-		a, b := net.Pipe()
-		go io.Copy(io.Discard, b)
-		t.Cleanup(func() { a.Close(); b.Close() })
-		return newPeer(id, "x", a, &wireMsg{Inst: inst})
-	}
-	flagged := func() bool {
-		for {
-			j, ok := m.NextEventTimeout(50*time.Millisecond, nil)
-			if !ok {
-				return false
-			}
-			if strings.Contains(j, "duplicate-identity") {
-				return true
-			}
-		}
-	}
-	// A restart: new instance, the old one never returns.
-	for _, inst := range []string{"one", "two", "two"} {
-		m.noteInstance(conn(inst))
-	}
-	if flagged() {
-		t.Fatal("a restart was taken for a second device")
-	}
-	m.noteInstance(conn("one"))
-	if !flagged() {
-		t.Fatal("two instances taking turns went unnoticed")
-	}
-}
-
 func TestSweepStale(t *testing.T) {
 	dir := t.TempDir()
 	old := time.Now().Add(-8 * 24 * time.Hour)
@@ -220,13 +184,5 @@ func TestSweepStale(t *testing.T) {
 		if (err == nil) != survives {
 			t.Errorf("%s: exists %v, want %v", name, err == nil, survives)
 		}
-	}
-}
-
-func TestSendTextCapsBody(t *testing.T) {
-	m := New(Config{})
-	err := m.SendText("nobody", "m", strings.Repeat("x", maxBody+1), "")
-	if err == nil || !strings.Contains(err.Error(), "too long") {
-		t.Fatalf("oversized text: %v", err)
 	}
 }

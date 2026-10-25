@@ -24,7 +24,7 @@ const (
 	transferIDLen = 16
 
 	// A stranger's frames are capped near the largest thing they may
-	// send: a profile with a picture.
+	// send: a profile with a picture, its text capped by maxProfileText.
 	maxPendingFrame = maxAvatarBytes + 64<<10
 
 	// Texts, reactions and error reasons.

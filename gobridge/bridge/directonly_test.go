@@ -2,10 +2,8 @@ package bridge
 
 import (
 	"context"
-	"crypto/rand"
 	"encoding/json"
-	"os"
-	"path/filepath"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,14 +16,34 @@ import (
 // fakePath makes m see a relayed path while relayed holds, a direct one
 // otherwise; the dev relay can't produce a real relayed path.
 func fakePath(m *Manager, relayed *atomic.Bool) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.probeFn = func(ctx context.Context, cl *tailcat.Client) (*ipnstate.PingResult, error) {
+	f := probeFunc(func(ctx context.Context, cl *tailcat.Client) (*ipnstate.PingResult, error) {
 		if relayed.Load() {
 			return &ipnstate.PingResult{DERPRegionCode: "D", LatencySeconds: 0.05}, nil
 		}
 		return &ipnstate.PingResult{Endpoint: "127.0.0.1:41641", LatencySeconds: 0.001}, nil
+	})
+	m.probeFn.Store(&f)
+}
+
+// failPath makes every probe of m fail, so it measures nothing.
+func failPath(m *Manager) {
+	f := probeFunc(func(ctx context.Context, cl *tailcat.Client) (*ipnstate.PingResult, error) {
+		return nil, errors.New("no path")
+	})
+	m.probeFn.Store(&f)
+}
+
+// within fails unless ch yields before the e2e timeout.
+func within[T any](t *testing.T, ch <-chan T, what string) T {
+	t.Helper()
+	select {
+	case v := <-ch:
+		return v
+	case <-time.After(90 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
 	}
+	var zero T
+	return zero
 }
 
 func decodeEvent(t *testing.T, j string) map[string]any {
@@ -102,7 +120,7 @@ func TestDirectOnlyDialWaitsForDirectPath(t *testing.T) {
 	}
 
 	relayed.Store(false)
-	d := <-done
+	d := within(t, done, "dial once direct")
 	if d.err != nil || d.id != alice.selfID {
 		t.Fatalf("dial once direct = %+v", d)
 	}
@@ -138,11 +156,10 @@ func TestDirectOnlyAcceptorHolds(t *testing.T) {
 		_, err := bob.Connect(alice.Address())
 		done <- err
 	}()
-	held := waitEvent(t, alice, "held status on the acceptor", isEvent("peer-status"))
-	if held["held"] != true || held["peer"] != bob.selfID {
-		t.Errorf("held status = %v", held)
-	}
-	noneFor(t, alice, 3*time.Second, "request while relayed", isEvent("peer-request"))
+	// A stranger is held without a word to the UI.
+	noneFor(t, alice, 3*time.Second, "request or status while relayed", func(ev map[string]any) bool {
+		return ev["type"] == "peer-request" || ev["type"] == "peer-status"
+	})
 	select {
 	case err := <-done:
 		t.Fatalf("dial settled while the acceptor held it: %v", err)
@@ -150,7 +167,7 @@ func TestDirectOnlyAcceptorHolds(t *testing.T) {
 	}
 
 	relayed.Store(false)
-	if err := <-done; err != nil {
+	if err := within(t, done, "dial once direct"); err != nil {
 		t.Fatal(err)
 	}
 	waitEvent(t, alice, "request once direct", isEvent("peer-request"))
@@ -160,72 +177,36 @@ func TestSetDirectOnlyDropsRelayedConversations(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e in -short mode")
 	}
-	alice, bob, aliceID, _ := acceptedPair(t)
-	var relayed atomic.Bool
-	relayed.Store(true)
-	fakePath(bob, &relayed)
-	livePeer(bob, aliceID).direct.Store(false)
+	reg := devDERP(t, logger.Discard)
+	alice := newTestManager(t, "alice", reg)
+	bob := newTestManager(t, "bob", reg)
+	carol := newTestManager(t, "carol", reg)
+	aliceID, _ := acceptDial(t, bob, alice)
+	carolID, _ := acceptDial(t, bob, carol)
+
+	// statusLoop learns nothing from here on, so only SetDirectOnly drops.
+	failPath(bob)
+	relayed, direct := livePeer(bob, aliceID), livePeer(bob, carolID)
+	for relayed.pingBusy.Load() || direct.pingBusy.Load() {
+		time.Sleep(10 * time.Millisecond)
+	}
+	relayed.direct.Store(false)
+	relayed.measured.Store(true)
+	direct.direct.Store(true)
+	direct.measured.Store(true)
+
 	bob.SetDirectOnly(true)
-	waitEvent(t, bob, "peer-removed", isEvent("peer-removed"))
+	if livePeer(bob, aliceID) != nil {
+		t.Error("kept a conversation measured relayed")
+	}
+	if livePeer(bob, carolID) != direct {
+		t.Error("dropped a direct conversation")
+	}
+	waitEvent(t, bob, "peer-removed", func(ev map[string]any) bool {
+		return ev["type"] == "peer-removed" && ev["peer"] == aliceID
+	})
 	bob.SetDirectOnly(false)
 	if _, err := bob.Connect(alice.Address()); err != nil {
 		t.Fatalf("redial with direct-only off: %v", err)
-	}
-}
-
-func TestCancelTransfer(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping e2e in -short mode")
-	}
-	alice, bob, aliceID, bobID := acceptedPair(t)
-
-	// The sender cancels; the receiver drops what it kept.
-	part := alice.partPath(recvKey(&peer{id: bobID}, "f1"))
-	os.MkdirAll(filepath.Dir(part), 0700)
-	if err := os.WriteFile(part, []byte("half a file"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := bob.CancelTransfer(aliceID, "f1"); err != nil {
-		t.Fatal(err)
-	}
-	ev := waitEvent(t, alice, "cancel on the receiver", isEvent("transfer-cancelled"))
-	if ev["peer"] != bobID || ev["id"] != "f1" {
-		t.Errorf("transfer-cancelled = %v", ev)
-	}
-	if _, err := os.Stat(part); !os.IsNotExist(err) {
-		t.Errorf("partial kept after cancel: %v", err)
-	}
-
-	// The receiver cancels; the sender hears of it.
-	if err := alice.CancelTransfer(bobID, "f2"); err != nil {
-		t.Fatal(err)
-	}
-	ev = waitEvent(t, bob, "cancel on the sender", isEvent("transfer-cancelled"))
-	if ev["peer"] != aliceID || ev["id"] != "f2" {
-		t.Errorf("transfer-cancelled = %v", ev)
-	}
-
-	// A send cancelled as it starts never completes, but keeps its copy.
-	blob := make([]byte, 8*chunkSize)
-	rand.Read(blob)
-	src := filepath.Join(t.TempDir(), "big.bin")
-	if err := os.WriteFile(src, blob, 0644); err != nil {
-		t.Fatal(err)
-	}
-	sent, err := bob.SendFile(aliceID, "f3", src)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := bob.CancelTransfer(aliceID, "f3"); err != nil {
-		t.Fatal(err)
-	}
-	noneFor(t, alice, 3*time.Second, "cancelled file arrived", func(ev map[string]any) bool {
-		return ev["type"] == "file-done" && ev["id"] == "f3"
-	})
-	if _, err := os.Stat(alice.partPath(recvKey(&peer{id: bobID}, "f3"))); !os.IsNotExist(err) {
-		t.Errorf("receiver kept a cancelled partial: %v", err)
-	}
-	if got, err := bob.cfg.Vault.ReadMedia(sent.Path); err != nil || len(got) != len(blob) {
-		t.Errorf("sender's sealed copy after cancel: %d bytes, %v", len(got), err)
 	}
 }

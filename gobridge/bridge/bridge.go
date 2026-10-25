@@ -29,7 +29,6 @@ import (
 	"unicode/utf8"
 
 	"github.com/tailscale/tailcat"
-	"tailscale.com/ipn/ipnstate"
 	"tailscale.com/tailcfg"
 	"tailscale.com/types/key"
 	"tailscale.com/types/logger"
@@ -94,10 +93,11 @@ type Manager struct {
 	lastInst   map[string]string
 	dupes      map[string]dupe
 
-	probeFn func(context.Context, *tailcat.Client) (*ipnstate.PingResult, error) // mu; tests fake paths
+	probeFn atomic.Pointer[probeFunc] // tests fake paths
 
 	directOnly atomic.Bool
 	directWait time.Duration // how long a held dial waits for a direct path
+	holding    int           // mu; strangers held for a direct path
 
 	saveMu sync.Mutex // one roster writer at a time
 
@@ -108,6 +108,8 @@ type Manager struct {
 	sends  map[string]*sendCancel // outgoing transfers, by recvKey
 
 	stop      chan struct{}
+	life      context.Context // cancelled by Close
+	endLife   context.CancelFunc
 	closeOnce sync.Once
 }
 
@@ -134,6 +136,11 @@ type peer struct {
 	// Outgoing peers: the far side hasn't accepted us yet. Manager.mu.
 	remotePending bool
 
+	// Set while in Manager.pending, so readLoop only locks to check it then.
+	stranger atomic.Bool
+
+	handlers sync.WaitGroup // readLoop's async handlers
+
 	sendSlots chan struct{}
 	offerMu   sync.Mutex
 	offers    map[string]chan int64 // file-offers awaiting file-resume
@@ -143,8 +150,9 @@ type peer struct {
 	toldDupe         atomic.Bool
 
 	// The last known path; in direct-only mode nothing is written while
-	// it is relayed.
+	// it is relayed or unmeasured.
 	direct     atomic.Bool
+	measured   atomic.Bool
 	onlyDirect *atomic.Bool
 }
 
@@ -184,21 +192,21 @@ func New(cfg Config) *Manager {
 	inst := make([]byte, 8)
 	rand.Read(inst)
 	m := &Manager{
-		cfg:     cfg,
-		logf:    logf,
-		name:    cfg.Name,
-		ev:      newEventQueue(),
-		inst:    hex.EncodeToString(inst),
-		peers:   make(map[string]*peer),
-		pending: make(map[string]*peer),
-		recvs:   make(map[string]*recvFile),
-		sends:   make(map[string]*sendCancel),
-		stop:    make(chan struct{}),
-		probeFn: func(ctx context.Context, cl *tailcat.Client) (*ipnstate.PingResult, error) {
-			return cl.DiscoPing(ctx)
-		},
+		cfg:        cfg,
+		logf:       logf,
+		name:       cfg.Name,
+		ev:         newEventQueue(),
+		inst:       hex.EncodeToString(inst),
+		peers:      make(map[string]*peer),
+		pending:    make(map[string]*peer),
+		recvs:      make(map[string]*recvFile),
+		sends:      make(map[string]*sendCancel),
+		stop:       make(chan struct{}),
 		directWait: time.Minute,
 	}
+	m.life, m.endLife = context.WithCancel(context.Background())
+	pf := probeFunc(discoPing)
+	m.probeFn.Store(&pf)
 	m.directOnly.Store(cfg.DirectOnly)
 	return m
 }
@@ -289,7 +297,7 @@ func (m *Manager) Open() error {
 		return err
 	}
 	m.mu.Lock()
-	m.priv = pk
+	m.setPrivLocked(pk)
 	m.mu.Unlock()
 	if fresh {
 		if err := m.saveIdentity(); err != nil {
@@ -321,7 +329,7 @@ func (m *Manager) Start() (map[string]any, error) {
 		m.downLocked(err)
 		return nil, err
 	}
-	return m.installServer(srv, pk), nil
+	return m.installServer(srv, pk)
 }
 
 // downLocked records why the server is down and keeps trying to bring
@@ -350,16 +358,13 @@ func (m *Manager) keepStarting() {
 			return
 		}
 		srv, pk, err := m.bringUp()
-		if err == nil && m.closed() {
-			srv.Close()
-			m.lifeMu.Unlock()
-			return
-		}
 		if err == nil {
 			m.retrying = false
-			ev := m.installServer(srv, pk)
+			ev, err := m.installServer(srv, pk)
 			m.lifeMu.Unlock()
-			m.emit(ev)
+			if err == nil {
+				m.emit(ev)
+			}
 			return
 		}
 		m.mu.Lock()
@@ -479,21 +484,34 @@ func (m *Manager) snapshotPeers(withPending bool) []*peer {
 	return ps
 }
 
+var errClosed = errors.New("shutting down")
+
 // installServer makes srv, built on pk, current and returns the
 // server-started event. It persists pk, whose key or pinned region may
 // be new.
-func (m *Manager) installServer(srv *tailcat.Server, pk *tailcat.PrivateKey) map[string]any {
+func (m *Manager) installServer(srv *tailcat.Server, pk *tailcat.PrivateKey) (map[string]any, error) {
 	m.mu.Lock()
-	m.priv = pk
+	if m.closed() {
+		// Close clears m.server under mu after stop closes, so this can't leak.
+		m.mu.Unlock()
+		srv.Close()
+		return nil, errClosed
+	}
+	m.setPrivLocked(pk)
 	m.server = srv
 	m.startErr = nil
 	m.addr = srv.ConnBlob()
-	m.selfID = pk.Private.Public().String()
 	m.mu.Unlock()
 	if err := m.saveIdentity(); err != nil {
 		m.logf("tincan: saving identity: %v", err)
 	}
-	return m.startedEvent()
+	return m.startedEvent(), nil
+}
+
+// setPrivLocked swaps in our key and the identity derived from it; mu held.
+func (m *Manager) setPrivLocked(pk *tailcat.PrivateKey) {
+	m.priv = pk
+	m.selfID = pk.Private.Public().String()
 }
 
 type storedProfile struct {
@@ -562,6 +580,9 @@ func (m *Manager) selfProfileEvent() map[string]any {
 // avatarPath points at a plaintext image the host just prepared;
 // avatarChanged distinguishes "no new picture" from "remove it".
 func (m *Manager) SetProfile(name, desc, status, avatarPath string, avatarChanged bool) error {
+	if len(name) > maxProfileText || len(desc) > maxProfileText || len(status) > maxProfileText {
+		return fmt.Errorf("profile text too long; limit is %d bytes per field", maxProfileText)
+	}
 	var avatar []byte
 	if avatarChanged && avatarPath != "" {
 		b, err := os.ReadFile(avatarPath)
@@ -607,6 +628,10 @@ func (m *Manager) SetProfile(name, desc, status, avatarPath string, avatarChange
 	return nil
 }
 
+// maxProfileText keeps a whole profile under maxPendingFrame, so a new
+// contact can read it.
+const maxProfileText = 4 << 10
+
 // profileMsg snapshots the profile as a wire message.
 func (m *Manager) profileMsg() *wireMsg {
 	m.mu.Lock()
@@ -649,7 +674,7 @@ func (m *Manager) teardown() {
 // replaceServer drops the running server, if any, for srv, built on
 // pk; lifeMu held. Until then the old server keeps serving, and
 // verifying hellos, with the old key.
-func (m *Manager) replaceServer(srv *tailcat.Server, pk *tailcat.PrivateKey) map[string]any {
+func (m *Manager) replaceServer(srv *tailcat.Server, pk *tailcat.PrivateKey) (map[string]any, error) {
 	m.teardown()
 	return m.installServer(srv, pk)
 }
@@ -665,7 +690,7 @@ func (m *Manager) ResetIdentity() (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("restarting with new identity: %w", err)
 	}
-	return m.replaceServer(srv, pk), nil
+	return m.replaceServer(srv, pk)
 }
 
 // Restart rebuilds the server from what is now on disk: the
@@ -692,12 +717,12 @@ func (m *Manager) Restart() (map[string]any, error) {
 	if err != nil {
 		// The old account is gone; retry as the restored one.
 		m.mu.Lock()
-		m.priv = pk
+		m.setPrivLocked(pk)
 		m.mu.Unlock()
 		m.downLocked(err)
 		return nil, fmt.Errorf("restarting: %w", err)
 	}
-	return m.installServer(srv, pk), nil
+	return m.installServer(srv, pk)
 }
 
 // newServer starts a tailcat server on pk, pinning the nearest region
@@ -769,7 +794,7 @@ func (m *Manager) SetRelay(host, mapURL string) (map[string]any, error) {
 	m.mu.Unlock()
 	srv, err := m.newServer(pk)
 	if err == nil {
-		return m.replaceServer(srv, pk), nil
+		return m.replaceServer(srv, pk)
 	}
 	if m.running() {
 		m.mu.Lock()
@@ -778,17 +803,18 @@ func (m *Manager) SetRelay(host, mapURL string) (map[string]any, error) {
 		return nil, fmt.Errorf("switching relay: %w", err)
 	}
 	m.mu.Lock()
-	m.priv = pk
+	m.setPrivLocked(pk)
 	m.mu.Unlock()
 	m.downLocked(err)
 	m.emit(map[string]any{"type": "transport-error", "error": err.Error()})
 	return nil, nil
 }
 
-// Close shuts everything down. The events channel stays open.
+// Close shuts everything down. Queued events can still be read.
 func (m *Manager) Close() error {
 	m.closeOnce.Do(func() {
 		close(m.stop)
+		m.endLife()
 		for _, p := range m.snapshotPeers(true) {
 			p.close()
 		}
@@ -838,7 +864,8 @@ func (m *Manager) verifyHello(h *wireMsg, conn net.Conn) (string, error) {
 		return "", fmt.Errorf("hello from %v names a connection key that isn't the tunnel's", pub.ShortString())
 	}
 	plain, ok := m.identityKey().OpenFrom(pub, h.Proof)
-	if !ok || string(plain) != string(helloProof(h.ConnKey)) {
+	// A v1 proof still verifies, so negotiate can tell them to update.
+	if !ok || string(plain) != string(helloProof(h.ConnKey)) && string(plain) != "tincan hello v1 "+h.ConnKey {
 		return "", fmt.Errorf("hello from %v carries no valid proof of its key", pub.ShortString())
 	}
 	return pub.String(), nil
@@ -880,7 +907,8 @@ func (m *Manager) peerError(peerID string, msg *wireMsg) {
 }
 
 // Connect dials a peer and waits for the outcome, returning their id.
-// Reaching someone offline takes up to 45s to fail.
+// Reaching someone offline takes up to 45s to fail; waiting for a direct
+// path adds up to directWait plus another 45s.
 func (m *Manager) Connect(token string) (peerID string, err error) {
 	server, err := m.dialTarget(token)
 	if err != nil {
@@ -907,10 +935,12 @@ func (m *Manager) dialTarget(token string) (key.NodePublic, error) {
 	_, isBlocked := m.blocked[server.String()]
 	m.mu.Unlock()
 	if isBlocked {
-		return key.NodePublic{}, errors.New("you blocked this peer; unblock them first")
+		return key.NodePublic{}, errBlockedPeer
 	}
 	return server, nil
 }
+
+var errBlockedPeer = errors.New("you blocked this peer; unblock them first")
 
 // dial connects to server and exchanges hellos, returning their id.
 func (m *Manager) dial(token string, server key.NodePublic) (string, error) {
@@ -973,6 +1003,8 @@ func (m *Manager) dial(token string, server key.NodePublic) (string, error) {
 	stopReport()
 	switch {
 	case err != nil:
+	case theirs.T == "error" && theirs.Code == "nodirect":
+		err = errNoDirect
 	case theirs.T == "error":
 		m.peerError(server.String(), theirs)
 		err = errors.New(theirs.Body)
@@ -988,6 +1020,9 @@ func (m *Manager) dial(token string, server key.NodePublic) (string, error) {
 	if err != nil {
 		conn.Close()
 		cl.Close()
+		if err == errNoDirect {
+			return "", err
+		}
 		return "", fmt.Errorf("reading hello: %w", err)
 	}
 	conn.SetDeadline(time.Time{})
@@ -997,10 +1032,16 @@ func (m *Manager) dial(token string, server key.NodePublic) (string, error) {
 	p.outgoing = true
 	p.client = cl
 	p.direct.Store(direct)
+	p.measured.Store(direct)
 	p.onlyDirect = &m.directOnly
 	// Dialing someone is implicit acceptance of them, and answers any
 	// request of theirs still waiting.
 	m.mu.Lock()
+	if _, blocked := m.blocked[p.id]; blocked {
+		m.mu.Unlock()
+		p.close()
+		return "", errBlockedPeer
+	}
 	mapSet(&m.accepted, p.id, p.name)
 	_, asked := m.pending[p.id]
 	m.mu.Unlock()
@@ -1047,11 +1088,29 @@ func (m *Manager) handleIncoming(conn net.Conn) {
 	}
 	direct := theirs.Direct
 	if !direct && m.directOnly.Load() {
-		if direct, err = m.holdForDirect(conn, theirs.Key); err != nil {
+		if !isAccepted && !m.reserveHold() {
+			conn.Close()
+			return
+		}
+		direct, err = m.holdForDirect(conn, theirs.Key, isAccepted)
+		if !isAccepted {
+			m.releaseHold()
+		}
+		if err != nil {
 			m.logf("tincan: held connection from %v: %v", theirs.Key, err)
 			conn.Close()
 			return
 		}
+		// The user may have blocked or accepted them during the hold.
+		m.mu.Lock()
+		_, isBlocked = m.blocked[theirs.Key]
+		_, isAccepted = m.accepted[theirs.Key]
+		m.mu.Unlock()
+		if isBlocked {
+			conn.Close()
+			return
+		}
+		conn.SetDeadline(time.Now().Add(20 * time.Second))
 	}
 
 	if err := writeMsgFrame(conn, m.hello("", nil)); err != nil {
@@ -1062,6 +1121,7 @@ func (m *Manager) handleIncoming(conn net.Conn) {
 
 	p := newPeer(theirs.Key, theirs.Name, conn, theirs)
 	p.direct.Store(direct)
+	p.measured.Store(direct)
 	p.onlyDirect = &m.directOnly
 	if ownToken(theirs.SelfAddr, p.id) {
 		p.token = theirs.SelfAddr
@@ -1084,6 +1144,7 @@ func (m *Manager) handleIncoming(conn net.Conn) {
 			conn.Close()
 			return
 		}
+		p.stranger.Store(true)
 		old := m.installPeerLocked(p, true)
 		m.mu.Unlock()
 		old.close()
@@ -1134,35 +1195,27 @@ func readHello(conn net.Conn) (*wireMsg, error) {
 	return msg, nil
 }
 
-func capBody(s string) string {
-	if len(s) <= maxBody {
+// truncUTF8 cuts s to at most n bytes, on a rune boundary.
+func truncUTF8(s string, n int) string {
+	if len(s) <= n {
 		return s
 	}
-	cut := maxBody
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
 	}
-	return s[:cut]
+	return s[:n]
 }
+
+func capBody(s string) string { return truncUTF8(s, maxBody) }
 
 const maxDisplayName = 128
 
 func cleanName(s string) string {
-	s = strings.TrimSpace(cleanText(s))
-	if len(s) > maxDisplayName {
-		cut := maxDisplayName
-		for cut > 0 && !utf8.RuneStart(s[cut]) {
-			cut--
-		}
-		s = s[:cut]
-	}
-	return s
+	return truncUTF8(strings.TrimSpace(cleanText(s)), maxDisplayName)
 }
 
-// installPeerLocked files p as live or pending under its id and returns
-// the connection to close once unlocked: the one p replaces, or p
-// itself. When both sides dial at once each ends up holding two
-// connections, so both keep the one dialed by the smaller identity key.
+// installPeerLocked files p as live or pending and returns the peer to
+// close once unlocked. Crossed dials keep the smaller key's on both sides.
 func (m *Manager) installPeerLocked(p *peer, pending bool) (drop *peer) {
 	set := m.peers
 	if pending {
@@ -1263,6 +1316,11 @@ func messageEvent(p *peer, msg *wireMsg) map[string]any {
 // the tie-break kept an existing one instead; p is closed then.
 func (m *Manager) addPeer(p *peer) bool {
 	m.mu.Lock()
+	if _, blocked := m.blocked[p.id]; blocked {
+		m.mu.Unlock()
+		p.close()
+		return false
+	}
 	drop := m.installPeerLocked(p, false)
 	live := m.peers[p.id]
 	m.mu.Unlock()
@@ -1314,7 +1372,9 @@ func (p *peer) write(f func() error) error {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
 	if p.onlyDirect != nil && p.onlyDirect.Load() && !p.direct.Load() {
-		p.conn.Close()
+		if p.measured.Load() {
+			p.conn.Close()
+		}
 		return errNoDirect
 	}
 	p.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
@@ -1393,14 +1453,22 @@ func (m *Manager) SetActivePeer(peerID string) {
 }
 
 func (m *Manager) readLoop(p *peer) {
-	defer m.abortRecvs(p)
+	defer func() {
+		p.handlers.Wait() // a file-end in flight still lands
+		m.abortRecvs(p)
+	}()
 	for {
-		m.mu.Lock()
 		limit := uint32(maxFrame)
-		if m.pending[p.id] == p {
-			limit = maxPendingFrame
+		if p.stranger.Load() {
+			m.mu.Lock()
+			still := m.pending[p.id] == p
+			m.mu.Unlock()
+			if still {
+				limit = maxPendingFrame
+			} else {
+				p.stranger.Store(false)
+			}
 		}
-		m.mu.Unlock()
 		p.conn.SetReadDeadline(time.Now().Add(readIdleLimit))
 		kind, payload, err := readFrame(p.conn, limit)
 		if err != nil {
@@ -1448,9 +1516,7 @@ func (m *Manager) holdIfPending(p *peer, msg *wireMsg) bool {
 	case "profile":
 		// Strangers don't get to publish a picture into our UI, nor park
 		// a big one in memory.
-		if len(msg.Avatar) > maxAvatarBytes || len(msg.Avatar) > 0 && checkAvatar(msg.Avatar) != nil {
-			msg.Avatar = nil
-		}
+		msg.Avatar = usableAvatar(msg.Avatar)
 		p.pendingProfile = msg
 	}
 	// Everything else waits for Accept; "accepted" would otherwise send
@@ -1462,33 +1528,36 @@ func (m *Manager) holdIfPending(p *peer, msg *wireMsg) bool {
 	return true
 }
 
+// handleMsg runs on the read loop, which must never wait on a write: a
+// peer streaming to us while we stream to them would deadlock.
 func (m *Manager) handleMsg(p *peer, msg *wireMsg) {
-	if msg.T == "error" {
-		msg.Body = capBody(cleanText(msg.Body))
-		m.peerError(p.id, msg)
-		return
-	}
 	if msg.T == "status" {
-		m.notePath(p, msg)
+		// A dialer measures its own path; only the acceptor takes reports.
+		if !p.outgoing {
+			m.notePath(p, wirePath(msg))
+		}
 		return
 	}
 	if m.holdIfPending(p, msg) {
 		return
 	}
 	switch msg.T {
+	case "error":
+		msg.Body = capBody(cleanText(msg.Body))
+		m.peerError(p.id, msg)
 	case "text":
 		if len(msg.Body) > maxBody {
 			m.logf("tincan: oversized text from %v", p.id)
 			return
 		}
 		m.emit(messageEvent(p, msg))
-		p.writeMsg(&wireMsg{T: "ack", Ref: msg.ID})
+		go p.writeMsg(&wireMsg{T: "ack", Ref: msg.ID})
 	case "react":
 		if len(msg.Body) > maxBody {
 			return
 		}
 		m.emit(map[string]any{"type": "react", "peer": p.id, "id": msg.ID, "ref": msg.Ref, "body": msg.Body})
-		p.writeMsg(&wireMsg{T: "ack", Ref: msg.ID})
+		go p.writeMsg(&wireMsg{T: "ack", Ref: msg.ID})
 	case "timer":
 		secs, err := strconv.Atoi(msg.Body)
 		if err != nil || secs < 0 {
@@ -1496,15 +1565,16 @@ func (m *Manager) handleMsg(p *peer, msg *wireMsg) {
 			return
 		}
 		m.emit(map[string]any{"type": "peer-timer", "peer": p.id, "id": msg.ID, "seconds": secs})
-		p.writeMsg(&wireMsg{T: "ack", Ref: msg.ID})
+		go p.writeMsg(&wireMsg{T: "ack", Ref: msg.ID})
 	case "ack":
 		m.emit(map[string]any{"type": "delivered", "peer": p.id, "id": msg.Ref})
 	case "file-offer":
-		m.startRecv(p, msg)
+		// Chunks only follow its file-resume, so they can't overtake it.
+		p.handlers.Go(func() { m.startRecv(p, msg) })
 	case "file-resume":
 		m.handleResume(p, msg)
 	case "file-end":
-		m.finishRecv(p, msg.ID)
+		p.handlers.Go(func() { m.finishRecv(p, msg.ID) })
 	case "ka":
 		// Receiving it already reset the read deadline.
 	case "profile":
@@ -1531,10 +1601,8 @@ func (m *Manager) handleMsg(p *peer, msg *wireMsg) {
 	}
 }
 
-// statusLoop disco-pings dialed peers, which both measures the path and
-// drives the direct upgrade, then mirrors the result to them: the
-// accepting side has no per-peer path report of its own. The chat on
-// screen gets one every statusActive, the rest every statusIdle.
+// statusLoop disco-pings dialed peers, measuring and upgrading the path,
+// and mirrors the result to the acceptor, which can't measure it.
 const (
 	statusActive = 5 * time.Second
 	statusIdle   = 30 * time.Second
@@ -1557,36 +1625,43 @@ func (m *Manager) statusLoop() {
 			if !p.outgoing || p.id != active && now.Sub(p.lastPing) < statusIdle-time.Second {
 				continue
 			}
-			if !p.pingBusy.CompareAndSwap(false, true) {
-				continue
+			if m.checkPath(p) {
+				p.lastPing = now
 			}
-			p.lastPing = now
-			go func(p *peer) {
-				defer p.pingBusy.Store(false)
-				ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-				defer cancel()
-				res, err := m.probe(ctx, p.client)
-				if err != nil {
-					m.logf("tincan: disco ping %v: %v", p.id, err)
-					return
-				}
-				st := pathStatus(res)
-				if m.notePath(p, st) {
-					p.writeMsg(st)
-				}
-			}(p)
 		}
 	}
+}
+
+// checkPath disco-pings a dialed peer in the background and mirrors the
+// result to them, unless a ping is already in flight.
+func (m *Manager) checkPath(p *peer) bool {
+	if !p.pingBusy.CompareAndSwap(false, true) {
+		return false
+	}
+	go func() {
+		defer p.pingBusy.Store(false)
+		ctx, cancel := context.WithTimeout(m.life, 4*time.Second)
+		defer cancel()
+		res, err := m.probe(ctx, p.client)
+		if err != nil {
+			m.logf("tincan: disco ping %v: %v", p.id, err)
+			return
+		}
+		st := pathStatus(res)
+		if m.notePath(p, st) {
+			p.writeMsg(st)
+		}
+	}()
+	return true
 }
 
 // applyPeerProfile stores a peer's profile. Profiles travel whole and
 // repeat often; storeAvatar skips a picture already on disk. A picture
 // that isn't a sane image counts as none.
 func (m *Manager) applyPeerProfile(p *peer, msg *wireMsg) {
-	avatar := msg.Avatar
-	if len(avatar) > maxAvatarBytes || len(avatar) > 0 && checkAvatar(avatar) != nil {
+	avatar := usableAvatar(msg.Avatar)
+	if avatar == nil && len(msg.Avatar) > 0 {
 		m.logf("tincan: unusable avatar from %v", p.id)
-		avatar = nil
 	}
 	avatarPath, err := m.cfg.Vault.storeAvatar(p.id, avatar)
 	if err != nil {
@@ -1619,11 +1694,16 @@ func (m *Manager) applyPeerProfile(p *peer, msg *wireMsg) {
 	})
 }
 
-// Two devices running one identity both stay online and keep replacing
-// each other's connection here. A restarted app also brings a new
-// instance id, but the old one never comes back, so only an instance
-// that returns after another replaced it counts. Both are then told,
-// on every connection within dupeFor, and warn their user.
+// usableAvatar is a peer's picture if it is a sane image, else nil.
+func usableAvatar(a []byte) []byte {
+	if len(a) > maxAvatarBytes || len(a) > 0 && checkAvatar(a) != nil {
+		return nil
+	}
+	return a
+}
+
+// Two devices on one identity keep replacing each other's connection; a
+// restart's old instance never returns, so only a returning one counts.
 const (
 	instWindow = 3 * time.Minute
 	dupeFor    = 10 * time.Minute
@@ -1640,15 +1720,26 @@ func (m *Manager) noteInstance(p *peer) {
 	}
 	now := time.Now()
 	m.mu.Lock()
+	for id, seen := range m.insts {
+		for inst, t := range seen {
+			if now.Sub(t) > instWindow {
+				delete(seen, inst)
+			}
+		}
+		if len(seen) == 0 {
+			delete(m.insts, id)
+			delete(m.lastInst, id)
+		}
+	}
+	for id, d := range m.dupes {
+		if now.Sub(d.at) >= dupeFor {
+			delete(m.dupes, id)
+		}
+	}
 	seen := m.insts[p.id]
 	if seen == nil {
 		seen = make(map[string]time.Time)
 		mapSet(&m.insts, p.id, seen)
-	}
-	for inst, t := range seen {
-		if now.Sub(t) > instWindow {
-			delete(seen, inst)
-		}
 	}
 	_, returning := seen[p.inst]
 	if returning && m.lastInst[p.id] != p.inst {

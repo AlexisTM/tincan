@@ -5,9 +5,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
-	"encoding/json"
 	"image"
 	"image/png"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -134,11 +134,7 @@ func waitEvent(t *testing.T, m *Manager, what string, match func(map[string]any)
 		if !ok {
 			continue
 		}
-		ev := make(map[string]any)
-		if err := json.Unmarshal([]byte(j), &ev); err != nil {
-			t.Fatalf("bad event %q: %v", j, err)
-		}
-		if match(ev) {
+		if ev := decodeEvent(t, j); match(ev) {
 			return ev
 		}
 	}
@@ -724,7 +720,7 @@ func TestHelloBoundToTunnelAndVersioned(t *testing.T) {
 	conn, connKey := rawDial(t, alice)
 	writeMsgFrame(conn, &wireMsg{
 		T: "hello", V: 1, Key: bob.selfID, ConnKey: connKey,
-		Proof: bobKey.SealTo(alicePub, helloProof(connKey)),
+		Proof: bobKey.SealTo(alicePub, []byte("tincan hello v1 "+connKey)),
 	})
 	reply, err := readHello(conn)
 	if err != nil || reply.T != "error" || reply.Code != "version" || reply.Body == "" {
@@ -740,20 +736,27 @@ func acceptedPair(t *testing.T) (alice, bob *Manager, aliceID, bobID string) {
 	reg := devDERP(t, logger.Discard)
 	alice = newTestManager(t, "alice", reg)
 	bob = newTestManager(t, "bob", reg)
-	aliceID, err := dialNow(bob, alice.Address())
+	aliceID, bobID = acceptDial(t, bob, alice)
+	return alice, bob, aliceID, bobID
+}
+
+// acceptDial has from dial to, and to accept, returning both ids.
+func acceptDial(t *testing.T, from, to *Manager) (toID, fromID string) {
+	t.Helper()
+	toID, err := dialNow(from, to.Address())
 	if err != nil {
 		t.Fatal(err)
 	}
-	req := waitEvent(t, alice, "request", func(ev map[string]any) bool { return ev["type"] == "peer-request" })
-	bobID = req["peer"].(string)
+	req := waitEvent(t, to, "request", func(ev map[string]any) bool { return ev["type"] == "peer-request" })
+	fromID = req["peer"].(string)
 	if req["fp"] == "" || req["verified"] != false {
 		t.Errorf("request lacks fp/verified: %v", req)
 	}
-	if err := alice.Accept(bobID); err != nil {
+	if err := to.Accept(fromID); err != nil {
 		t.Fatal(err)
 	}
-	waitEvent(t, bob, "accepted", func(ev map[string]any) bool { return ev["type"] == "peer-accepted" })
-	return alice, bob, aliceID, bobID
+	waitEvent(t, from, "accepted", func(ev map[string]any) bool { return ev["type"] == "peer-accepted" })
+	return toID, fromID
 }
 
 func TestAcksRepliesReactionsTimers(t *testing.T) {
@@ -850,5 +853,107 @@ func TestFileResumes(t *testing.T) {
 	}
 	if _, err := bob.SendFile(aliceID, "an-id-way-too-long", src); err == nil {
 		t.Error("an id longer than a blob frame holds was accepted")
+	}
+}
+
+func TestCancelTransfer(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e in -short mode")
+	}
+	alice, bob, aliceID, bobID := acceptedPair(t)
+
+	// The sender cancels; the receiver drops what it kept.
+	part := alice.partPath(recvKey(&peer{id: bobID}, "f1"))
+	if err := os.MkdirAll(filepath.Dir(part), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(part, []byte("half a file"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := bob.CancelTransfer(aliceID, "f1"); err != nil {
+		t.Fatal(err)
+	}
+	ev := waitEvent(t, alice, "cancel on the receiver", isEvent("transfer-cancelled"))
+	if ev["peer"] != bobID || ev["id"] != "f1" {
+		t.Errorf("transfer-cancelled = %v", ev)
+	}
+	if _, err := os.Stat(part); !os.IsNotExist(err) {
+		t.Errorf("partial kept after cancel: %v", err)
+	}
+
+	// The receiver cancels; the sender hears of it.
+	if err := alice.CancelTransfer(bobID, "f2"); err != nil {
+		t.Fatal(err)
+	}
+	ev = waitEvent(t, bob, "cancel on the sender", isEvent("transfer-cancelled"))
+	if ev["peer"] != aliceID || ev["id"] != "f2" {
+		t.Errorf("transfer-cancelled = %v", ev)
+	}
+
+	// A send cancelled as it starts never completes, but keeps its copy.
+	blob := make([]byte, 8*chunkSize)
+	if _, err := rand.Read(blob); err != nil {
+		t.Fatal(err)
+	}
+	src := filepath.Join(t.TempDir(), "big.bin")
+	if err := os.WriteFile(src, blob, 0644); err != nil {
+		t.Fatal(err)
+	}
+	sent, err := bob.SendFile(aliceID, "f3", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bob.CancelTransfer(aliceID, "f3"); err != nil {
+		t.Fatal(err)
+	}
+	noneFor(t, alice, 3*time.Second, "cancelled file arrived", func(ev map[string]any) bool {
+		return ev["type"] == "file-done" && ev["id"] == "f3"
+	})
+	if _, err := os.Stat(alice.partPath(recvKey(&peer{id: bobID}, "f3"))); !os.IsNotExist(err) {
+		t.Errorf("receiver kept a cancelled partial: %v", err)
+	}
+	if got, err := bob.cfg.Vault.ReadMedia(sent.Path); err != nil || len(got) != len(blob) {
+		t.Errorf("sender's sealed copy after cancel: %d bytes, %v", len(got), err)
+	}
+}
+
+func TestDuplicateIdentityNeedsAReturningInstance(t *testing.T) {
+	m := New(Config{})
+	id := key.NewNode().Public().String()
+	conn := func(inst string) *peer {
+		a, b := net.Pipe()
+		go io.Copy(io.Discard, b)
+		t.Cleanup(func() { a.Close(); b.Close() })
+		return newPeer(id, "x", a, &wireMsg{Inst: inst})
+	}
+	flagged := func() bool {
+		for {
+			j, ok := m.NextEventTimeout(50*time.Millisecond, nil)
+			if !ok {
+				return false
+			}
+			if strings.Contains(j, "duplicate-identity") {
+				return true
+			}
+		}
+	}
+	// A restart: new instance, the old one never returns.
+	for _, inst := range []string{"one", "two", "two"} {
+		m.noteInstance(conn(inst))
+	}
+	if flagged() {
+		t.Fatal("a restart was taken for a second device")
+	}
+	m.noteInstance(conn("one"))
+	if !flagged() {
+		t.Fatal("two instances taking turns went unnoticed")
+	}
+}
+
+func TestSendTextCapsBody(t *testing.T) {
+	m := New(Config{})
+	err := m.SendText("nobody", "m", strings.Repeat("x", maxBody+1), "")
+	if err == nil || !strings.Contains(err.Error(), "too long") {
+		t.Fatalf("oversized text: %v", err)
 	}
 }

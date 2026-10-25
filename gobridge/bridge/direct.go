@@ -11,40 +11,45 @@ import (
 	"tailscale.com/ipn/ipnstate"
 )
 
-// Direct-only mode: the relay still carries the handshake and the disco
-// traffic that finds a direct path, but no chat. A dialer waits for a
-// direct path before its hello; an acceptor, which can't measure its
-// own path, holds a hello that isn't marked direct until the dialer
-// reports one. A conversation whose path falls back to the relay is
-// closed and redialed. Magicsock has no knob to keep WireGuard data off
-// DERP, so the gate is ours: between two path checks, and while
-// magicsock revalidates a direct path, packets can still cross the
-// relay, sealed end to end like everything else.
+// Direct-only mode: the relay carries only the handshake and disco. Magicsock
+// can't keep WireGuard data off DERP, so the gate is ours.
 
 var errNoDirect = errors.New("No direct path (direct-only mode)")
 
-const directPoll = 2 * time.Second
+const (
+	directPoll    = 2 * time.Second
+	maxProbeFails = 3
+	maxPathText   = 64
+	maxPathMs     = 60_000
+)
 
 // SetDirectOnly switches direct-only mode live. Turning it on drops
-// conversations last seen relayed; they redial and wait for a path.
+// conversations known to be relayed and probes dialed ones not yet measured.
 func (m *Manager) SetDirectOnly(on bool) {
 	m.directOnly.Store(on)
 	if !on {
 		return
 	}
 	for _, p := range m.snapshotPeers(true) {
-		if !p.direct.Load() {
+		switch {
+		case p.direct.Load():
+		case p.outgoing && !p.measured.Load():
+			m.checkPath(p)
+		default:
 			m.logf("tincan: %v is relayed; dropping it for direct-only mode", p.id)
 			m.removePeer(p)
 		}
 	}
 }
 
+type probeFunc func(context.Context, *tailcat.Client) (*ipnstate.PingResult, error)
+
+func discoPing(ctx context.Context, cl *tailcat.Client) (*ipnstate.PingResult, error) {
+	return cl.DiscoPing(ctx)
+}
+
 func (m *Manager) probe(ctx context.Context, cl *tailcat.Client) (*ipnstate.PingResult, error) {
-	m.mu.Lock()
-	f := m.probeFn
-	m.mu.Unlock()
-	return f(ctx, cl)
+	return (*m.probeFn.Load())(ctx, cl)
 }
 
 func pathStatus(res *ipnstate.PingResult) *wireMsg {
@@ -55,15 +60,26 @@ func pathStatus(res *ipnstate.PingResult) *wireMsg {
 	return &wireMsg{T: "status", Direct: res.Endpoint != "", Addr: res.Endpoint, Relay: res.DERPRegionCode, Ms: ms}
 }
 
+// wirePath is a peer's path report, made safe to show.
+func wirePath(msg *wireMsg) *wireMsg {
+	return &wireMsg{
+		T:      "status",
+		Direct: msg.Direct,
+		Addr:   truncUTF8(cleanText(msg.Addr), maxPathText),
+		Relay:  truncUTF8(cleanText(msg.Relay), maxPathText),
+		Ms:     min(max(msg.Ms, 0), maxPathMs),
+	}
+}
+
 func heldEvent(peerID string, held bool) map[string]any {
 	return map[string]any{"type": "peer-status", "peer": peerID, "direct": false, "held": held}
 }
 
-// notePath records a measured or reported path and passes it on, unless
-// p is a stranger, closing p if direct-only mode can't keep it. Reports
-// whether p stays.
+// notePath records a path and reports it, unless p is a stranger, closing p
+// if direct-only mode can't keep it. Reports whether p stays.
 func (m *Manager) notePath(p *peer, st *wireMsg) bool {
 	p.direct.Store(st.Direct)
+	p.measured.Store(true)
 	if !st.Direct && m.directOnly.Load() {
 		m.logf("tincan: path to %v fell back to the relay; closing", p.id)
 		m.removePeer(p)
@@ -83,18 +99,30 @@ func (m *Manager) notePath(p *peer, st *wireMsg) bool {
 	return true
 }
 
-// awaitDirect disco-pings until the path is direct, which the pings
-// themselves help bring about. It reports false, without error, if
-// direct-only mode is switched off meanwhile.
+// awaitDirect disco-pings until the path is direct. It reports false,
+// without error, if direct-only mode is switched off meanwhile.
 func (m *Manager) awaitDirect(cl *tailcat.Client, peerID string) (bool, error) {
 	deadline := time.Now().Add(m.directWait)
-	held := false
+	held, fails := false, 0
+	defer func() {
+		if held {
+			m.emit(heldEvent(peerID, false))
+		}
+	}()
 	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		ctx, cancel := context.WithTimeout(m.life, 4*time.Second)
 		res, err := m.probe(ctx, cl)
 		cancel()
+		if m.closed() {
+			return false, errClosed
+		}
 		if err == nil && res.Endpoint != "" {
 			return true, nil
+		}
+		if err == nil {
+			fails = 0
+		} else if fails++; fails >= maxProbeFails {
+			return false, fmt.Errorf("peer unreachable: %w", err)
 		}
 		if !m.directOnly.Load() {
 			return false, nil
@@ -109,19 +137,25 @@ func (m *Manager) awaitDirect(cl *tailcat.Client, peerID string) (bool, error) {
 		select {
 		case <-time.After(directPoll):
 		case <-m.stop:
-			return false, errors.New("shutting down")
+			return false, errClosed
 		}
 	}
 }
 
 // reportPath streams our measured path to an acceptor that may be
-// holding our hello, until the returned stop is called.
+// holding our hello, until the returned stop is called. An acceptor that
+// isn't holding answers before the first report.
 func (m *Manager) reportPath(conn net.Conn, cl *tailcat.Client) (stop func()) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(m.life)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		for {
+			select {
+			case <-time.After(directPoll):
+			case <-ctx.Done():
+				return
+			}
 			pctx, pcancel := context.WithTimeout(ctx, 4*time.Second)
 			res, err := m.probe(pctx, cl)
 			pcancel()
@@ -129,13 +163,6 @@ func (m *Manager) reportPath(conn net.Conn, cl *tailcat.Client) (stop func()) {
 				return
 			}
 			if err == nil && writeMsgFrame(conn, pathStatus(res)) != nil {
-				return
-			}
-			select {
-			case <-time.After(directPoll):
-			case <-ctx.Done():
-				return
-			case <-m.stop:
 				return
 			}
 		}
@@ -146,19 +173,87 @@ func (m *Manager) reportPath(conn net.Conn, cl *tailcat.Client) (stop func()) {
 	}
 }
 
+// reserveHold takes a slot for holding a stranger, sharing the pending cap
+// so fresh keys can't pin unbounded held streams.
+func (m *Manager) reserveHold() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.pending)+m.holding >= maxPendingPeers {
+		return false
+	}
+	m.holding++
+	return true
+}
+
+func (m *Manager) releaseHold() {
+	m.mu.Lock()
+	m.holding--
+	m.mu.Unlock()
+}
+
+var errReleased = errors.New("direct-only mode switched off")
+
+// holdReader reads a held stream in directPoll slices so the hold notices
+// the mode going off; it lets go only between frames.
+type holdReader struct {
+	m     *Manager
+	conn  net.Conn
+	end   time.Time
+	fresh bool // nothing of the current frame read yet
+}
+
+func (r *holdReader) Read(b []byte) (int, error) {
+	for {
+		dl := time.Now().Add(directPoll)
+		if dl.After(r.end) {
+			dl = r.end
+		}
+		r.conn.SetReadDeadline(dl)
+		n, err := r.conn.Read(b)
+		if n > 0 {
+			r.fresh = false
+			if isTimeout(err) {
+				err = nil
+			}
+			return n, err
+		}
+		if !isTimeout(err) || !time.Now().Before(r.end) {
+			return 0, err
+		}
+		if r.m.closed() {
+			return 0, errClosed
+		}
+		if r.fresh && !r.m.directOnly.Load() {
+			return 0, errReleased
+		}
+	}
+}
+
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
+}
+
 // holdForDirect keeps an incoming stream silent, reading only the
 // dialer's path reports, until one says direct or the mode goes off.
-func (m *Manager) holdForDirect(conn net.Conn, peerID string) (direct bool, err error) {
-	m.emit(heldEvent(peerID, true))
-	defer func() {
-		if err != nil {
-			m.emit(heldEvent(peerID, false))
-		}
-	}()
-	conn.SetDeadline(time.Now().Add(m.directWait))
+// Only known peers get held events; strangers have no conversation yet.
+func (m *Manager) holdForDirect(conn net.Conn, peerID string, known bool) (bool, error) {
+	if known {
+		m.emit(heldEvent(peerID, true))
+		defer m.emit(heldEvent(peerID, false))
+	}
+	r := &holdReader{m: m, conn: conn, end: time.Now().Add(m.directWait)}
 	for {
-		kind, payload, err := readFrame(conn, maxPendingFrame)
-		if err != nil {
+		r.fresh = true
+		kind, payload, err := readFrame(r, maxPendingFrame)
+		switch {
+		case errors.Is(err, errReleased):
+			return false, nil
+		case isTimeout(err):
+			conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+			writeMsgFrame(conn, &wireMsg{T: "error", Code: "nodirect", Body: errNoDirect.Error()})
+			return false, errNoDirect
+		case err != nil:
 			return false, err
 		}
 		if kind != frameMsg {
