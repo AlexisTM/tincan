@@ -1,10 +1,11 @@
 name: tincan
-description: "A new Flutter project."
+description: "Peer-to-peer encrypted chat with no accounts and no server."
 publish_to: 'none'
 version: 0.0.2+7
 
 environment:
-  sdk: ^3.11.5
+  sdk: ^3.13.0
+  flutter: ">=3.47.0"
 
 dependencies:
   archive: ^4.2.0
@@ -39,7 +40,6 @@ flutter:
   uses-material-design: true
   assets:
     - assets/logo.svg
-    - assets/logo-mono.svg
   fonts:
     - family: SchibstedGrotesk
       fonts:

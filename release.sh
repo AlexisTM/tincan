@@ -16,7 +16,10 @@ die() { echo "release: $*" >&2; exit 1; }
 
 [[ "$(git branch --show-current)" == main ]] || die "not on main"
 [[ -z "$(git status --porcelain --untracked-files=no)" ]] || die "working tree has uncommitted changes"
+git fetch -q --tags origin main
+[[ "$(git rev-parse HEAD)" == "$(git rev-parse origin/main)" ]] || die "main is not in sync with origin/main"
 git rev-parse -q --verify "refs/tags/$version" >/dev/null && die "tag $version already exists"
+[[ -z "$(git ls-remote --tags origin "refs/tags/$version")" ]] || die "tag $version already exists on origin"
 [[ -f android/key.properties ]] || die "android/key.properties missing; Gradle would sign with the debug key"
 command -v gh >/dev/null || die "gh not installed"
 
@@ -56,11 +59,20 @@ fi
 sed -i "s/^version: .*/version: $version+$build_number/" pubspec.yaml
 {
 	echo "# Changelog"; echo; echo "$section"; echo
-	[[ -f CHANGELOG.md ]] && tail -n +3 CHANGELOG.md
-} > CHANGELOG.md.new && mv CHANGELOG.md.new CHANGELOG.md
+	if [[ -f CHANGELOG.md ]]; then tail -n +3 CHANGELOG.md; fi
+} > CHANGELOG.md.new
+mv CHANGELOG.md.new CHANGELOG.md
 
 git add pubspec.yaml CHANGELOG.md
 git commit -m "Release $version"
 git tag -a "$version" -m "Release $version"
-git push origin main "$version"
-gh release create "$version" --title "v$version" --notes "$notes" "$out"/*
+if ! git push --atomic origin main "$version"; then
+	git tag -d "$version"
+	git reset -q --keep HEAD~1
+	die "push failed; release commit and tag rolled back"
+fi
+notes_file="build/release/$version-notes.md"
+printf '%s\n' "$notes" > "$notes_file"
+gh release create "$version" --title "v$version" --notes-file "$notes_file" "$out"/* ||
+	die "tag $version is pushed but the GitHub release failed; retry with:
+  gh release create $version --title v$version --notes-file $notes_file $out/*"

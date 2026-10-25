@@ -13,23 +13,43 @@ Future<void> main(List<String> args) async {
   final bridge = TincanBridge();
   String? peer;
 
+  void cleanup() {
+    try {
+      dir.deleteSync(recursive: true);
+    } catch (_) {}
+  }
+
+  ProcessSignal.sigint.watch().listen((_) {
+    cleanup();
+    exit(130);
+  });
+
   bridge.events.listen((ev) async {
     switch (ev['type']) {
       case 'peer-request':
-        stdout.writeln('<< request from ${ev['name']} — accepting');
-        await bridge.accept(ev['peer'] as String);
+        stdout.writeln('<< request from ${ev['name']}, accepting');
+        try {
+          await bridge.accept(ev['peer'] as String);
+        } catch (e) {
+          stdout.writeln('!! accept failed: $e');
+        }
       case 'peer-added':
         peer = ev['peer'] as String;
         stdout.writeln('<< connected: ${ev['name']}');
       case 'peer-profile':
         stdout.writeln('<< profile: ${ev['name']} / ${ev['status']}');
       case 'peer-status':
-        stdout.writeln('<< path: ${ev['direct'] == true ? 'DIRECT ${ev['addr']}' : 'relay ${ev['relay']}'} ${ev['latencyMs']}ms');
+        if (ev.containsKey('held')) {
+          stdout.writeln(ev['held'] == true ? '<< held: no direct path yet' : '<< no longer held');
+        } else {
+          stdout.writeln('<< path: ${ev['direct'] == true ? 'DIRECT ${ev['addr']}' : 'relay ${ev['relay']}'} ${ev['latencyMs']}ms');
+        }
       case 'message':
         stdout.writeln('<< ${ev['body']}');
       case 'file-done':
         stdout.writeln('<< file ${ev['name']} (${ev['size']} bytes) -> ${ev['path']}');
       case 'peer-removed':
+        if (ev['peer'] == peer) peer = null;
         stdout.writeln('<< disconnected');
     }
   });
@@ -46,7 +66,13 @@ Future<void> main(List<String> args) async {
       stdout.writeln('!! nobody connected yet');
       continue;
     }
-    await bridge.sendText(peer!, DateTime.now().microsecondsSinceEpoch.toString(), line);
-    stdout.writeln('>> $line');
+    try {
+      await bridge.sendText(peer!, DateTime.now().microsecondsSinceEpoch.toString(), line);
+      stdout.writeln('>> $line');
+    } catch (e) {
+      stdout.writeln('!! send failed: $e');
+    }
   }
+  cleanup();
+  exit(0);
 }

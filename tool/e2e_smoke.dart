@@ -38,6 +38,25 @@ class Events {
 
 Future<int> parentMain() async {
   final dir = Directory.systemTemp.createTempSync('tincan-smoke-a');
+  Process? child;
+  try {
+    return await _parentRun(dir, (p) => child = p);
+  } on TimeoutException catch (e) {
+    stderr.writeln('parent: $e');
+    return 1;
+  } finally {
+    child?.kill();
+    _rm(dir);
+  }
+}
+
+void _rm(Directory dir) {
+  try {
+    dir.deleteSync(recursive: true);
+  } catch (_) {}
+}
+
+Future<int> _parentRun(Directory dir, void Function(Process) spawned) async {
   final bridge = TincanBridge();
   final events = Events(bridge.events);
   await bridge.vaultCreate(
@@ -51,6 +70,7 @@ Future<int> parentMain() async {
     ['run', 'tool/e2e_smoke.dart', '--peer', addr],
     environment: {...Platform.environment},
   );
+  spawned(child);
   child.stdout.transform(const SystemEncoding().decoder).listen((s) => stdout.write('  child: $s'));
   child.stderr.transform(const SystemEncoding().decoder).listen((s) => stderr.write('  child! $s'));
 
@@ -110,6 +130,17 @@ Future<int> parentMain() async {
 
 Future<int> childMain(String peerAddr) async {
   final dir = Directory.systemTemp.createTempSync('tincan-smoke-b');
+  try {
+    return await _childRun(dir, peerAddr);
+  } on TimeoutException catch (e) {
+    stderr.writeln('child: $e');
+    return 1;
+  } finally {
+    _rm(dir);
+  }
+}
+
+Future<int> _childRun(Directory dir, String peerAddr) async {
   final bridge = TincanBridge();
   final events = Events(bridge.events);
   await bridge.vaultCreate(
