@@ -23,47 +23,76 @@ class ProfileDialog extends StatefulWidget {
   State<ProfileDialog> createState() => _ProfileDialogState();
 }
 
-class _ProfileDialogState extends State<ProfileDialog> {
+/// Picture picking, preview and saving shared by [ProfileDialog] and the
+/// onboarding name step.
+mixin ProfileEditor<T extends StatefulWidget> on State<T> {
+  AppState get appState;
+
+  String? newAvatarSource;
+  String? error;
+  bool busy = false;
+
+  String? get avatarPreview =>
+      newAvatarSource ?? appState.plaintextPath(appState.selfAvatarPath);
+
+  @override
+  void dispose() {
+    unawaited(releasePicked(newAvatarSource));
+    super.dispose();
+  }
+
+  Future<void> pickAvatar() async {
+    final path = await pickFile(const [imageTypes], mimeTypes: const ['image/*']);
+    if (path == null) return;
+    if (!mounted) return unawaited(releasePicked(path));
+    unawaited(releasePicked(newAvatarSource));
+    setState(() => newAvatarSource = path);
+  }
+
+  /// True once saved; on failure [error] is set.
+  Future<bool> saveProfile(
+      {required String name, required String description, required String status}) async {
+    setState(() {
+      busy = true;
+      error = null;
+    });
+    final err = await appState.saveProfile(
+      name: name,
+      description: description,
+      status: status,
+      newAvatarSource: newAvatarSource,
+    );
+    if (!mounted) return false;
+    if (err != null) {
+      setState(() {
+        busy = false;
+        error = err;
+      });
+    }
+    return err == null;
+  }
+}
+
+class _ProfileDialogState extends State<ProfileDialog> with ProfileEditor {
   late final _name = PlainTextEditingController(text: widget.state.selfName);
   late final _status = PlainTextEditingController(text: widget.state.selfStatus);
   late final _desc = PlainTextEditingController(text: widget.state.selfDescription);
-  String? _newAvatarSource;
-  String? _error;
-  bool _busy = false;
+
+  @override
+  AppState get appState => widget.state;
 
   @override
   void dispose() {
     _name.dispose();
     _status.dispose();
     _desc.dispose();
-    unawaited(releasePicked(_newAvatarSource));
     super.dispose();
   }
 
-  Future<void> _pickAvatar() async {
-    final path = await pickFile(const [imageTypes], mimeTypes: const ['image/*']);
-    if (path == null) return;
-    if (!mounted) return unawaited(releasePicked(path));
-    unawaited(releasePicked(_newAvatarSource));
-    setState(() => _newAvatarSource = path);
-  }
-
   Future<void> _save() async {
-    setState(() => _busy = true);
-    final err = await widget.state.saveProfile(
-      name: _name.text,
-      description: _desc.text,
-      status: _status.text,
-      newAvatarSource: _newAvatarSource,
-    );
-    if (!mounted) return;
-    if (err == null) {
+    if (await saveProfile(name: _name.text, description: _desc.text, status: _status.text) &&
+        mounted) {
       Navigator.of(context).pop();
-    } else {
-      setState(() {
-        _busy = false;
-        _error = err;
-      });
     }
   }
 
@@ -72,8 +101,6 @@ class _ProfileDialogState extends State<ProfileDialog> {
     final tc = TincanColors.of(context);
     // On a phone the keyboard would cover half the dialog straight away.
     final wide = MediaQuery.sizeOf(context).width >= 700;
-    final avatarPreview =
-        _newAvatarSource ?? widget.state.plaintextPath(widget.state.selfAvatarPath);
     return Dialog(
       child: Container(
         width: 460,
@@ -97,7 +124,7 @@ class _ProfileDialogState extends State<ProfileDialog> {
                     size: 56),
                 const SizedBox(width: 12),
                 OutlinedButton.icon(
-                  onPressed: _busy ? null : _pickAvatar,
+                  onPressed: busy ? null : pickAvatar,
                   icon: const Icon(Icons.image_outlined, size: 15),
                   label: const Text('Change picture…', style: TextStyle(fontSize: 12.5)),
                 ),
@@ -108,21 +135,21 @@ class _ProfileDialogState extends State<ProfileDialog> {
               _field(_status, 'Status', maxLength: 80),
               const SizedBox(height: 12),
               _field(_desc, 'Description', maxLength: 300, lines: 3),
-              if (_error != null) ...[
+              if (error != null) ...[
                 const SizedBox(height: 10),
-                Text(_error!, style: TextStyle(fontSize: 12, height: 1.4, color: tc.danger)),
+                Text(error!, style: TextStyle(fontSize: 12, height: 1.4, color: tc.danger)),
               ],
               const SizedBox(height: 16),
               Row(mainAxisAlignment: MainAxisAlignment.end, children: [
                 TextButton(
                   style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
-                  onPressed: _busy ? null : () => Navigator.of(context).pop(),
+                  onPressed: busy ? null : () => Navigator.of(context).pop(),
                   child: const Text('Cancel'),
                 ),
                 const SizedBox(width: 8),
                 FilledButton(
-                  onPressed: _busy ? null : _save,
-                  child: busyOr(_busy, const Text('Save')),
+                  onPressed: busy ? null : _save,
+                  child: busyOr(busy, const Text('Save')),
                 ),
               ]),
             ],
@@ -137,7 +164,7 @@ class _ProfileDialogState extends State<ProfileDialog> {
     return TextField(
       controller: c,
       autofocus: autofocus,
-      enabled: !_busy,
+      enabled: !busy,
       maxLength: maxLength,
       maxLines: lines,
       // A nickname is not prose. (The composing underline is the

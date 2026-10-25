@@ -1,12 +1,10 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 
 import '../app_state.dart';
-import '../files.dart';
 import '../models.dart' show initialsOf;
 import '../theme.dart';
 import 'sidebar.dart' show AvatarCircle;
+import 'profile_dialog.dart' show ProfileEditor;
 import 'text_input.dart';
 import 'unlock_screen.dart' show SetupSheet;
 
@@ -21,51 +19,29 @@ class NameStep extends StatefulWidget {
   State<NameStep> createState() => _NameStepState();
 }
 
-class _NameStepState extends State<NameStep> {
-  late final _name = PlainTextEditingController(text: widget.state.selfName);
-  String? _picture;
-  String? _error;
-  bool _busy = false;
+class _NameStepState extends State<NameStep> with ProfileEditor {
+  // Empty, not the fallback name, so Continue means a name was picked.
+  final _name = PlainTextEditingController();
+
+  @override
+  AppState get appState => widget.state;
 
   @override
   void dispose() {
     _name.dispose();
-    unawaited(releasePicked(_picture));
     super.dispose();
-  }
-
-  Future<void> _pickPicture() async {
-    final path = await pickFile(const [imageTypes], mimeTypes: const ['image/*']);
-    if (path == null) return;
-    if (!mounted) return unawaited(releasePicked(path));
-    unawaited(releasePicked(_picture));
-    setState(() => _picture = path);
   }
 
   Future<void> _save() async {
     if (_name.text.trim().isEmpty) return;
-    setState(() {
-      _busy = true;
-      _error = null;
-    });
     final s = widget.state;
-    final err = await s.saveProfile(
-      name: _name.text,
-      description: s.selfDescription,
-      status: s.selfStatus,
-      newAvatarSource: _picture,
-    );
-    if (!mounted || err == null) return;
-    setState(() {
-      _busy = false;
-      _error = err;
-    });
+    await saveProfile(name: _name.text, description: s.selfDescription, status: s.selfStatus);
   }
 
   @override
   Widget build(BuildContext context) {
     final tc = TincanColors.of(context);
-    final ready = _name.text.trim().isNotEmpty && !_busy;
+    final ready = _name.text.trim().isNotEmpty && !busy;
     return SetupSheet(
       title: 'What should people call you?',
       blurb: 'Your name and picture go to the people you chat with. You can change them later.',
@@ -74,13 +50,13 @@ class _NameStepState extends State<NameStep> {
           AvatarCircle(
               id: widget.state.selfName,
               initials: initialsOf(_name.text),
-              imagePath: _picture,
+              imagePath: avatarPreview,
               size: 56),
           const SizedBox(width: 12),
           OutlinedButton.icon(
-            onPressed: _busy ? null : _pickPicture,
+            onPressed: busy ? null : pickAvatar,
             icon: const Icon(Icons.image_outlined, size: 15),
-            label: Text(_picture == null ? 'Add a picture…' : 'Change picture…',
+            label: Text(avatarPreview == null ? 'Add a picture…' : 'Change picture…',
                 style: const TextStyle(fontSize: 12.5)),
           ),
         ]),
@@ -88,7 +64,7 @@ class _NameStepState extends State<NameStep> {
         TextField(
           controller: _name,
           autofocus: MediaQuery.sizeOf(context).width >= 700,
-          enabled: !_busy,
+          enabled: !busy,
           maxLength: 40,
           autocorrect: false,
           enableSuggestions: false,
@@ -96,9 +72,9 @@ class _NameStepState extends State<NameStep> {
           onSubmitted: (_) => _save(),
           decoration: const InputDecoration(labelText: 'Your name', counterText: ''),
         ),
-        if (_error != null) ...[
+        if (error != null) ...[
           const SizedBox(height: 10),
-          Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
+          Text(error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
         ],
         const SizedBox(height: 20),
         FilledButton(
@@ -108,7 +84,7 @@ class _NameStepState extends State<NameStep> {
           ),
           onPressed: ready ? _save : null,
           child: busyOr(
-              _busy,
+              busy,
               const Text('Continue', style: TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
               size: 18),
         ),

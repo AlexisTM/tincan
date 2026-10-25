@@ -37,13 +37,12 @@ class SettingsDialog extends StatefulWidget {
 class _SettingsDialogState extends State<SettingsDialog> {
   late int _background = widget.state.settings.backgroundMinutes;
   late bool _directOnly = widget.state.settings.directOnly;
+  late final bool _directOnlyWas = _directOnly;
   late final String _relayWas = widget.state.settings.relay;
   late final _relay = PlainTextEditingController(text: _relayWas);
   final _backupPassword = PlainTextEditingController();
   late bool _advanced = _relayWas.isNotEmpty;
   String? _error;
-  String? _note;
-  bool _noteIsError = false;
   bool _busy = false;
 
   @override
@@ -122,18 +121,16 @@ class _SettingsDialogState extends State<SettingsDialog> {
     Navigator.of(context).pop();
   }
 
-  Future<void> _run(Future<String?> Function() op, String doneNote) async {
+  Future<void> _run(Future<String?> Function() op, String done) async {
+    if (!mounted) return;
     setState(() => _busy = true);
     final err = await op();
     if (!mounted) return;
-    setState(() {
-      _busy = false;
-      _note = err ?? doneNote;
-      _noteIsError = err != null;
-    });
-    showToast(context, err == null ? doneNote : 'Failed: $err');
+    setState(() => _busy = false);
+    showToast(context, err == null ? done : 'Failed: $err');
   }
 
+  // Applies at once so it can be tried; Cancel puts it back.
   Future<void> _setDirectOnly(bool on) async {
     setState(() {
       _directOnly = on;
@@ -148,9 +145,36 @@ class _SettingsDialogState extends State<SettingsDialog> {
     if (err != null) showToast(context, 'Failed: $err');
   }
 
+  Future<void> _cancel() async {
+    if (_directOnly != _directOnlyWas) {
+      await _setDirectOnly(_directOnlyWas);
+      if (_directOnly != _directOnlyWas) return;
+    }
+    if (mounted) Navigator.of(context).pop();
+  }
+
+  bool get _dirty =>
+      _background != widget.state.settings.backgroundMinutes || _relay.text.trim() != _relayWas;
+
   Future<void> _lockNow() async {
-    Navigator.of(context).pop();
-    await widget.state.lockNow();
+    if (_dirty &&
+        !await confirmDialog(context,
+            title: 'Lock without saving?',
+            body: 'Your unsaved changes to these settings are dropped.',
+            action: 'Lock now')) {
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _busy = true);
+    try {
+      await widget.state.lockNow();
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _busy = false);
+      showToast(context, 'Couldn\'t lock: $e');
+      return;
+    }
+    if (mounted) Navigator.of(context).pop();
   }
 
   Future<void> _regenerate() async {
@@ -165,13 +189,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
 
   String get _password => _backupPassword.text;
 
-  static const _accountType = XTypeGroup(label: 'Account', extensions: ['json']);
-  static const _chatsType = XTypeGroup(label: 'Chats', extensions: ['zip']);
+  // Sealed backups are neither JSON nor zip, so they get their own extension.
+  static const _accountType = XTypeGroup(label: 'Account', extensions: ['json', 'tincan']);
+  static const _chatsType = XTypeGroup(label: 'Chats', extensions: ['zip', 'tincan']);
+  static const _sealedType = XTypeGroup(label: 'Sealed backup', extensions: ['tincan']);
 
   Future<void> _saveAccount() async {
-    final target = await chooseSaveTarget('tincan-account.json', const [_accountType]);
-    if (target == null) return;
     final password = _password;
+    final target = await chooseSaveTarget(
+        password.isEmpty ? 'tincan-account.json' : 'tincan-account.tincan',
+        [password.isEmpty ? const XTypeGroup(label: 'Account', extensions: ['json']) : _sealedType]);
+    if (target == null) return;
     await _run(
         () => target.write((path) => widget.state.exportAccount(path, password: password)),
         password.isEmpty
@@ -196,15 +224,17 @@ class _SettingsDialogState extends State<SettingsDialog> {
       await _run(
           () => widget.state.importAccount(path, password: password), 'Account restored.');
     } finally {
-      // It holds the private key in plaintext.
+      // Unsealed, it holds the private key in plaintext.
       await releasePicked(path);
     }
   }
 
   Future<void> _saveChats() async {
-    final target = await chooseSaveTarget('tincan-chats.zip', const [_chatsType]);
-    if (target == null) return;
     final password = _password;
+    final target = await chooseSaveTarget(
+        password.isEmpty ? 'tincan-chats.zip' : 'tincan-chats.tincan',
+        [password.isEmpty ? const XTypeGroup(label: 'Chats', extensions: ['zip']) : _sealedType]);
+    if (target == null) return;
     await _run(() => target.write((path) => widget.state.exportChats(path, password: password)),
         'Chats saved (messages and shared media).');
   }
@@ -230,189 +260,189 @@ class _SettingsDialogState extends State<SettingsDialog> {
           padding: const EdgeInsets.only(top: 22, bottom: 4),
           child: Text(title, style: Tc.caps(tc.label)),
         );
-    return Dialog(
-      insetPadding: EdgeInsets.all(narrow ? 14 : 40),
-      child: Container(
-        width: 480,
-        padding: const EdgeInsets.all(24),
-        child: SingleChildScrollView(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Row(children: [
-                const Expanded(
-                  child: Text('Settings',
-                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
-                ),
-                IconButton(
-                  tooltip: 'Close',
-                  onPressed: _busy ? null : () => Navigator.of(context).pop(),
-                  icon: Icon(Icons.close, size: 18, color: tc.inkMuted),
-                ),
-              ]),
-              section('RECEIVE IN THE BACKGROUND'),
-              if (!widget.state.supportsBackgroundPolicy)
-                Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 6),
-                  child: Text(
-                      'On this platform the app keeps receiving as long as its window is open.',
-                      style: blurb),
-                )
-              else ...[
-                RadioGroup<int>(
-                  groupValue: _background,
-                  onChanged: (v) => setState(() => _background = v!),
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    for (final m in backgroundPresets)
-                      RadioRow(
-                        value: m,
-                        title: switch (m) { 0 => 'Off', 60 => '1 hour', _ => '$m minutes' },
-                        blurb: m == 0 ? 'Messages arrive only while Tincan is open.' : '',
-                        onTap: () => setState(() => _background = m),
-                      ),
-                  ]),
-                ),
-                Text('Android shows a notification while Tincan listens in the background.',
-                    style: blurb),
-              ],
-              section('CONNECTIONS'),
-              SwitchListTile(
-                contentPadding: EdgeInsets.zero,
-                value: _directOnly,
-                onChanged: _busy ? null : _setDirectOnly,
-                title: const Text('Direct connections only', style: TextStyle(fontSize: 14)),
-                subtitle: Text(
-                    'The relay only introduces you; messages never pass through it. '
-                    'Contacts on other networks may be unreachable.',
-                    style: blurb),
-              ),
-              section('LOCK'),
-              Row(children: [
-                Expanded(
-                  child: Text(
-                    switch (widget.state.lockMode) {
-                      LockMode.device => 'Unlocks with this device\'s fingerprint, face or screen lock.',
-                      LockMode.password => 'Unlocks with your password.',
-                      LockMode.none => 'Opens without asking, so anyone holding this device can read your messages. Pick a real lock.',
-                      null => 'Lock unknown.',
-                    },
-                    style: widget.state.lockMode == LockMode.none
-                        ? blurb.copyWith(color: tc.danger)
-                        : blurb,
+    return PopScope(
+      canPop: !_busy && _directOnly == _directOnlyWas,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && !_busy) _cancel();
+      },
+      child: Dialog(
+        insetPadding: EdgeInsets.all(narrow ? 14 : 40),
+        child: Container(
+          width: 480,
+          padding: const EdgeInsets.all(24),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  const Expanded(
+                    child: Text('Settings',
+                        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
                   ),
-                ),
-                const SizedBox(width: 8),
-                // Old unlocked stores; same test as vault.canUpgradeLock.
-                if (widget.state.lockMode == LockMode.none)
-                  FilledButton(
-                    onPressed: _busy ? null : () => _changeLock(context),
-                    child: const Text('Set a lock…'),
+                  IconButton(
+                    tooltip: 'Close',
+                    onPressed: _busy ? null : _cancel,
+                    icon: Icon(Icons.close, size: 18, color: tc.inkMuted),
+                  ),
+                ]),
+                section('RECEIVE IN THE BACKGROUND'),
+                if (!widget.state.supportsBackgroundPolicy)
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 6),
+                    child: Text(
+                        'On this platform the app keeps receiving as long as its window is open.',
+                        style: blurb),
                   )
-                else
-                  OutlinedButton(
-                    style: tc.accentOutline,
-                    onPressed: _busy ? null : () => _changeLock(context),
-                    child: const Text('Change…'),
+                else ...[
+                  RadioGroup<int>(
+                    groupValue: _background,
+                    onChanged: (v) => setState(() => _background = v!),
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      for (final m in backgroundPresets)
+                        RadioRow(
+                          value: m,
+                          title: switch (m) { 0 => 'Off', 60 => '1 hour', _ => '$m minutes' },
+                          blurb: m == 0 ? 'Messages arrive only while Tincan is open.' : '',
+                          onTap: () => setState(() => _background = m),
+                        ),
+                    ]),
                   ),
-              ]),
-              if (canLockNow(widget.state)) ...[
+                  Text('Android shows a notification while Tincan listens in the background.',
+                      style: blurb),
+                ],
+                section('CONNECTIONS'),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  value: _directOnly,
+                  onChanged: _busy ? null : _setDirectOnly,
+                  title: const Text('Direct connections only', style: TextStyle(fontSize: 14)),
+                  subtitle: Text(
+                      'The relay only introduces you; messages never pass through it. '
+                      'Contacts on other networks may be unreachable.',
+                      style: blurb),
+                ),
+                section('LOCK'),
+                Row(children: [
+                  Expanded(
+                    child: Text(
+                      switch (widget.state.lockMode) {
+                        LockMode.device => 'Unlocks with this device\'s fingerprint, face or screen lock.',
+                        LockMode.password => 'Unlocks with your password.',
+                        LockMode.none => 'Opens without asking, so anyone holding this device can read your messages. Pick a real lock.',
+                        null => 'Lock unknown.',
+                      },
+                      style: widget.state.lockMode == LockMode.none
+                          ? blurb.copyWith(color: tc.danger)
+                          : blurb,
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  // Old unlocked stores; same test as vault.canUpgradeLock.
+                if (widget.state.lockMode == LockMode.none)
+                    FilledButton(
+                      onPressed: _busy ? null : () => _changeLock(context),
+                      child: const Text('Set a lock…'),
+                    )
+                  else
+                    OutlinedButton(
+                      style: tc.accentOutline,
+                      onPressed: _busy ? null : () => _changeLock(context),
+                      child: const Text('Change…'),
+                    ),
+                ]),
+                if (canLockNow(widget.state)) ...[
+                  const SizedBox(height: 8),
+                  OutlinedButton.icon(
+                    onPressed: _busy ? null : _lockNow,
+                    icon: const Icon(Icons.lock_outline, size: 16),
+                    label: const Text('Lock now'),
+                  ),
+                ],
+                section('ACCOUNT'),
+                Text('Your Tincan ID is how people reach you. A new one cuts off everyone holding the old one.',
+                    style: blurb),
                 const SizedBox(height: 8),
                 OutlinedButton.icon(
-                  onPressed: _busy ? null : _lockNow,
-                  icon: const Icon(Icons.lock_outline, size: 16),
-                  label: const Text('Lock now'),
+                  style: OutlinedButton.styleFrom(
+                      foregroundColor: tc.danger, padding: const EdgeInsets.symmetric(horizontal: 14)),
+                  onPressed: _busy ? null : _regenerate,
+                  icon: const Icon(Icons.refresh, size: 16),
+                  label: const Text('Generate a new Tincan ID…'),
                 ),
-              ],
-              section('ACCOUNT'),
-              Text('Your Tincan ID is how people reach you. A new one cuts off everyone holding the old one.',
-                  style: blurb),
-              const SizedBox(height: 8),
-              OutlinedButton.icon(
-                style: OutlinedButton.styleFrom(
-                    foregroundColor: tc.danger, padding: const EdgeInsets.symmetric(horizontal: 14)),
-                onPressed: _busy ? null : _regenerate,
-                icon: const Icon(Icons.refresh, size: 16),
-                label: const Text('Generate a new Tincan ID…'),
-              ),
-              section('BACKUPS'),
-              Text(
-                  'With a password, backups are encrypted and need it to restore. Without one, anyone holding the files can read them.',
-                  style: blurb),
-              const SizedBox(height: 10),
-              PasswordField(
-                controller: _backupPassword,
-                label: 'Backup password (optional)',
-                enabled: !_busy,
-                onSubmitted: () {},
-              ),
-              const SizedBox(height: 10),
-              Row(children: [
-                Expanded(child: _ghostButton('Save account…', _saveAccount)),
-                const SizedBox(width: 8),
-                Expanded(child: _ghostButton('Restore account…', _restoreAccount)),
-              ]),
-              const SizedBox(height: 8),
-              Row(children: [
-                Expanded(child: _ghostButton('Save chats…', _saveChats)),
-                const SizedBox(width: 8),
-                Expanded(child: _ghostButton('Restore chats…', _restoreChats)),
-              ]),
-              const SizedBox(height: 6),
-              Text(
-                  'The account file holds your private key. The chats file holds your history and shared media.',
-                  style: TextStyle(fontSize: 12, height: 1.4, color: tc.inkFaint)),
-              if (_note != null) ...[
-                const SizedBox(height: 8),
-                Text(_note!,
-                    style: TextStyle(
-                        fontSize: 12, height: 1.4, color: _noteIsError ? tc.danger : tc.inkMuted)),
-              ],
-              const SizedBox(height: 14),
-              AdvancedToggle(open: _advanced, onTap: () => setState(() => _advanced = !_advanced)),
-              if (_advanced) ...[
+                section('BACKUPS'),
                 Text(
-                  'Peers talk directly when they can, and through a relay when a network blocks that. '
-                  'A relay only sees ciphertext. Leave empty for the default relays.',
-                  style: blurb,
-                ),
+                    'With a password, backups are encrypted and need it to restore. Without one, anyone holding the files can read them.',
+                    style: blurb),
                 const SizedBox(height: 10),
-                TextField(
-                  controller: _relay,
+                PasswordField(
+                  controller: _backupPassword,
+                  label: 'Backup password (optional)',
                   enabled: !_busy,
-                  autocorrect: false,
-                  enableSuggestions: false,
-                  style: const TextStyle(fontSize: 13.5),
-                  decoration: InputDecoration(
-                    labelText: 'Relay',
-                    hintText: 'relay.example.com or https://…/relays.json',
-                    hintStyle: TextStyle(fontSize: 13, color: tc.inkFaint),
-                    isDense: true,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-                  ),
+                  onSubmitted: () {},
                 ),
-                const SizedBox(height: 6),
-                Text('Changing it changes your Tincan ID.',
-                    style: TextStyle(fontSize: 12, height: 1.4, color: tc.inkFaint)),
-              ],
-              if (_error != null) ...[
                 const SizedBox(height: 10),
-                Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
+                Row(children: [
+                  Expanded(child: _ghostButton('Save account…', _saveAccount)),
+                  const SizedBox(width: 8),
+                  Expanded(child: _ghostButton('Restore account…', _restoreAccount)),
+                ]),
+                const SizedBox(height: 8),
+                Row(children: [
+                  Expanded(child: _ghostButton('Save chats…', _saveChats)),
+                  const SizedBox(width: 8),
+                  Expanded(child: _ghostButton('Restore chats…', _restoreChats)),
+                ]),
+                const SizedBox(height: 6),
+                Text(
+                    'The account file holds your private key. The chats file holds your history and shared media.',
+                    style: TextStyle(fontSize: 12, height: 1.4, color: tc.inkFaint)),
+                const SizedBox(height: 14),
+                AdvancedToggle(open: _advanced, onTap: () => setState(() => _advanced = !_advanced)),
+                if (_advanced) ...[
+                  Text(
+                    'Peers talk directly when they can, and through a relay when a network blocks that. '
+                    'A relay only sees ciphertext. Leave empty for the default relays.',
+                    style: blurb,
+                  ),
+                  const SizedBox(height: 10),
+                  TextField(
+                    controller: _relay,
+                    enabled: !_busy,
+                    autocorrect: false,
+                    enableSuggestions: false,
+                    style: const TextStyle(fontSize: 13.5),
+                    decoration: InputDecoration(
+                      labelText: 'Relay',
+                      hintText: 'relay.example.com or https://…/relays.json',
+                      hintStyle: TextStyle(fontSize: 13, color: tc.inkFaint),
+                      isDense: true,
+                      contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text('Changing it changes your Tincan ID.',
+                      style: TextStyle(fontSize: 12, height: 1.4, color: tc.inkFaint)),
+                ],
+                if (_error != null) ...[
+                  const SizedBox(height: 10),
+                  Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
+                ],
+                const SizedBox(height: 18),
+                Row(mainAxisAlignment: MainAxisAlignment.end, children: [
+                  TextButton(
+                    style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
+                    onPressed: _busy ? null : _cancel,
+                    child: const Text('Cancel'),
+                  ),
+                  const SizedBox(width: 8),
+                  FilledButton(
+                    onPressed: _busy ? null : _save,
+                    child: busyOr(_busy, const Text('Save')),
+                  ),
+                ]),
               ],
-              const SizedBox(height: 18),
-              Row(mainAxisAlignment: MainAxisAlignment.end, children: [
-                TextButton(
-                  style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
-                  onPressed: _busy ? null : () => Navigator.of(context).pop(),
-                  child: const Text('Cancel'),
-                ),
-                const SizedBox(width: 8),
-                FilledButton(
-                  onPressed: _busy ? null : _save,
-                  child: busyOr(_busy, const Text('Save')),
-                ),
-              ]),
-            ],
+            ),
           ),
         ),
       ),

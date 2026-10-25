@@ -36,19 +36,46 @@ class _NewChatDialogState extends State<NewChatDialog> {
   bool _advanced = false;
   String? _error;
 
+  /// Text that came off the camera; still verified while the field holds it.
+  String? _scanned;
+
+  late String? _id = widget.state.selfProfile?.encode();
+  late String? _addr = widget.state.selfAddress;
+  late String _name = widget.state.selfName;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.state.addListener(_onState);
+  }
+
   @override
   void dispose() {
+    widget.state.removeListener(_onState);
     _token.dispose();
     super.dispose();
   }
 
+  // Only what this dialog shows; any other notify would re-encode the QR.
+  void _onState() {
+    final s = widget.state;
+    final id = s.selfProfile?.encode();
+    if (id == _id && s.selfAddress == _addr && s.selfName == _name) return;
+    setState(() {
+      _id = id;
+      _addr = s.selfAddress;
+      _name = s.selfName;
+    });
+  }
+
   /// A code scanned off their screen is them, so it starts verified.
-  Future<void> _connect([String? input, bool verified = false]) async {
+  Future<void> _connect() async {
+    final input = _token.text;
     setState(() {
       _connecting = true;
       _error = null;
     });
-    final err = await widget.state.connect(input ?? _token.text, verified: verified);
+    final err = await widget.state.connect(input, verified: input == _scanned);
     if (!mounted) return;
     if (err == null) {
       Navigator.of(context).pop();
@@ -66,7 +93,8 @@ class _NewChatDialogState extends State<NewChatDialog> {
     );
     if (scanned == null || !mounted) return;
     _token.text = scanned;
-    await _connect(scanned, true);
+    _scanned = scanned;
+    await _connect();
   }
 
   Future<void> _scanQrImage() async {
@@ -84,7 +112,7 @@ class _NewChatDialogState extends State<NewChatDialog> {
       return;
     }
     _token.text = text;
-    await _connect(text);
+    await _connect();
   }
 
   // mobile_scanner has no desktop implementation.
@@ -93,7 +121,9 @@ class _NewChatDialogState extends State<NewChatDialog> {
   Future<void> _saveContact() async {
     final vcard = widget.state.selfProfile?.toVCard();
     if (vcard == null) return;
-    final target = await chooseSaveTarget('${widget.state.selfName} (Tincan).vcf',
+    // The Android save path is joined onto a scratch dir, so no separators.
+    final safe = _name.replaceAll(RegExp(r'[\\/:*?"<>|\x00-\x1f]'), '_').trim();
+    final target = await chooseSaveTarget('${safe.isEmpty ? 'Contact' : safe} (Tincan).vcf',
         const [XTypeGroup(label: 'vCard', extensions: ['vcf'])]);
     if (target == null) return;
     final err = await target.write((path) async {
@@ -118,7 +148,7 @@ class _NewChatDialogState extends State<NewChatDialog> {
     try {
       await SharePlus.instance.share(ShareParams(
         text: id,
-        subject: '${widget.state.selfName} on Tincan',
+        subject: '$_name on Tincan',
         sharePositionOrigin: origin,
       ));
     } catch (_) {
@@ -141,73 +171,70 @@ class _NewChatDialogState extends State<NewChatDialog> {
       child: Container(
         width: narrow ? 440 : 700,
         padding: EdgeInsets.all(narrow ? 20 : 28),
-        child: ListenableBuilder(
-          listenable: widget.state,
-          builder: (context, _) => SingleChildScrollView(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Expanded(
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      const Text('Start a conversation',
-                          style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
-                      const SizedBox(height: 5),
-                      Text('No accounts, no sign-in. You connect straight to a peer.',
-                          style: TextStyle(fontSize: 13, color: tc.inkMuted)),
-                    ]),
-                  ),
-                  IconButton(
-                    tooltip: 'Close',
-                    onPressed: () => Navigator.of(context).pop(),
-                    icon: Icon(Icons.close, size: 18, color: tc.inkMuted),
-                  ),
-                ]),
-                const SizedBox(height: 22),
-                if (narrow) ...[
-                  _connectColumn(tc),
-                  Container(
-                    height: 1,
-                    margin: const EdgeInsets.symmetric(vertical: 20),
-                    color: tc.border,
-                  ),
-                  _shareColumn(tc),
-                ] else
-                  // No IntrinsicHeight: QrImageView holds a LayoutBuilder,
-                  // which refuses intrinsic-size queries.
-                  Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Expanded(child: _shareColumn(tc)),
-                    const SizedBox(width: 24),
-                    Expanded(
-                      child: Container(
-                        decoration: BoxDecoration(
-                          border: Border(left: BorderSide(color: tc.border)),
-                        ),
-                        padding: const EdgeInsets.only(left: 24),
-                        child: _connectColumn(tc),
-                      ),
-                    ),
-                  ]),
-                const SizedBox(height: 22),
-                Container(
-                  padding: const EdgeInsets.only(top: 16),
-                  decoration: BoxDecoration(
-                    border: Border(top: BorderSide(color: tc.border)),
-                  ),
-                  child: Row(children: [
-                    Icon(Icons.lock_outline, size: 15, color: tc.inkMuted),
-                    const SizedBox(width: 9),
-                    Expanded(
-                      child: Text(
-                        'End-to-end encrypted. Straight between devices when your networks allow it, otherwise through a relay that can\'t read your messages.',
-                        style: TextStyle(fontSize: 12, color: tc.inkMuted),
-                      ),
-                    ),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Expanded(
+                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                    const Text('Start a conversation',
+                        style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700)),
+                    const SizedBox(height: 5),
+                    Text('No accounts, no sign-in. You connect straight to a peer.',
+                        style: TextStyle(fontSize: 13, color: tc.inkMuted)),
                   ]),
                 ),
-              ],
-            ),
+                IconButton(
+                  tooltip: 'Close',
+                  onPressed: () => Navigator.of(context).pop(),
+                  icon: Icon(Icons.close, size: 18, color: tc.inkMuted),
+                ),
+              ]),
+              const SizedBox(height: 22),
+              if (narrow) ...[
+                _connectColumn(tc),
+                Container(
+                  height: 1,
+                  margin: const EdgeInsets.symmetric(vertical: 20),
+                  color: tc.border,
+                ),
+                _shareColumn(tc),
+              ] else
+                // No IntrinsicHeight: QrImageView holds a LayoutBuilder,
+                // which refuses intrinsic-size queries.
+                Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  Expanded(child: _shareColumn(tc)),
+                  const SizedBox(width: 24),
+                  Expanded(
+                    child: Container(
+                      decoration: BoxDecoration(
+                        border: Border(left: BorderSide(color: tc.border)),
+                      ),
+                      padding: const EdgeInsets.only(left: 24),
+                      child: _connectColumn(tc),
+                    ),
+                  ),
+                ]),
+              const SizedBox(height: 22),
+              Container(
+                padding: const EdgeInsets.only(top: 16),
+                decoration: BoxDecoration(
+                  border: Border(top: BorderSide(color: tc.border)),
+                ),
+                child: Row(children: [
+                  Icon(Icons.lock_outline, size: 15, color: tc.inkMuted),
+                  const SizedBox(width: 9),
+                  Expanded(
+                    child: Text(
+                      'End-to-end encrypted. Straight between devices when your networks allow it, otherwise through a relay that can\'t read your messages.',
+                      style: TextStyle(fontSize: 12, color: tc.inkMuted),
+                    ),
+                  ),
+                ]),
+              ),
+            ],
           ),
         ),
       ),
@@ -215,8 +242,8 @@ class _NewChatDialogState extends State<NewChatDialog> {
   }
 
   Widget _shareColumn(TincanColors tc) {
-    final id = widget.state.selfProfile?.encode();
-    final addr = widget.state.selfAddress;
+    final id = _id;
+    final addr = _addr;
     return Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
       const Text('Share your Tincan ID',
           style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600)),
@@ -251,7 +278,7 @@ class _NewChatDialogState extends State<NewChatDialog> {
       ),
       const SizedBox(height: 6),
       Center(
-        child: Text('${widget.state.selfName} · scan or paste',
+        child: Text('$_name · scan or paste',
             style: TextStyle(fontSize: 12, color: tc.inkMuted)),
       ),
       const SizedBox(height: 12),
@@ -282,18 +309,11 @@ class _NewChatDialogState extends State<NewChatDialog> {
           ),
         ),
         const SizedBox(width: 8),
-        MenuAnchor(
-          menuChildren: [
-            MenuItemButton(
-              onPressed: id == null ? null : _saveContact,
-              leadingIcon: const Icon(Icons.contact_page_outlined, size: 18),
-              child: const Text('Save as contact (vCard)…'),
-            ),
-          ],
-          builder: (context, menu, _) => OutlinedButton.icon(
-            onPressed: () => menu.isOpen ? menu.close() : menu.open(),
-            icon: const Icon(Icons.more_horiz, size: 16),
-            label: const Text('More', style: TextStyle(fontSize: 12.5)),
+        Expanded(
+          child: OutlinedButton.icon(
+            onPressed: id == null ? null : _saveContact,
+            icon: const Icon(Icons.contact_page_outlined, size: 15),
+            label: const Text('Save contact…', style: TextStyle(fontSize: 12.5)),
           ),
         ),
       ]),
