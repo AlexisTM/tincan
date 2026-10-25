@@ -7,13 +7,17 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
+
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // A file goes out as file-offer; the receiver answers file-resume with
@@ -34,6 +38,7 @@ const (
 type recvFile struct {
 	mu    sync.Mutex
 	owner *peer
+	id    string
 	f     *os.File
 	w     *ChunkWriter
 	part  string
@@ -104,6 +109,10 @@ func (m *Manager) SendFile(peerID, id, path string) (SentFile, error) {
 	if id == "" || len(id) > transferIDLen {
 		return SentFile{}, fmt.Errorf("transfer id must be 1 to %d bytes", transferIDLen)
 	}
+	if old := m.sendFor(peerID, id); old != nil {
+		old.fire(true) // a resend takes over
+		<-old.done     // once its last blob is out and its sealed copy is in place
+	}
 	src, size, err := m.openSource(path)
 	if err != nil {
 		return SentFile{}, err
@@ -126,8 +135,15 @@ func (m *Manager) SendFile(peerID, id, path string) (SentFile, error) {
 	}
 	sc := m.trackSend(peerID, id)
 	go func() {
-		defer m.untrackSend(peerID, id, sc)
-		m.streamFile(peerID, p, err, id, sf, src, out, sc)
+		ok := m.streamFile(peerID, p, err, id, sf, src, out, sc)
+		close(sc.done)
+		if !ok {
+			m.untrackSend(peerID, id, sc)
+			return
+		}
+		// Kept a while so a late cancel can't undo a delivered file and
+		// the peer's file-cancel, if it fails to place it, still lands.
+		time.AfterFunc(offerTimeout, func() { m.untrackSend(peerID, id, sc) })
 	}()
 	return sf, nil
 }
@@ -137,6 +153,7 @@ var errCancelled = errors.New("cancelled")
 // sendCancel stops one outgoing transfer.
 type sendCancel struct {
 	ch    chan struct{}
+	done  chan struct{} // closed when the stream has returned
 	once  sync.Once
 	quiet bool // the peer needn't hear of it; set before ch closes
 }
@@ -146,6 +163,14 @@ func (sc *sendCancel) fire(quiet bool) {
 		sc.quiet = quiet
 		close(sc.ch)
 	})
+}
+
+// finish claims the transfer as complete, which later cancels can't
+// undo; false when a cancel came first.
+func (sc *sendCancel) finish() bool {
+	won := false
+	sc.once.Do(func() { won = true })
+	return won
 }
 
 func (sc *sendCancel) fired() bool {
@@ -158,7 +183,7 @@ func (sc *sendCancel) fired() bool {
 }
 
 func (m *Manager) trackSend(peerID, id string) *sendCancel {
-	sc := &sendCancel{ch: make(chan struct{})}
+	sc := &sendCancel{ch: make(chan struct{}), done: make(chan struct{})}
 	m.sendMu.Lock()
 	defer m.sendMu.Unlock()
 	if old := m.sends[transferKey(peerID, id)]; old != nil {
@@ -250,33 +275,55 @@ func (m *Manager) openSource(path string) (io.ReadCloser, int64, error) {
 }
 
 // streamFile sends src to p, unless sendErr says p is unusable, while
-// sealing it into out when that is set.
-func (m *Manager) streamFile(peerID string, p *peer, sendErr error, id string, sf SentFile, src io.ReadCloser, out *os.File, sc *sendCancel) {
+// sealing it into out when that is set. It reports whether the peer got
+// the whole file.
+func (m *Manager) streamFile(peerID string, p *peer, sendErr error, id string, sf SentFile, src io.ReadCloser, out *os.File, sc *sendCancel) bool {
 	defer src.Close()
-	fail := func(err error) {
-		m.emit(map[string]any{"type": "send-error", "peer": peerID, "id": id, "error": err.Error()})
-	}
 	var seal *ChunkWriter
 	if out != nil {
 		seal = m.cfg.Vault.ChunkWriter(out)
 	}
 	var have int64
+	slot, accepted := false, false
 	if sendErr == nil {
 		select {
 		case p.sendSlots <- struct{}{}:
-			defer func() { <-p.sendSlots }()
+			slot = true
 			have, sendErr = m.offer(p, id, sf, sc.ch)
+			accepted = sendErr == nil
 		case <-p.done:
 			sendErr = errors.New("connection closed")
 		case <-sc.ch:
 			sendErr = errCancelled
 		}
 	}
+	// leave is called once nothing more goes to the peer: it frees the
+	// slot, and tells the peer when it took the offer or we cancelled.
+	var told bool
+	leave := func(err error) {
+		cancelled := errors.Is(err, errCancelled)
+		if err != nil && !told && (accepted && !cancelled || cancelled && !sc.quiet) {
+			told = true
+			q := p
+			if q == nil {
+				q, _ = m.peerByID(peerID)
+			}
+			if q != nil {
+				q.writeMsg(&wireMsg{T: "file-cancel", Ref: id})
+			}
+		}
+		if slot {
+			slot = false
+			<-p.sendSlots
+		}
+	}
+	r := io.LimitReader(src, sf.Size)
 	buf := make([]byte, chunkSize)
 	var off int64
 	var prog progress
+	var localErr error
 	for seal != nil || sendErr == nil {
-		n, rerr := io.ReadFull(src, buf)
+		n, rerr := io.ReadFull(r, buf)
 		if n > 0 && seal != nil {
 			if _, err := seal.Write(buf[:n]); err != nil {
 				rerr = err
@@ -290,45 +337,56 @@ func (m *Manager) streamFile(peerID string, p *peer, sendErr error, id string, s
 				m.emit(map[string]any{"type": "file-progress", "peer": peerID, "id": id, "done": end, "size": sf.Size})
 			}
 		}
+		if sendErr != nil {
+			leave(sendErr)
+		}
 		off += int64(n)
 		if rerr == io.EOF || rerr == io.ErrUnexpectedEOF {
+			if off < sf.Size {
+				localErr = fmt.Errorf("the file shrank to %d of %d bytes while sending", off, sf.Size)
+			}
 			break
 		}
 		if rerr != nil {
-			if out != nil {
-				out.Close()
-				os.Remove(sf.Path + ".part")
-			}
-			fail(rerr)
-			return
+			localErr = rerr
+			break
 		}
 	}
 	if out != nil {
-		err := seal.Close()
-		if err != nil {
+		if localErr == nil {
+			localErr = seal.Close()
+		}
+		if localErr == nil {
+			localErr = commitPart(out, sf.Path)
+		} else {
 			out.Close()
 			os.Remove(sf.Path + ".part")
-		} else {
-			err = commitPart(out, sf.Path)
-		}
-		if err != nil && sendErr == nil {
-			sendErr = err
 		}
 	}
-	if sendErr == nil {
-		sendErr = p.writeMsg(&wireMsg{T: "file-end", ID: id})
+	err := sendErr
+	if localErr != nil {
+		err = localErr
 	}
-	if errors.Is(sendErr, errCancelled) {
-		if !sc.quiet && p != nil {
-			p.writeMsg(&wireMsg{T: "file-cancel", Ref: id})
+	if err == nil {
+		if !sc.finish() {
+			err = errCancelled
+		} else if err = p.writeMsg(&wireMsg{T: "file-end", ID: id}); err != nil {
+			accepted = false // the connection is gone
 		}
-		return
 	}
-	if sendErr != nil {
-		fail(sendErr)
-		return
+	if sc.fired() {
+		err = errCancelled // even after a failure, so the peer drops its part
+	}
+	leave(err)
+	if errors.Is(err, errCancelled) {
+		return false
+	}
+	if err != nil {
+		m.emit(map[string]any{"type": "send-error", "peer": peerID, "id": id, "error": err.Error()})
+		return false
 	}
 	m.emit(map[string]any{"type": "file-done", "peer": peerID, "id": id, "path": sf.Path, "name": sf.Name, "size": sf.Size})
+	return true
 }
 
 // offer announces a file and returns how much of it the peer has.
@@ -339,7 +397,9 @@ func (m *Manager) offer(p *peer, id string, sf SentFile, cancel <-chan struct{})
 	p.offerMu.Unlock()
 	defer func() {
 		p.offerMu.Lock()
-		delete(p.offers, id)
+		if p.offers[id] == ch { // a resend may have put its own there
+			delete(p.offers, id)
+		}
 		p.offerMu.Unlock()
 	}()
 	err := p.writeMsg(&wireMsg{T: "file-offer", ID: id, TS: time.Now().UnixMilli(), File: sf.Name, Size: sf.Size, Kind: sf.Kind})
@@ -397,7 +457,7 @@ func (m *Manager) startRecv(p *peer, msg *wireMsg) {
 		refuse(errors.New("bad transfer id or size"))
 		return
 	}
-	key := recvKey(p, msg.ID)
+	key := transferKey(p.id, msg.ID)
 	m.recvMu.Lock()
 	old := m.recvs[key]
 	n := 0
@@ -422,11 +482,18 @@ func (m *Manager) startRecv(p *peer, msg *wireMsg) {
 		refuse(err)
 		return
 	}
-	rf.owner = p
+	rf.owner, rf.id = p, msg.ID
 	m.recvMu.Lock()
-	old = m.recvs[key]
-	m.recvs[key] = rf
+	if err = m.roomFor(key, rf); err == nil {
+		old = m.recvs[key]
+		m.recvs[key] = rf
+	}
 	m.recvMu.Unlock()
+	if err != nil {
+		rf.stop()
+		refuse(err)
+		return
+	}
 	if old != nil {
 		old.stop()
 	}
@@ -450,27 +517,46 @@ func (m *Manager) openPart(key string, msg *wireMsg) (*recvFile, error) {
 	if err == nil && have > msg.Size {
 		// Not this file after all; start over.
 		if err = f.Truncate(0); err == nil {
-			if _, err = f.Seek(0, io.SeekStart); err == nil {
-				w, have, err = m.cfg.Vault.ResumePart(f)
-			}
-		}
-	}
-	if err == nil {
-		if free, ok := freeSpace(m.cfg.DownloadDir); ok && free < uint64(msg.Size-have)+freeMargin {
-			err = fmt.Errorf("not enough free space for %d bytes", msg.Size-have)
+			w, have, err = m.cfg.Vault.ResumePart(f)
 		}
 	}
 	if err != nil {
 		f.Close()
 		return nil, err
 	}
-	name := capName(sanitizeName(msg.File))
+	name := storedName(sanitizeName(msg.File))
 	return &recvFile{f: f, w: w, part: part, name: name, kind: MediaKind(name), size: msg.Size, got: have}, nil
+}
+
+// roomFor checks the disk holds what rf still needs on top of what the
+// other transfers still expect. Called with recvMu held.
+func (m *Manager) roomFor(key string, rf *recvFile) error {
+	free, ok := freeSpace(m.cfg.DownloadDir)
+	if !ok {
+		return nil
+	}
+	need := sealedSize(rf.size - rf.got)
+	for k, o := range m.recvs {
+		if k != key {
+			o.mu.Lock()
+			need += sealedSize(o.size - o.got)
+			o.mu.Unlock()
+		}
+	}
+	if free < uint64(need)+freeMargin {
+		return fmt.Errorf("not enough free space for %d bytes", rf.size-rf.got)
+	}
+	return nil
+}
+
+// sealedSize is about what n plaintext bytes take on disk once sealed.
+func sealedSize(n int64) int64 {
+	return n + (n/chunkSize+2)*(4+chacha20poly1305.NonceSizeX+chacha20poly1305.Overhead)
 }
 
 // takeRecv unlinks p's transfer id, if it is p's.
 func (m *Manager) takeRecv(p *peer, id string) *recvFile {
-	key := recvKey(p, id)
+	key := transferKey(p.id, id)
 	m.recvMu.Lock()
 	defer m.recvMu.Unlock()
 	rf := m.recvs[key]
@@ -483,7 +569,7 @@ func (m *Manager) takeRecv(p *peer, id string) *recvFile {
 
 func (m *Manager) handleChunk(p *peer, id string, chunk []byte) {
 	m.recvMu.Lock()
-	rf := m.recvs[recvKey(p, id)]
+	rf := m.recvs[transferKey(p.id, id)]
 	m.recvMu.Unlock()
 	if rf == nil || rf.owner != p {
 		return // unknown transfer; drop
@@ -508,6 +594,7 @@ func (m *Manager) handleChunk(p *peer, id string, chunk []byte) {
 			rf.stop()
 			os.Remove(rf.part)
 			m.emit(map[string]any{"type": "recv-error", "peer": p.id, "id": id, "error": err.Error()})
+			p.writeMsg(&wireMsg{T: "file-cancel", Ref: id})
 		}
 		return
 	}
@@ -543,6 +630,7 @@ func (m *Manager) finishRecv(p *peer, id string) {
 		m.logf("tincan: finishing %q: %v", rf.name, err)
 		os.Remove(rf.part)
 		m.emit(map[string]any{"type": "recv-error", "peer": p.id, "id": id, "error": err.Error()})
+		p.writeMsg(&wireMsg{T: "file-cancel", Ref: id})
 		return
 	}
 	m.emit(map[string]any{"type": "file-done", "peer": p.id, "id": id, "path": final, "name": filepath.Base(final), "size": rf.got})
@@ -551,41 +639,46 @@ func (m *Manager) finishRecv(p *peer, id string) {
 
 // placePart renames part to a free variant of dir/name.
 func placePart(part, dir, name string) (string, error) {
-	for {
-		final := uniquePath(dir, name)
-		f, err := os.OpenFile(final, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-		if errors.Is(err, os.ErrExist) {
-			continue
-		}
-		if err != nil {
-			return "", err
-		}
-		f.Close()
-		if err := os.Rename(part, final); err != nil {
-			os.Remove(final)
-			return "", err
-		}
-		return final, nil
+	f, final, err := openUnique(dir, name, "")
+	if err != nil {
+		return "", err
 	}
+	f.Close()
+	if err := os.Rename(part, final); err != nil {
+		os.Remove(final)
+		return "", err
+	}
+	return final, nil
+}
+
+// openUnique creates a free variant of dir/name plus suffix exclusively,
+// returning it open with the variant's path without suffix.
+func openUnique(dir, name, suffix string) (*os.File, string, error) {
+	for range 100 {
+		final := uniquePath(dir, name)
+		f, err := os.OpenFile(final+suffix, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
+		if !errors.Is(err, os.ErrExist) {
+			return f, final, err
+		}
+	}
+	return nil, "", fmt.Errorf("no free name for %q", name)
 }
 
 // abortRecvs stops the transfers a closed connection left unfinished,
 // keeping what arrived for a resume.
 func (m *Manager) abortRecvs(p *peer) {
 	m.recvMu.Lock()
-	var ids []string
 	var rfs []*recvFile
 	for key, rf := range m.recvs {
 		if rf.owner == p {
 			delete(m.recvs, key)
-			ids = append(ids, strings.TrimPrefix(key, p.id+"\x00"))
 			rfs = append(rfs, rf)
 		}
 	}
 	m.recvMu.Unlock()
-	for i, rf := range rfs {
+	for _, rf := range rfs {
 		rf.stop()
-		m.emit(map[string]any{"type": "recv-error", "peer": p.id, "id": ids[i]})
+		m.emit(map[string]any{"type": "recv-error", "peer": p.id, "id": rf.id})
 	}
 }
 
@@ -639,6 +732,19 @@ func isBidiControl(r rune) bool {
 
 const maxNameBytes = 200
 
+// storedName is name as a file we keep: capped, and never looking like
+// the leftovers sweepStale removes.
+func storedName(name string) string {
+	name = capName(strings.TrimLeft(name, "."))
+	if base, ok := strings.CutSuffix(name, ".part"); ok {
+		name = base + "_part"
+	}
+	if name == "" {
+		name = "file"
+	}
+	return name
+}
+
 // capName keeps room under the filesystem's 255-byte limit for the
 // " (n)" and ".part" that uniquePath and createUnique add.
 func capName(name string) string {
@@ -667,7 +773,11 @@ func uniquePath(dir, name string) string {
 	stem := strings.TrimSuffix(name, ext)
 	path := filepath.Join(dir, name)
 	for i := 2; taken(path) || taken(path+".part"); i++ {
-		path = filepath.Join(dir, fmt.Sprintf("%s (%d)%s", stem, i, ext))
+		tag := strconv.Itoa(i)
+		if i > 20 { // a crowded name: stop probing one by one
+			tag = strconv.FormatUint(uint64(rand.Uint32()), 36)
+		}
+		path = filepath.Join(dir, fmt.Sprintf("%s (%s)%s", stem, tag, ext))
 	}
 	return path
 }

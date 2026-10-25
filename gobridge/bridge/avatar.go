@@ -2,6 +2,7 @@ package bridge
 
 import (
 	"bytes"
+	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -9,9 +10,11 @@ import (
 	_ "image/gif"
 	_ "image/jpeg"
 	_ "image/png"
+	"io"
 	"os"
 	"path/filepath"
 
+	"golang.org/x/crypto/hkdf"
 	_ "golang.org/x/image/webp"
 )
 
@@ -42,24 +45,60 @@ func checkAvatar(img []byte) error {
 	return nil
 }
 
-func ownerPrefix(owner string) string {
+// nameTag names a file after data under a key derived from the vault's,
+// so a known picture or contact key can't be matched to a filename.
+func (v *Vault) nameTag(kind string, data []byte, n int) (string, error) {
+	var tag string
+	err := v.withKey(func(key []byte) error {
+		nk := make([]byte, 32)
+		defer clear(nk)
+		if _, err := io.ReadFull(hkdf.New(sha256.New, key, nil, []byte("tincan file names")), nk); err != nil {
+			return err
+		}
+		mac := hmac.New(sha256.New, nk)
+		mac.Write([]byte(kind + "\x00"))
+		mac.Write(data)
+		tag = hex.EncodeToString(mac.Sum(nil)[:n])
+		return nil
+	})
+	return tag, err
+}
+
+// legacyOwnerPrefix is how pictures were named before nameTag.
+func legacyOwnerPrefix(owner string) string {
 	sum := sha256.Sum256([]byte(owner))
 	return hex.EncodeToString(sum[:8])
 }
 
-func (v *Vault) avatarGlob(owner string) string {
-	return filepath.Join(v.dir, "avatars", ownerPrefix(owner)+"-*.img")
+// avatarFiles lists owner's pictures, under either naming.
+func (v *Vault) avatarFiles(owner string) []string {
+	var found []string
+	prefixes := []string{legacyOwnerPrefix(owner)}
+	if p, err := v.nameTag("owner", []byte(owner), 8); err == nil {
+		prefixes = append([]string{p}, prefixes...)
+	}
+	for _, p := range prefixes {
+		m, _ := filepath.Glob(filepath.Join(v.dir, "avatars", p+"-*.img"))
+		found = append(found, m...)
+	}
+	return found
 }
 
-func (v *Vault) avatarPath(owner string, img []byte) string {
-	sum := sha256.Sum256(img)
-	return filepath.Join(v.dir, "avatars", ownerPrefix(owner)+"-"+hex.EncodeToString(sum[:4])+".img")
+func (v *Vault) avatarPath(owner string, img []byte) (string, error) {
+	op, err := v.nameTag("owner", []byte(owner), 8)
+	if err != nil {
+		return "", err
+	}
+	tag, err := v.nameTag("avatar", img, 16)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(v.dir, "avatars", op+"-"+tag+".img"), nil
 }
 
 // dropAvatars removes owner's pictures other than keep.
 func (v *Vault) dropAvatars(owner, keep string) {
-	old, _ := filepath.Glob(v.avatarGlob(owner))
-	for _, f := range old {
+	for _, f := range v.avatarFiles(owner) {
 		if f != keep {
 			os.Remove(f)
 		}
@@ -72,7 +111,10 @@ func (v *Vault) dropAvatars(owner, keep string) {
 func (v *Vault) storeAvatar(owner string, img []byte) (string, error) {
 	path := ""
 	if len(img) > 0 {
-		path = v.avatarPath(owner, img)
+		var err error
+		if path, err = v.avatarPath(owner, img); err != nil {
+			return "", err
+		}
 		if _, err := os.Stat(path); err != nil {
 			if err := v.WriteMedia(path, img, 0600); err != nil {
 				return "", err
@@ -80,13 +122,24 @@ func (v *Vault) storeAvatar(owner string, img []byte) (string, error) {
 		}
 	}
 	v.dropAvatars(owner, path)
+	if owner == selfOwner {
+		os.Remove(filepath.Join(v.dir, legacyAvatarFile))
+	}
 	return path, nil
 }
 
+// legacyAvatarFile is where our own picture lived before avatars/.
+const legacyAvatarFile = "avatar.img"
+
 // selfAvatar is the path of our own picture, or "" if there is none.
 func (v *Vault) selfAvatar() string {
-	if found, _ := filepath.Glob(v.avatarGlob(selfOwner)); len(found) > 0 {
+	if found := v.avatarFiles(selfOwner); len(found) > 0 {
 		return found[0]
+	}
+	if img, err := v.ReadMedia(filepath.Join(v.dir, legacyAvatarFile)); err == nil {
+		if path, err := v.storeAvatar(selfOwner, img); err == nil {
+			return path
+		}
 	}
 	return ""
 }

@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"slices"
@@ -34,9 +35,7 @@ import (
 
 const vaultFile = "vault.json"
 
-// Version 2 binds every state file and media chunk to its path, so
-// sealed files can't be swapped, renamed or cut short unnoticed. A
-// version 1 vault still opens the unbound files it already holds.
+// Version 2 binds state files and media chunks to where they belong.
 const vaultVersion = 2
 
 type vaultHeader struct {
@@ -82,15 +81,22 @@ func deriveKey(kdf string, secret, salt []byte) ([]byte, error) {
 }
 
 func seal(key, plaintext, aad []byte) ([]byte, error) {
+	return sealAppend(nil, key, plaintext, aad)
+}
+
+// sealAppend appends nonce||ciphertext to dst.
+func sealAppend(dst, key, plaintext, aad []byte) ([]byte, error) {
 	aead, err := chacha20poly1305.NewX(key)
 	if err != nil {
 		return nil, err
 	}
-	nonce := make([]byte, aead.NonceSize(), aead.NonceSize()+len(plaintext)+aead.Overhead())
+	n := len(dst)
+	out := slices.Grow(dst, aead.NonceSize()+len(plaintext)+aead.Overhead())[:n+aead.NonceSize()]
+	nonce := out[n:]
 	if _, err := rand.Read(nonce); err != nil {
 		return nil, err
 	}
-	return aead.Seal(nonce, nonce, plaintext, aad), nil
+	return aead.Seal(out, nonce, plaintext, aad), nil
 }
 
 func open(key, blob, aad []byte) ([]byte, error) {
@@ -207,15 +213,7 @@ func createUnique(dir, name string) (*os.File, string, error) {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, "", err
 	}
-	name = capName(name)
-	for {
-		final := uniquePath(dir, name)
-		f, err := os.OpenFile(final+".part", os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0600)
-		if errors.Is(err, os.ErrExist) {
-			continue
-		}
-		return f, final, err
-	}
+	return openUnique(dir, storedName(name), ".part")
 }
 
 // commitPart closes a file from createUnique and moves it into place.
@@ -282,6 +280,14 @@ func OpenVault(stateDir, secret string) (*Vault, error) {
 	if err != nil {
 		return nil, errors.New("wrong password")
 	}
+	if h.Version > vaultVersion {
+		clear(dek)
+		return nil, fmt.Errorf("this vault is from a newer version of the app (format %d)", h.Version)
+	}
+	if err := rollbackImport(stateDir); err != nil {
+		clear(dek)
+		return nil, fmt.Errorf("undoing an interrupted account import: %w", err)
+	}
 	return &Vault{key: dek, dir: stateDir, legacy: h.Version < 2}, nil
 }
 
@@ -315,6 +321,119 @@ func (v *Vault) ChangeSecret(secret, mode string) error {
 	})
 }
 
+// Upgrade reseals the unbound files a version 1 vault holds, under its
+// state dir and mediaDirs, then marks it version 2 so unbound files stop
+// opening. Run it before anything else reads or writes those files.
+func (v *Vault) Upgrade(mediaDirs ...string) error {
+	if !v.legacy {
+		return nil
+	}
+	for _, dir := range append([]string{v.dir}, mediaDirs...) {
+		err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+			switch {
+			case err != nil:
+				if path == dir && errors.Is(err, fs.ErrNotExist) {
+					return nil
+				}
+				return err
+			case d.IsDir():
+				if d.Name() == partialDir {
+					return filepath.SkipDir // resumes start over on foreign parts anyway
+				}
+				return nil
+			case !d.Type().IsRegular() || path == headerPath(v.dir) || path == filepath.Join(v.dir, importJournal):
+				return nil
+			}
+			if err := v.upgradeFile(path); err != nil {
+				return fmt.Errorf("upgrading %s: %w", path, err)
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	h, err := readHeader(v.dir)
+	if err != nil {
+		return err
+	}
+	h.Version = vaultVersion
+	j, err := json.MarshalIndent(h, "", "\t")
+	if err != nil {
+		return err
+	}
+	if err := writeBytesAtomic(headerPath(v.dir), 0600, j); err != nil {
+		return err
+	}
+	v.mu.Lock()
+	v.legacy = false
+	v.mu.Unlock()
+	return nil
+}
+
+const maxLegacyState = 256 << 20
+
+// upgradeFile reseals path if it opens as an unbound state file or
+// unbound media, and leaves anything else alone.
+func (v *Vault) upgradeFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	var magic [len(stateMagic)]byte
+	if _, err := io.ReadFull(f, magic[:]); err == nil && (string(magic[:]) == stateMagic || string(magic[:]) == mediaMagic) {
+		return nil
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	br := bufio.NewReader(f)
+	if blob, err := readLenPrefixed(br, maxSealedChunk); err == nil {
+		err = v.withKey(func(key []byte) error {
+			plain, err := open(key, blob, nil)
+			clear(plain)
+			return err
+		})
+		if errors.Is(err, errLocked) {
+			return err
+		}
+		if err == nil {
+			if _, err := f.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			return v.createMedia(path, fi.Mode().Perm(), func(w io.Writer) error {
+				_, err := io.Copy(w, &legacyChunkReader{v: v, r: bufio.NewReader(f)})
+				return err
+			})
+		}
+	}
+	if fi.Size() > maxLegacyState {
+		return nil
+	}
+	blob, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	var plain []byte
+	err = v.withKey(func(key []byte) (err error) {
+		plain, err = open(key, blob, nil)
+		return err
+	})
+	if errors.Is(err, errLocked) {
+		return err
+	}
+	if err != nil {
+		return nil // not ours
+	}
+	defer clear(plain)
+	return v.WriteFile(path, plain, fi.Mode().Perm())
+}
+
 // bind is the associated data tying a sealed file to its path relative
 // to the state dir, which survives the app's data dir moving.
 func (v *Vault) bind(kind, path string) []byte {
@@ -332,18 +451,23 @@ func (v *Vault) bind(kind, path string) []byte {
 
 const stateMagic = "TCS\x02"
 
+// sealState is the on-disk form of a state file at path.
+func (v *Vault) sealState(path string, data []byte) (blob []byte, err error) {
+	err = v.withKey(func(key []byte) (err error) {
+		blob, err = sealAppend([]byte(stateMagic), key, data, v.bind("state", path))
+		return err
+	})
+	return blob, err
+}
+
 // WriteFile seals data bound to path, always in the current format,
 // so an old file is upgraded the next time it is saved.
 func (v *Vault) WriteFile(path string, data []byte, perm os.FileMode) error {
-	var blob []byte
-	err := v.withKey(func(key []byte) (err error) {
-		blob, err = seal(key, data, v.bind("state", path))
-		return err
-	})
+	blob, err := v.sealState(path, data)
 	if err != nil {
 		return err
 	}
-	return writeBytesAtomic(path, perm, append([]byte(stateMagic), blob...))
+	return writeBytesAtomic(path, perm, blob)
 }
 
 func (v *Vault) ReadFile(path string) ([]byte, error) {
@@ -379,14 +503,9 @@ func (v *Vault) String() string {
 	return "Vault(" + v.dir + ")"
 }
 
-// Media is sealed chunk by chunk as it arrives, so a received file is
-// never plaintext on disk, not even briefly. A sealed stream is a
-// header then chunks, each a 4-byte big-endian length and
-// nonce||ciphertext, ending with an empty last chunk. The associated
-// data carries the stream's binding, the chunk index and a last flag,
-// so swapped, dropped or cut-off chunks fail to open. Media is bound to
-// a random id in its header rather than its path, since transfers are
-// renamed when they finish. Version 1 media had no header at all.
+// Media is a header holding a random id, then length-prefixed sealed
+// chunks bound to that id, their index and a last flag. The id, not the
+// path, since transfers are renamed when they finish.
 
 const (
 	maxSealedChunk = 1 << 20
@@ -515,10 +634,11 @@ func (c *chunkReader) Read(p []byte) (int, error) {
 func (c *chunkReader) next() error {
 	if c.last {
 		var b [1]byte
-		if _, err := io.ReadFull(c.r, b[:]); err == io.EOF {
-			return io.EOF
+		n, err := io.ReadFull(c.r, b[:])
+		if n > 0 {
+			return errors.New("data after the last sealed chunk")
 		}
-		return errors.New("data after the last sealed chunk")
+		return err
 	}
 	blob, err := readLenPrefixed(c.r, maxSealedChunk)
 	if err == io.EOF || err == io.ErrUnexpectedEOF {
@@ -607,26 +727,22 @@ func (m *mediaReader) Read(p []byte) (int, error) {
 }
 
 func (v *Vault) stageMedia(path string, perm os.FileMode, fill func(w io.Writer) error) (string, error) {
-	return stageFile(path, perm, func(w io.Writer) error {
+	return stageFile(path, perm, sealedFill(v, fill))
+}
+
+func sealedFill(v *Vault, fill func(w io.Writer) error) func(w io.Writer) error {
+	return func(w io.Writer) error {
 		cw := v.ChunkWriter(w)
 		if err := fill(cw); err != nil {
 			return err
 		}
 		return cw.Close()
-	})
+	}
 }
 
 // createMedia writes path through a ChunkWriter filled by fill.
 func (v *Vault) createMedia(path string, perm os.FileMode, fill func(w io.Writer) error) error {
-	tmp, err := v.stageMedia(path, perm, fill)
-	if err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		os.Remove(tmp)
-		return err
-	}
-	return nil
+	return writeFileAtomic(path, perm, sealedFill(v, fill))
 }
 
 func writeAll(data []byte) func(w io.Writer) error {
@@ -650,12 +766,28 @@ func (v *Vault) MediaSize(path string) (int64, error) {
 		return 0, err
 	}
 	defer f.Close()
-	var magic [len(mediaMagic)]byte
-	skip := int64(0)
-	if _, err := io.ReadFull(f, magic[:]); err == nil && string(magic[:]) == mediaMagic {
-		skip = int64(len(magic) + mediaIDSize)
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, err
 	}
-	if _, err := f.Seek(skip, io.SeekStart); err != nil {
+	var magic [len(mediaMagic)]byte
+	headed := false
+	switch _, err := io.ReadFull(f, magic[:]); {
+	case err == nil && string(magic[:]) == mediaMagic:
+		if fi.Size() < int64(len(magic)+mediaIDSize) {
+			return 0, errTruncated
+		}
+		headed = true
+	case err != nil && err != io.EOF && err != io.ErrUnexpectedEOF:
+		return 0, err
+	case !v.legacy:
+		return 0, errors.New("not a sealed file")
+	}
+	off := int64(0)
+	if headed {
+		off = int64(len(magic) + mediaIDSize)
+	}
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
 		return 0, err
 	}
 	overhead := int64(chacha20poly1305.NonceSizeX + chacha20poly1305.Overhead)
@@ -663,7 +795,13 @@ func (v *Vault) MediaSize(path string) (int64, error) {
 	for {
 		n, err := readLen(f, maxSealedChunk)
 		if err == io.EOF {
+			if headed && off == int64(len(magic)+mediaIDSize) {
+				return 0, errTruncated // a sealed stream always ends with a last chunk
+			}
 			return size, nil
+		}
+		if err == io.ErrUnexpectedEOF {
+			return 0, errTruncated
 		}
 		if err != nil {
 			return 0, err
@@ -671,7 +809,10 @@ func (v *Vault) MediaSize(path string) (int64, error) {
 		if int64(n) < overhead {
 			return 0, fmt.Errorf("bad chunk length %d", n)
 		}
-		if _, err := f.Seek(int64(n), io.SeekCurrent); err != nil {
+		if off += 4 + int64(n); off > fi.Size() {
+			return 0, errTruncated
+		}
+		if _, err := f.Seek(off, io.SeekStart); err != nil {
 			return 0, err
 		}
 		size += int64(n) - overhead
@@ -706,36 +847,17 @@ func (v *Vault) DecryptFile(src, dst string) error {
 // or foreign tail, and returns the plaintext bytes kept with a writer
 // that appends after them. An empty or unreadable f starts over.
 func (v *Vault) ResumePart(f *os.File) (*ChunkWriter, int64, error) {
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return nil, 0, err
-	}
-	br := bufio.NewReader(f)
 	hdr := make([]byte, len(mediaMagic)+mediaIDSize)
 	var cw *ChunkWriter
 	var off, have int64
-	if _, err := io.ReadFull(br, hdr); err == nil && string(hdr[:len(mediaMagic)]) == mediaMagic {
+	if _, err := f.ReadAt(hdr, 0); err == nil && string(hdr[:len(mediaMagic)]) == mediaMagic {
 		cw = newChunkWriter(v.withKey, mediaBind(hdr[len(mediaMagic):]), f, nil)
-		off = int64(len(hdr))
-		for {
-			blob, err := readLenPrefixed(br, maxSealedChunk)
-			if err != nil {
-				break
-			}
-			var plain []byte
-			err = v.withKey(func(key []byte) (err error) {
-				plain, err = open(key, blob, chunkAAD(cw.bind, cw.n, false))
-				return err
-			})
-			if errors.Is(err, errLocked) {
-				return nil, 0, err
-			}
-			if err != nil {
-				break
-			}
-			clear(plain)
-			off += 4 + int64(len(blob))
-			have += int64(len(plain))
-			cw.n++
+		var err error
+		if off, have, err = v.resumeFast(f, cw); err == nil && off < 0 {
+			off, have, err = v.resumeScan(f, cw)
+		}
+		if err != nil {
+			return nil, 0, err
 		}
 	} else {
 		cw = v.ChunkWriter(f)
@@ -748,6 +870,73 @@ func (v *Vault) ResumePart(f *os.File) (*ChunkWriter, int64, error) {
 		return nil, 0, err
 	}
 	return cw, have, nil
+}
+
+// resumeFast relies on a part holding only full chunks, as ChunkWriter
+// leaves it before Close, and opens just the last whole one. off < 0
+// means the layout didn't hold.
+func (v *Vault) resumeFast(f *os.File, cw *ChunkWriter) (off, have int64, err error) {
+	fi, err := f.Stat()
+	if err != nil {
+		return 0, 0, err
+	}
+	start := int64(len(mediaMagic) + mediaIDSize)
+	blobLen := int64(chacha20poly1305.NonceSizeX + chunkSize + chacha20poly1305.Overhead)
+	rec := 4 + blobLen
+	n := (fi.Size() - start) / rec
+	if n <= 0 {
+		return start, 0, nil
+	}
+	b := make([]byte, rec)
+	if _, err := f.ReadAt(b, start+(n-1)*rec); err != nil {
+		return 0, 0, err
+	}
+	if int64(binary.BigEndian.Uint32(b)) != blobLen {
+		return -1, 0, nil
+	}
+	err = v.withKey(func(key []byte) error {
+		plain, err := open(key, b[4:], chunkAAD(cw.bind, uint64(n-1), false))
+		clear(plain)
+		return err
+	})
+	if errors.Is(err, errLocked) {
+		return 0, 0, err
+	}
+	if err != nil {
+		return -1, 0, nil
+	}
+	cw.n = uint64(n)
+	return start + n*rec, n * chunkSize, nil
+}
+
+// resumeScan opens chunk after chunk until one fails.
+func (v *Vault) resumeScan(f *os.File, cw *ChunkWriter) (off, have int64, err error) {
+	off = int64(len(mediaMagic) + mediaIDSize)
+	if _, err := f.Seek(off, io.SeekStart); err != nil {
+		return 0, 0, err
+	}
+	br := bufio.NewReader(f)
+	for {
+		blob, err := readLenPrefixed(br, maxSealedChunk)
+		if err != nil {
+			return off, have, nil
+		}
+		var plain []byte
+		err = v.withKey(func(key []byte) (err error) {
+			plain, err = open(key, blob, chunkAAD(cw.bind, cw.n, false))
+			return err
+		})
+		if errors.Is(err, errLocked) {
+			return 0, 0, err
+		}
+		if err != nil {
+			return off, have, nil
+		}
+		clear(plain)
+		off += 4 + int64(len(blob))
+		have += int64(len(plain))
+		cw.n++
+	}
 }
 
 // Password-sealed files (account and chat backups) are a magic, an
@@ -818,9 +1007,8 @@ func SealFile(src, dst string, password []byte) error {
 	})
 }
 
-// OpenFile decrypts a SealFile output into dst. A file that was never
-// sealed is copied as is, so callers can try without a password first
-// and ask for one on ErrPasswordRequired.
+// OpenFile decrypts a SealFile output into dst, or copies an unsealed
+// file as is, so callers can ask for a password on ErrPasswordRequired.
 func OpenFile(src, dst string, password []byte) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -875,15 +1063,17 @@ func (v *Vault) ExportAccount(dst string, password []byte) error {
 	}
 	b := AccountBackup{Version: 1, Kind: accountKind, Identity: identity}
 	defer b.wipe()
-	if r, err := v.ReadFile(filepath.Join(v.dir, rosterFile)); err == nil {
-		b.Roster = r
+	// A missing file is an empty one; one that won't open would be lost
+	// on import, so it fails the export.
+	if b.Roster, err = v.ReadFile(filepath.Join(v.dir, rosterFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("contacts: %w", err)
 	}
-	if p, err := v.ReadFile(filepath.Join(v.dir, profileFile)); err == nil {
-		b.Profile = p
+	if b.Profile, err = v.ReadFile(filepath.Join(v.dir, profileFile)); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("profile: %w", err)
 	}
 	if path := v.selfAvatar(); path != "" {
-		if a, err := v.ReadMedia(path); err == nil {
-			b.Avatar = a
+		if b.Avatar, err = v.ReadMedia(path); err != nil {
+			return fmt.Errorf("profile picture: %w", err)
 		}
 	}
 	j, err := json.MarshalIndent(b, "", "\t")
@@ -924,6 +1114,7 @@ func readAccount(src string, password []byte) (*AccountBackup, error) {
 	}
 	b := new(AccountBackup)
 	if err := json.Unmarshal(j, b); err != nil || b.Kind != accountKind || len(b.Identity) == 0 {
+		b.wipe()
 		return nil, errors.New("not a tincan account file")
 	}
 	var pk tailcat.PrivateKey
@@ -947,8 +1138,8 @@ func readAccount(src string, password []byte) (*AccountBackup, error) {
 }
 
 // ImportAccount replaces the account with a backup, re-encrypted under
-// this device's key. Everything is checked and staged before the first
-// rename, so a bad file leaves the current account as it was.
+// this device's key. Everything is checked and staged first, and the
+// swap rolls back on failure, so a bad import keeps the current account.
 func (v *Vault) ImportAccount(src string, password []byte) error {
 	b, err := readAccount(src, password)
 	if err != nil {
@@ -961,19 +1152,6 @@ func (v *Vault) ImportAccount(src string, password []byte) error {
 			os.Remove(s[0])
 		}
 	}()
-	stage := func(path string, fill func(w io.Writer) error, media bool) error {
-		var tmp string
-		var err error
-		if media {
-			tmp, err = v.stageMedia(path, 0600, fill)
-		} else {
-			tmp, err = stageFile(path, 0600, fill)
-		}
-		if err == nil {
-			staged = append(staged, [2]string{tmp, path})
-		}
-		return err
-	}
 	// What the backup lacks belonged to the account being replaced.
 	var drop []string
 	for _, f := range []struct {
@@ -989,38 +1167,136 @@ func (v *Vault) ImportAccount(src string, password []byte) error {
 			drop = append(drop, path)
 			continue
 		}
-		var blob []byte
-		err := v.withKey(func(key []byte) (err error) {
-			blob, err = seal(key, f.data, v.bind("state", path))
-			return err
-		})
-		if err == nil {
-			err = stage(path, writeAll(append([]byte(stateMagic), blob...)), false)
-		}
+		blob, err := v.sealState(path, f.data)
 		if err != nil {
 			return err
 		}
+		tmp, err := stageFile(path, 0600, writeAll(blob))
+		if err != nil {
+			return err
+		}
+		staged = append(staged, [2]string{tmp, path})
 	}
 	avatar := ""
 	if len(b.Avatar) > 0 {
-		avatar = v.avatarPath(selfOwner, b.Avatar)
-		if err := stage(avatar, writeAll(b.Avatar), true); err != nil {
+		if avatar, err = v.avatarPath(selfOwner, b.Avatar); err != nil {
 			return err
 		}
-	}
-	for len(staged) > 0 {
-		if err := os.Rename(staged[0][0], staged[0][1]); err != nil {
+		tmp, err := v.stageMedia(avatar, 0600, writeAll(b.Avatar))
+		if err != nil {
 			return err
 		}
-		staged = staged[1:]
+		staged = append(staged, [2]string{tmp, avatar})
 	}
-	for _, path := range drop {
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			return err
-		}
+	if err := v.swapIn(staged, drop); err != nil {
+		return err
 	}
+	staged = nil
 	v.dropAvatars(selfOwner, avatar)
 	return nil
+}
+
+// An import moves the files it replaces aside under a journal, so a
+// failure or a crash midway puts them back.
+
+const importJournal = "import.journal"
+
+type journalEntry struct {
+	Path string `json:"path"` // relative to the state dir
+	Had  bool   `json:"had"`  // an old file was there to restore
+}
+
+func asidePath(path string) string {
+	return filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp-import")
+}
+
+// swapIn renames each staged temp over its final path and removes drop,
+// all or nothing.
+func (v *Vault) swapIn(staged [][2]string, drop []string) error {
+	targets := slices.Clone(drop)
+	for _, s := range staged {
+		targets = append(targets, s[1])
+	}
+	var entries []journalEntry
+	for _, t := range targets {
+		rel, err := filepath.Rel(v.dir, t)
+		if err != nil {
+			return err
+		}
+		_, err = os.Lstat(t)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		entries = append(entries, journalEntry{Path: filepath.ToSlash(rel), Had: err == nil})
+	}
+	j, err := json.Marshal(entries)
+	if err != nil {
+		return err
+	}
+	if err := writeBytesAtomic(filepath.Join(v.dir, importJournal), 0600, j); err != nil {
+		return err
+	}
+	err = func() error {
+		for i, t := range targets {
+			if entries[i].Had {
+				if err := os.Rename(t, asidePath(t)); err != nil {
+					return err
+				}
+			}
+		}
+		for _, s := range staged {
+			if err := os.Rename(s[0], s[1]); err != nil {
+				return err
+			}
+		}
+		return nil
+	}()
+	if err != nil {
+		if rerr := rollbackImport(v.dir); rerr != nil {
+			return fmt.Errorf("%w; restoring the old account: %v", err, rerr)
+		}
+		return err
+	}
+	if err := os.Remove(filepath.Join(v.dir, importJournal)); err != nil {
+		return err
+	}
+	for i, t := range targets {
+		if entries[i].Had {
+			os.Remove(asidePath(t))
+		}
+	}
+	return nil
+}
+
+// rollbackImport undoes an import that a journal shows unfinished.
+func rollbackImport(stateDir string) error {
+	journal := filepath.Join(stateDir, importJournal)
+	j, err := os.ReadFile(journal)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var entries []journalEntry
+	if err := json.Unmarshal(j, &entries); err != nil {
+		return err
+	}
+	for _, e := range entries {
+		t := filepath.Join(stateDir, filepath.FromSlash(e.Path))
+		if !filepath.IsLocal(e.Path) {
+			continue
+		}
+		if !e.Had {
+			err = os.Remove(t)
+		} else if err = os.Rename(asidePath(t), t); errors.Is(err, fs.ErrNotExist) {
+			err = nil // never moved aside
+		}
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return os.Remove(journal)
 }
 
 // ImportMedia seals a plaintext file into dir under a free variant of

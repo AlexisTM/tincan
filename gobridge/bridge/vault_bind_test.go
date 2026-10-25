@@ -67,6 +67,19 @@ func TestVaultStateFileBoundToPath(t *testing.T) {
 	}
 }
 
+func TestVaultRefusesUnboundStateFile(t *testing.T) {
+	v := newTestVault(t)
+	path := filepath.Join(v.dir, identityFile)
+	blob, err := seal(v.key, []byte("swapped in"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(path, blob, 0600)
+	if _, err := v.ReadFile(path); err == nil {
+		t.Error("a v2 vault should refuse an unbound state file")
+	}
+}
+
 func TestVaultMediaTruncationDetected(t *testing.T) {
 	v := newTestVault(t)
 	path := filepath.Join(v.dir, "m")
@@ -75,7 +88,7 @@ func TestVaultMediaTruncationDetected(t *testing.T) {
 	}
 	b, _ := os.ReadFile(path)
 	offs := chunkOffsets(t, b)
-	for _, cut := range offs[1 : len(offs)-1] {
+	for _, cut := range offs[:len(offs)-1] {
 		os.WriteFile(path, b[:cut], 0600)
 		if _, err := v.ReadMedia(path); !errors.Is(err, errTruncated) {
 			t.Errorf("cut at %d: err %v, want truncated", cut, err)
