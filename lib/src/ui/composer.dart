@@ -26,16 +26,19 @@ String attachBlockedReason(Conversation c) => c.blocked
     : 'Files can be sent once ${c.displayName} accepts';
 
 /// Sends files picked, pasted or dropped, if this peer can take them now.
-Future<void> sendFiles(
+/// Files carry no reply, so callers drop the reply bar once this is true.
+Future<bool> sendFiles(
     BuildContext context, AppState state, Conversation convo, List<String> paths) async {
-  if (paths.isEmpty) return;
-  if (!canAttach(convo)) return showToast(context, attachBlockedReason(convo));
+  if (paths.isEmpty) return false;
+  if (!canAttach(convo)) {
+    showToast(context, attachBlockedReason(convo));
+    return false;
+  }
   for (final path in paths) {
     await state.sendFile(convo.id, path);
   }
+  return true;
 }
-
-final bool _isDesktop = Platform.isLinux || Platform.isWindows || Platform.isMacOS;
 
 class Composer extends StatefulWidget {
   const Composer({super.key, required this.state, required this.convo, this.reply});
@@ -110,6 +113,8 @@ class _ComposerState extends State<Composer> {
   // always inserts a newline.
   KeyEventResult _onKey(FocusNode _, KeyEvent e) {
     if (e is! KeyDownEvent) return KeyEventResult.ignored;
+    final composing = _controller.value.composing;
+    if (composing.isValid && !composing.isCollapsed) return KeyEventResult.ignored;
     final keys = HardwareKeyboard.instance;
     if (e.logicalKey == LogicalKeyboardKey.escape && _showEmoji) {
       setState(() => _showEmoji = false);
@@ -119,7 +124,7 @@ class _ComposerState extends State<Composer> {
       widget.reply!.value = null;
       return KeyEventResult.handled;
     }
-    if (_isDesktop &&
+    if (!isTouchPlatform &&
         e.logicalKey == LogicalKeyboardKey.keyV &&
         (keys.isControlPressed || keys.isMetaPressed) &&
         !keys.isShiftPressed) {
@@ -133,19 +138,21 @@ class _ComposerState extends State<Composer> {
     return KeyEventResult.handled;
   }
 
-  /// Images and copied files go out as files; anything else pastes as text.
+  /// Copied files go out as files, then text pastes, and a bare image is
+  /// offered for sending. Office apps put both a bitmap and text, so text wins.
   Future<void> _paste() async {
-    final image = await Pasteboard.image.catchError((_) => null);
-    if (image != null && image.isNotEmpty) return _sendImageBytes(image, 'png');
     final files = await Pasteboard.files().catchError((_) => <String>[]);
     final local = [for (final f in files) if (File(f).existsSync()) f];
-    if (local.isNotEmpty) {
-      if (mounted) await sendFiles(context, widget.state, widget.convo, local);
+    final text = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
+    if (!mounted) return;
+    if (local.isNotEmpty && canAttach(widget.convo)) {
+      if (await sendFiles(context, widget.state, widget.convo, local)) widget.reply?.value = null;
       return;
     }
-    final text = (await Clipboard.getData(Clipboard.kTextPlain))?.text;
-    if (text == null || text.isEmpty || !mounted) return;
-    _replaceSelection(text);
+    if (text != null && text.isNotEmpty) return _replaceSelection(text);
+    if (local.isNotEmpty) return showToast(context, attachBlockedReason(widget.convo));
+    final image = await Pasteboard.image.catchError((_) => null);
+    if (image != null && image.isNotEmpty) return _sendImageBytes(image, 'png');
   }
 
   Future<void> _sendImageBytes(Uint8List bytes, String ext) async {
@@ -156,12 +163,19 @@ class _ComposerState extends State<Composer> {
     final dir = await Directory.systemTemp.createTemp('tincan-paste-');
     final stamp = DateTime.now().toIso8601String().replaceAll(RegExp(r'[:.]'), '-');
     final file = File(p.join(dir.path, 'pasted-$stamp.$ext'));
+    var sealed = true;
     try {
       await file.writeAsBytes(bytes, flush: true);
+      widget.reply?.value = null;
       await widget.state.sendFile(widget.convo.id, file.path);
+      final name = p.basename(file.path);
+      final msg = widget.convo.messages.reversed
+          .where((m) => m.outgoing && m.name == name)
+          .firstOrNull;
+      // Retry reads the temp file until there is a sealed copy.
+      sealed = msg == null || msg.path != null;
     } finally {
-      // The bridge keeps its own sealed copy.
-      await dir.delete(recursive: true).catchError((_) => dir);
+      if (sealed) await dir.delete(recursive: true).catchError((_) => dir);
     }
   }
 
@@ -249,7 +263,12 @@ class _ComposerState extends State<Composer> {
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
             ),
             tooltip: 'Send a file',
-            onPressed: attach ? () => widget.state.attachAndSendFile(widget.convo.id) : null,
+            onPressed: attach
+                ? () {
+                    widget.reply?.value = null;
+                    unawaited(widget.state.attachAndSendFile(widget.convo.id));
+                  }
+                : null,
             icon: Icon(Icons.attach_file, size: 18, color: attach ? tc.inkMuted : tc.disabledInk),
           ),
           const SizedBox(width: 10),

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:desktop_drop/desktop_drop.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -35,8 +36,6 @@ String _timerLabel(Duration d) {
   return '${max(1, d.inMinutes)} min';
 }
 
-final bool _isDesktop = Platform.isLinux || Platform.isWindows || Platform.isMacOS;
-
 class ThreadView extends StatefulWidget {
   const ThreadView({
     super.key,
@@ -59,6 +58,8 @@ class _ThreadViewState extends State<ThreadView> {
   final _scroll = ScrollController();
   final _flash = ValueNotifier<String?>(null);
   final _keys = <String, GlobalKey>{};
+  final _mounted = <String>{};
+  int _scrollGen = 0;
   Timer? _flashTimer;
 
   bool _searching = false;
@@ -81,8 +82,11 @@ class _ThreadViewState extends State<ThreadView> {
       widget.state.focused.addListener(_onFocus);
     }
     if (old.convo.id == widget.convo.id) return;
+    _scrollGen++;
     _reply.value = null;
     _keys.clear();
+    _mounted.clear();
+    if (_scroll.hasClients) _scroll.jumpTo(0);
     _closeSearch();
     _onFocus();
   }
@@ -115,15 +119,24 @@ class _ThreadViewState extends State<ThreadView> {
       for (final f in details.files)
         if (f is! DropItemDirectory && f.path.isNotEmpty) f.path
     ];
-    await sendFiles(context, widget.state, widget.convo, paths);
+    if (await sendFiles(context, widget.state, widget.convo, paths)) _reply.value = null;
+  }
+
+  void _rowMounted(String id) => _mounted.add(id);
+
+  void _rowUnmounted(String id) {
+    _mounted.remove(id);
+    _keys.remove(id);
   }
 
   /// Scrolls the lazily built list until [id] is on screen, then flashes it.
   Future<void> _scrollTo(String id) async {
+    final gen = ++_scrollGen;
     final msgs = widget.convo.messages;
-    final target = msgs.indexWhere((m) => m.id == id);
-    if (target < 0) return;
-    for (var i = 0; i < 400 && mounted; i++) {
+    final index = {for (var j = 0; j < msgs.length; j++) msgs[j].id: j};
+    final target = index[id];
+    if (target == null) return;
+    for (var i = 0; i < 400 && mounted && gen == _scrollGen; i++) {
       final ctx = _keys[id]?.currentContext;
       if (ctx != null && ctx.mounted) {
         _flashTimer?.cancel();
@@ -134,12 +147,13 @@ class _ThreadViewState extends State<ThreadView> {
         return;
       }
       if (!_scroll.hasClients) return;
-      final built = [
-        for (var j = 0; j < msgs.length; j++)
-          if (_keys[msgs[j].id]?.currentContext != null) j
-      ];
+      var oldest = -1;
+      for (final m in _mounted) {
+        final j = index[m];
+        if (j != null && (oldest < 0 || j < oldest)) oldest = j;
+      }
       // Reversed list: older messages sit further along.
-      final older = built.isEmpty || target < built.reduce(min);
+      final older = oldest < 0 || target < oldest;
       final pos = _scroll.position;
       final step = pos.viewportDimension * 0.8;
       final to = (pos.pixels + (older ? step : -step)).clamp(0.0, pos.maxScrollExtent);
@@ -161,21 +175,34 @@ class _ThreadViewState extends State<ThreadView> {
     });
   }
 
-  void _search(String q) {
+  List<String> _matches(String q) {
     final needle = q.trim().toLowerCase();
     final msgs = widget.convo.messages;
+    if (needle.isEmpty) return const [];
+    return [
+      for (var i = msgs.length - 1; i >= 0; i--)
+        if (msgs[i].body.toLowerCase().contains(needle) ||
+            (msgs[i].isMedia && (msgs[i].name?.toLowerCase().contains(needle) ?? false)))
+          msgs[i].id
+    ];
+  }
+
+  void _search(String q) {
     setState(() {
-      _hits = needle.isEmpty
-          ? const []
-          : [
-              for (var i = msgs.length - 1; i >= 0; i--)
-                if (msgs[i].body.toLowerCase().contains(needle) ||
-                    (msgs[i].isMedia && (msgs[i].name?.toLowerCase().contains(needle) ?? false)))
-                  msgs[i].id
-            ];
+      _hits = _matches(q);
       _hit = 0;
     });
     if (_hits.isNotEmpty) unawaited(_scrollTo(_hits.first));
+  }
+
+  // Messages arrive, expire and get deleted under an open search.
+  void _refreshHits() {
+    final hits = _matches(_query.text);
+    if (listEquals(hits, _hits)) return;
+    final at = _hits.isEmpty ? null : _hits[_hit];
+    final keep = at == null ? -1 : hits.indexOf(at);
+    _hits = hits;
+    _hit = keep < 0 ? 0 : keep;
   }
 
   void _step(int by) {
@@ -192,6 +219,7 @@ class _ThreadViewState extends State<ThreadView> {
       final tc = TincanColors.of(context);
       final gutter = MediaQuery.sizeOf(context).width < 700 ? 12.0 : 28.0;
       final msgs = convo.messages;
+      if (_searching) _refreshHits();
       return Column(children: [
         _Header(
             state: widget.state, convo: convo, onBack: widget.onBack, onSearch: _openSearch),
@@ -224,26 +252,31 @@ class _ThreadViewState extends State<ThreadView> {
                       key: _keys.putIfAbsent(msg.id, GlobalKey.new),
                       padding: EdgeInsets.only(
                           bottom: (groupedWithNext ? 3 : 14) + (msg.reactions.isEmpty ? 0 : 6)),
-                      child: ValueListenableBuilder(
-                        valueListenable: _flash,
-                        builder: (context, flash, child) => AnimatedContainer(
-                          duration: const Duration(milliseconds: 300),
-                          decoration: BoxDecoration(
-                            color: flash == msg.id
-                                ? tc.highlight.withValues(alpha: 0.14)
-                                : tc.highlight.withValues(alpha: 0),
-                            borderRadius: BorderRadius.circular(12),
+                      child: _Tracked(
+                        id: msg.id,
+                        onMount: _rowMounted,
+                        onUnmount: _rowUnmounted,
+                        child: ValueListenableBuilder(
+                          valueListenable: _flash,
+                          builder: (context, flash, child) => AnimatedContainer(
+                            duration: const Duration(milliseconds: 300),
+                            decoration: BoxDecoration(
+                              color: flash == msg.id
+                                  ? tc.highlight.withValues(alpha: 0.14)
+                                  : tc.highlight.withValues(alpha: 0),
+                              borderRadius: BorderRadius.circular(12),
+                            ),
+                            child: child,
                           ),
-                          child: child,
-                        ),
-                        child: _MessageRow(
-                          state: widget.state,
-                          convo: convo,
-                          msg: msg,
-                          lastInGroup: !groupedWithNext,
-                          showStatus: !groupedWithNext || next.status != msg.status,
-                          onReply: (m) => _reply.value = m,
-                          onJump: (id) => widget.state.focusMessage(convo.id, id),
+                          child: _MessageRow(
+                            state: widget.state,
+                            convo: convo,
+                            msg: msg,
+                            lastInGroup: !groupedWithNext,
+                            showStatus: !groupedWithNext || next.status != msg.status,
+                            onReply: (m) => _reply.value = m,
+                            onJump: (id) => widget.state.focusMessage(convo.id, id),
+                          ),
                         ),
                       ),
                     );
@@ -255,7 +288,7 @@ class _ThreadViewState extends State<ThreadView> {
         Composer(key: ValueKey(convo.id), state: widget.state, convo: convo, reply: _reply),
       ]);
     });
-    if (!_isDesktop) return thread;
+    if (isTouchPlatform) return thread;
     final tc = TincanColors.of(context);
     return DropTarget(
       onDragEntered: (_) => setState(() => _dragging = true),
@@ -901,19 +934,25 @@ class _MessageRowState extends State<_MessageRow> {
         ),
       ),
     );
-    final hoverButton = !_isDesktop
+    final hoverButton = isTouchPlatform
         ? null
-        : Visibility.maintain(
+        : Visibility(
             visible: _hover,
-            child: Builder(
-              builder: (context) => IconButton(
-                visualDensity: VisualDensity.compact,
-                tooltip: 'Message actions',
-                onPressed: () {
-                  final box = context.findRenderObject()! as RenderBox;
-                  _actions(box.localToGlobal(box.size.bottomCenter(Offset.zero)));
-                },
-                icon: Icon(Icons.more_horiz, size: 18, color: tc.inkMuted),
+            maintainSize: true,
+            maintainAnimation: true,
+            maintainState: true,
+            child: ExcludeFocus(
+              excluding: !_hover,
+              child: Builder(
+                builder: (context) => IconButton(
+                  visualDensity: VisualDensity.compact,
+                  tooltip: 'Message actions',
+                  onPressed: () {
+                    final box = context.findRenderObject()! as RenderBox;
+                    _actions(box.localToGlobal(box.size.bottomCenter(Offset.zero)));
+                  },
+                  icon: Icon(Icons.more_horiz, size: 18, color: tc.inkMuted),
+                ),
               ),
             ),
           );
@@ -1178,4 +1217,34 @@ class _MediaBubble extends StatelessWidget {
       ),
     );
   }
+}
+
+/// Reports when a row enters and leaves the built list.
+class _Tracked extends StatefulWidget {
+  const _Tracked({required this.id, required this.onMount, required this.onUnmount, required this.child});
+
+  final String id;
+  final ValueChanged<String> onMount;
+  final ValueChanged<String> onUnmount;
+  final Widget child;
+
+  @override
+  State<_Tracked> createState() => _TrackedState();
+}
+
+class _TrackedState extends State<_Tracked> {
+  @override
+  void initState() {
+    super.initState();
+    widget.onMount(widget.id);
+  }
+
+  @override
+  void dispose() {
+    widget.onUnmount(widget.id);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.child;
 }

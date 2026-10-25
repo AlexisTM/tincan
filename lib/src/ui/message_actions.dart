@@ -1,17 +1,14 @@
-import 'dart:io';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../app_state.dart';
 import '../models.dart';
 import '../theme.dart';
+import 'composer.dart';
 import 'emoji_picker.dart';
 import 'toast.dart';
 
 const quickReactions = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
-
-final bool _isDesktop = Platform.isLinux || Platform.isWindows || Platform.isMacOS;
 
 bool canCancelTransfer(ChatMessage m) => m.isMedia && m.status == MessageStatus.sending;
 
@@ -27,22 +24,25 @@ Future<void> showMessageActions(
   required ValueChanged<ChatMessage> onReply,
   Offset? at,
 }) async {
+  final canSend = canSendTo(convo);
   final actions = <(String, IconData, String)>[
-    ('reply', Icons.reply, 'Reply'),
+    if (canSend) ('reply', Icons.reply, 'Reply'),
     if (msg.kind == MessageKind.text) ('copy', Icons.copy_outlined, 'Copy'),
     if (canRetry(msg)) ('retry', Icons.refresh, 'Retry'),
     if (canCancelTransfer(msg)) ('cancel', Icons.close, 'Cancel transfer'),
     ('delete', Icons.delete_outline, 'Delete for me'),
   ];
   final String? choice;
-  if (at != null && _isDesktop) {
+  if (at != null && !isTouchPlatform) {
     final overlay = Overlay.of(context).context.findRenderObject()! as RenderBox;
     choice = await showMenu<String>(
       context: context,
       position: RelativeRect.fromRect(at & const Size(1, 1), Offset.zero & overlay.size),
       items: [
-        _ReactRow(mine: msg.reactionOf('me')),
-        const PopupMenuDivider(),
+        if (canSend) ...[
+          _ReactRow(mine: msg.reactionOf('me')),
+          const PopupMenuDivider(),
+        ],
         for (final (v, icon, label) in actions)
           PopupMenuItem(
             value: v,
@@ -56,11 +56,16 @@ Future<void> showMessageActions(
       showDragHandle: true,
       builder: (context) => SafeArea(
         child: Column(mainAxisSize: MainAxisSize.min, children: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12),
-            child: _ReactButtons(mine: msg.reactionOf('me')),
-          ),
-          const Divider(),
+          if (canSend) ...[
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: FittedBox(
+                fit: BoxFit.scaleDown,
+                child: _ReactButtons(mine: msg.reactionOf('me'), cell: minTap),
+              ),
+            ),
+            const Divider(),
+          ],
           for (final (v, icon, label) in actions)
             ListTile(
               onTap: () => Navigator.of(context).pop(v),
@@ -86,10 +91,17 @@ Future<void> showMessageActions(
           title: 'Delete this message?',
           body: 'It goes from this device only. ${convo.displayName} keeps their copy.',
           action: 'Delete');
-      if (sure) await state.deleteForMe(convo.id, msg.id);
+      if (!sure) return;
+      if (msg.isMedia && (msg.status == MessageStatus.sending || msg.progress.value != null)) {
+        await state.cancelTransfer(convo.id, msg.id);
+      }
+      await state.deleteForMe(convo.id, msg.id);
     case 'react+':
       final emoji = await pickEmoji(context);
-      if (emoji != null) await state.react(convo.id, msg.id, emoji);
+      // react toggles, so picking mine again would clear it.
+      if (emoji != null && emoji != msg.reactionOf('me')) {
+        await state.react(convo.id, msg.id, emoji);
+      }
     case final r when r.startsWith('react:'):
       await state.react(convo.id, msg.id, r.substring(6));
   }
@@ -148,15 +160,17 @@ class _ReactRowState extends State<_ReactRow> {
   @override
   Widget build(BuildContext context) => Padding(
         padding: const EdgeInsets.symmetric(horizontal: 6),
-        child: _ReactButtons(mine: widget.mine),
+        // showMenu caps its width at 280.
+        child: _ReactButtons(mine: widget.mine, cell: 36),
       );
 }
 
 /// Pops `react:` plus the emoji, or `react+` for the full picker.
 class _ReactButtons extends StatelessWidget {
-  const _ReactButtons({this.mine});
+  const _ReactButtons({this.mine, required this.cell});
 
   final String? mine;
+  final double cell;
 
   @override
   Widget build(BuildContext context) {
@@ -168,12 +182,13 @@ class _ReactButtons extends StatelessWidget {
           selected: e == mine,
           label: 'React $e',
           excludeSemantics: true,
+          onTap: () => Navigator.of(context).pop('react:$e'),
           child: InkWell(
             borderRadius: BorderRadius.circular(999),
             onTap: () => Navigator.of(context).pop('react:$e'),
             child: Container(
-              width: minTap,
-              height: minTap,
+              width: cell,
+              height: cell,
               alignment: Alignment.center,
               decoration: e == mine
                   ? BoxDecoration(color: tc.accentSoft, shape: BoxShape.circle)
@@ -183,7 +198,8 @@ class _ReactButtons extends StatelessWidget {
           ),
         ),
       IconButton(
-        constraints: BoxConstraints(minWidth: minTap, minHeight: minTap),
+        constraints: BoxConstraints(minWidth: cell, minHeight: cell),
+        padding: EdgeInsets.zero,
         tooltip: 'More reactions',
         onPressed: () => Navigator.of(context).pop('react+'),
         icon: Icon(Icons.add_reaction_outlined, size: 20, color: tc.inkMuted),
@@ -212,6 +228,7 @@ class ReactionChips extends StatelessWidget {
             selected: emoji == mine,
             label: '$emoji ${who.length}${emoji == mine ? ', yours' : ''}',
             excludeSemantics: true,
+            onTap: () => onToggle(emoji),
             child: InkWell(
               borderRadius: BorderRadius.circular(999),
               onTap: () => onToggle(emoji),
@@ -283,6 +300,7 @@ class ReplyQuote extends StatelessWidget {
       button: true,
       label: 'Quote from ${quoteAuthor(convo, q)}: ${_snippet(q)}. Show it',
       excludeSemantics: true,
+      onTap: onTap,
       child: InkWell(borderRadius: BorderRadius.circular(6), onTap: onTap, child: body),
     );
   }
