@@ -14,6 +14,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"path/filepath"
 	"strconv"
 	"sync"
 	"time"
@@ -38,6 +39,9 @@ func result(v map[string]any, err error) *C.char {
 	}
 	if err != nil {
 		v["error"] = err.Error()
+		if bridge.Offline(err) {
+			v["code"] = "offline"
+		}
 	}
 	j, err := json.Marshal(v)
 	if err != nil {
@@ -125,7 +129,14 @@ func TincanUnlock(cfgJSON *C.char) *C.char {
 	if err != nil {
 		return result(nil, err)
 	}
-	return setVault(bridge.OpenVault(c.StateDir, c.Secret))
+	v, err := bridge.OpenVault(c.StateDir, c.Secret)
+	if err == nil {
+		// Before the host touches any file; the host keeps media beside state.
+		if err := v.Upgrade(filepath.Join(filepath.Dir(c.StateDir), "media")); err != nil {
+			log.Printf("tincan: vault upgrade: %v", err)
+		}
+	}
+	return setVault(v, err)
 }
 
 // TincanChangeSecret rewraps the same data key, so switching between
@@ -198,12 +209,25 @@ func TincanExportAccount(dst, password *C.char) *C.char {
 	})
 }
 
+// TincanImportAccount writes the restored account; TincanRestart then
+// loads it.
+//
 //export TincanImportAccount
 func TincanImportAccount(src, password *C.char) *C.char {
 	pw := cBytes(password)
 	defer clear(pw)
+	mu.Lock()
+	m := mgr
+	mu.Unlock()
 	return withVault(func(v *bridge.Vault) (map[string]any, error) {
-		return nil, v.ImportAccount(C.GoString(src), pw)
+		if m != nil {
+			m.BeginRestore()
+		}
+		err := v.ImportAccount(C.GoString(src), pw)
+		if err != nil && m != nil {
+			m.AbortRestore()
+		}
+		return nil, err
 	})
 }
 

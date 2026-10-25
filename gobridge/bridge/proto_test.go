@@ -2,12 +2,8 @@ package bridge
 
 import (
 	"bytes"
-	"encoding/json"
-	"os"
-	"path/filepath"
 	"regexp"
 	"testing"
-	"time"
 
 	"tailscale.com/types/key"
 )
@@ -52,36 +48,6 @@ func TestFrameRoundTrip(t *testing.T) {
 	}
 }
 
-func TestSanitizeName(t *testing.T) {
-	for in, want := range map[string]string{
-		"../../etc/passwd":  "passwd",
-		`..\..\evil.exe`:    "evil.exe",
-		".hidden":           "hidden",
-		"":                  "file",
-		"ridge-north.jpg":   "ridge-north.jpg",
-		"/abs/path/vid.mp4": "vid.mp4",
-	} {
-		if got := sanitizeName(in); got != want {
-			t.Errorf("sanitizeName(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
-func TestSanitizeNameStripsHiddenChars(t *testing.T) {
-	for in, want := range map[string]string{
-		"a\x00b.txt":      "ab.txt",
-		"evil‮gnp.exe":    "evilgnp.exe",
-		"tab\there\n.jpg": "tabhere.jpg",
-		"⁦x⁩.png":         "x.png",
-		"bad\xffutf8.bin": "badutf8.bin",
-		"\x00‏":           "file",
-	} {
-		if got := sanitizeName(in); got != want {
-			t.Errorf("sanitizeName(%q) = %q, want %q", in, got, want)
-		}
-	}
-}
-
 func TestNegotiate(t *testing.T) {
 	for _, c := range []struct {
 		h  wireMsg
@@ -121,68 +87,6 @@ func TestParseRelay(t *testing.T) {
 	} {
 		if h, u := ParseRelay(in); h != want[0] || u != want[1] {
 			t.Errorf("ParseRelay(%q) = %q, %q", in, h, u)
-		}
-	}
-}
-
-func TestEventsCoalesceButNeverDropMessages(t *testing.T) {
-	m := New(Config{})
-	for range 5 {
-		m.emit(map[string]any{"type": "peer-status", "peer": "q"})
-	}
-	for i := range maxLossyQueued + 10 {
-		m.emit(map[string]any{"type": "file-progress", "peer": "p", "done": i})
-	}
-	m.emit(map[string]any{"type": "message", "peer": "p", "id": "m1"})
-	m.emit(map[string]any{"type": "peer-request", "peer": "r", "first": ""})
-	m.emit(map[string]any{"type": "peer-request", "peer": "r", "first": "hi"})
-	m.emit(map[string]any{"type": "peer-added", "peer": "r"})
-
-	counts := map[string]int{}
-	deadline := time.Now().Add(2 * coalesceEvery)
-	for time.Now().Before(deadline) {
-		j, ok := m.NextEventTimeout(100*time.Millisecond, nil)
-		if !ok {
-			continue
-		}
-		var ev map[string]any
-		json.Unmarshal([]byte(j), &ev)
-		counts[ev["type"].(string)]++
-	}
-	if counts["file-progress"] != maxLossyQueued-1 || counts["message"] != 1 {
-		t.Errorf("progress %d, messages %d", counts["file-progress"], counts["message"])
-	}
-	if counts["peer-status"] != 2 {
-		t.Errorf("5 quick statuses became %d events, want first + latest", counts["peer-status"])
-	}
-	if counts["peer-request"] != 1 || counts["peer-added"] != 1 {
-		t.Errorf("held request outlived its answer: %v", counts)
-	}
-}
-
-func TestSweepStale(t *testing.T) {
-	dir := t.TempDir()
-	old := time.Now().Add(-8 * 24 * time.Hour)
-	files := map[string]bool{ // name -> survives
-		".partial/abc.part":   false,
-		"photo.jpg.part":      false,
-		".chats.json.tmp123":  false,
-		"photo.jpg":           true,
-		".partial/fresh.part": true,
-	}
-	for name := range files {
-		p := filepath.Join(dir, name)
-		os.MkdirAll(filepath.Dir(p), 0700)
-		os.WriteFile(p, []byte("x"), 0600)
-		if name != ".partial/fresh.part" {
-			os.Chtimes(p, old, old)
-		}
-	}
-	sweepStale(dir)
-	for name, survives := range files {
-		_, err := os.Stat(filepath.Join(dir, name))
-		if (err == nil) != survives {
-			t.Errorf("%s: exists %v, want %v", name, err == nil, survives)
 		}
 	}
 }

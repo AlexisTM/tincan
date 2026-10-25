@@ -36,6 +36,9 @@ func (m *Manager) readRoster() (rosterData, error) {
 func (m *Manager) saveRoster() error {
 	m.saveMu.Lock()
 	defer m.saveMu.Unlock()
+	if m.restoring.Load() {
+		return nil
+	}
 	m.mu.Lock()
 	r := rosterData{maps.Clone(m.accepted), maps.Clone(m.blocked), maps.Clone(m.verified)}
 	m.mu.Unlock()
@@ -108,11 +111,15 @@ func (m *Manager) Accept(peerID string) error {
 	return nil
 }
 
-// Ignore drops a pending request without blocking; they may ask again.
+// Ignore drops a pending request without blocking. Their redials are
+// refused until we restart or reach them ourselves.
 func (m *Manager) Ignore(peerID string) error {
 	m.mu.Lock()
 	p := m.pending[peerID]
 	delete(m.pending, peerID)
+	if p != nil {
+		mapSet(&m.ignored, peerID, true)
+	}
 	m.mu.Unlock()
 	if p == nil {
 		return fmt.Errorf("no pending request from %v", peerID)
@@ -120,6 +127,13 @@ func (m *Manager) Ignore(peerID string) error {
 	m.dropPeer(p, false)
 	return nil
 }
+
+// BeginRestore stops roster saves until Restart, so the in-memory
+// roster can't overwrite the restored one meanwhile.
+func (m *Manager) BeginRestore() { m.restoring.Store(true) }
+
+// AbortRestore resumes roster saves after a restore that wrote nothing.
+func (m *Manager) AbortRestore() { m.restoring.Store(false) }
 
 // SetVerified records whether the user checked this peer's safety
 // number.

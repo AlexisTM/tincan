@@ -79,6 +79,7 @@ type Manager struct {
 	startErr   error // why the server is down, while it is
 	addr       tailcat.ConnBlob
 	name       string            // display name sent in hellos and profiles
+	named      bool              // name was chosen, not cfg.Name
 	desc       string            // profile description/bio
 	status     string            // profile status line
 	avatar     []byte            // profile picture bytes (any image format)
@@ -99,7 +100,12 @@ type Manager struct {
 	directWait time.Duration // how long a held dial waits for a direct path
 	holding    int           // mu; strangers held for a direct path
 
-	saveMu sync.Mutex // one roster writer at a time
+	saveMu    sync.Mutex  // one roster writer at a time
+	restoring atomic.Bool // a restore owns the roster file until Restart
+
+	// Requests ignored this session, refused silently so a redialing
+	// requester can't bring them back. Manager.mu.
+	ignored map[string]bool
 
 	recvMu sync.Mutex
 	recvs  map[string]*recvFile // by recvKey
@@ -490,6 +496,11 @@ var errClosed = errors.New("shutting down")
 // server-started event. It persists pk, whose key or pinned region may
 // be new.
 func (m *Manager) installServer(srv *tailcat.Server, pk *tailcat.PrivateKey) (map[string]any, error) {
+	if got, want := srv.Addr(), tunnelAddr(pk.Private.Public()); got != want {
+		// Every incoming hello would fail fromTunnelOf.
+		srv.Close()
+		return nil, fmt.Errorf("tailcat put us at %v, not %v: tunnelAddr is out of date", got, want)
+	}
 	m.mu.Lock()
 	if m.closed() {
 		// Close clears m.server under mu after stop closes, so this can't leak.
@@ -524,6 +535,7 @@ const profileFile = "profile.json"
 
 type loadedProfile struct {
 	storedProfile
+	named      bool // the user chose the name, rather than cfg.Name standing in
 	avatar     []byte
 	avatarPath string
 }
@@ -532,10 +544,11 @@ type loadedProfile struct {
 // restored account replaces it.
 func (m *Manager) readProfile() loadedProfile {
 	var sp storedProfile
-	if m.loadJSON(profileFile, &sp) != nil || sp.Name == "" {
+	named := m.loadJSON(profileFile, &sp) == nil && sp.Name != ""
+	if !named {
 		sp = storedProfile{Name: m.cfg.Name}
 	}
-	lp := loadedProfile{storedProfile: sp}
+	lp := loadedProfile{storedProfile: sp, named: named}
 	lp.avatarPath = m.cfg.Vault.selfAvatar()
 	if lp.avatarPath != "" {
 		lp.avatar, _ = m.cfg.Vault.ReadMedia(lp.avatarPath)
@@ -548,7 +561,7 @@ func (m *Manager) readProfile() loadedProfile {
 
 func (m *Manager) applyProfile(lp loadedProfile) {
 	m.mu.Lock()
-	m.name, m.desc, m.status = lp.Name, lp.Desc, lp.Status
+	m.name, m.desc, m.status, m.named = lp.Name, lp.Desc, lp.Status, lp.named
 	m.avatar, m.avatarPath = lp.avatar, lp.avatarPath
 	m.mu.Unlock()
 }
@@ -573,6 +586,7 @@ func (m *Manager) selfProfileEvent() map[string]any {
 		"description": m.desc,
 		"status":      m.status,
 		"avatarPath":  m.avatarPath,
+		"named":       m.named,
 	}
 }
 
@@ -599,7 +613,7 @@ func (m *Manager) SetProfile(name, desc, status, avatarPath string, avatarChange
 	}
 
 	m.mu.Lock()
-	m.name, m.desc, m.status = name, desc, status
+	m.name, m.desc, m.status, m.named = name, desc, status, true
 	if avatarChanged {
 		m.avatar = avatar
 	}
@@ -699,6 +713,7 @@ func (m *Manager) ResetIdentity() (map[string]any, error) {
 func (m *Manager) Restart() (map[string]any, error) {
 	m.lifeMu.Lock()
 	defer m.lifeMu.Unlock()
+	defer m.restoring.Store(false)
 	pk, _, err := m.loadIdentity()
 	if err != nil {
 		return nil, err
@@ -874,17 +889,20 @@ func (m *Manager) verifyHello(h *wireMsg, conn net.Conn) (string, error) {
 // fromTunnelOf reports whether conn comes from the WireGuard peer k.
 // tailcat gives each node an address derived from its key and
 // WireGuard drops packets from any other source, so the address
-// authenticates the key. This mirrors tailcat's tcAddrForKey.
+// authenticates the key.
 func fromTunnelOf(conn net.Conn, k key.NodePublic) bool {
 	ra, ok := conn.RemoteAddr().(*net.TCPAddr)
-	if !ok {
-		return false
-	}
+	return ok && ra.AddrPort().Addr().Unmap() == tunnelAddr(k)
+}
+
+// tunnelAddr is tailcat's unexported tcAddrForKey; installServer checks
+// the two still agree.
+func tunnelAddr(k key.NodePublic) netip.Addr {
 	var a [16]byte
 	copy(a[:], []byte{0xfd, 0x7a, 0x11, 0x5c, 0xa1, 0xe0})
 	r := k.Raw32()
 	copy(a[6:], r[:10])
-	return ra.AddrPort().Addr().Unmap() == netip.AddrFrom16(a)
+	return netip.AddrFrom16(a)
 }
 
 // negotiate checks that a hello's protocol range overlaps ours.
@@ -1074,8 +1092,9 @@ func (m *Manager) handleIncoming(conn net.Conn) {
 	m.mu.Lock()
 	_, isBlocked := m.blocked[theirs.Key]
 	_, isAccepted := m.accepted[theirs.Key]
+	isIgnored := !isAccepted && m.ignored[theirs.Key]
 	m.mu.Unlock()
-	if isBlocked {
+	if isBlocked || isIgnored {
 		// Silence, so a blocked peer can't tell us from an offline one.
 		conn.Close()
 		return
@@ -1323,6 +1342,7 @@ func (m *Manager) addPeer(p *peer) bool {
 	}
 	drop := m.installPeerLocked(p, false)
 	live := m.peers[p.id]
+	delete(m.ignored, p.id)
 	m.mu.Unlock()
 	drop.close()
 	m.noteInstance(live)
@@ -1353,12 +1373,20 @@ func (m *Manager) removePeer(p *peer) {
 	}
 }
 
+var errNotConnected = errors.New("no connected peer")
+
+// Offline reports whether err means the peer can't be reached right
+// now, so the send should wait rather than fail.
+func Offline(err error) bool {
+	return errors.Is(err, errNotConnected) || errors.Is(err, errNoDirect)
+}
+
 func (m *Manager) peerByID(id string) (*peer, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	p := m.peers[id]
 	if p == nil {
-		return nil, fmt.Errorf("no connected peer %v", id)
+		return nil, fmt.Errorf("%w %v", errNotConnected, id)
 	}
 	return p, nil
 }

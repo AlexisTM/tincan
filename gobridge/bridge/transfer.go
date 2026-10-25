@@ -755,11 +755,7 @@ func capName(name string) string {
 	if len(ext) > 16 {
 		ext = ""
 	}
-	cut := maxNameBytes - len(ext)
-	for cut > 0 && !utf8.RuneStart(name[cut]) {
-		cut--
-	}
-	return name[:cut] + ext
+	return truncUTF8(name, maxNameBytes-len(ext)) + ext
 }
 
 // uniquePath returns dir/name, or dir/name (2) etc if taken. A path it
