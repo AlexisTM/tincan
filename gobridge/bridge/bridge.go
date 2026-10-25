@@ -825,6 +825,13 @@ func (m *Manager) SetRelay(host, mapURL string) (map[string]any, error) {
 	return nil, nil
 }
 
+// Stop closes the manager and queues "transport-stopped" after every
+// event it produced, so the host knows when it has them all.
+func (m *Manager) Stop() {
+	m.Close()
+	m.emit(map[string]any{"type": "transport-stopped"})
+}
+
 // Close shuts everything down. Queued events can still be read.
 func (m *Manager) Close() error {
 	m.closeOnce.Do(func() {

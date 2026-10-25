@@ -9,6 +9,7 @@ import 'package:tincan/src/chat_store.dart';
 import 'package:tincan/src/models.dart';
 import 'package:tincan/src/notifier.dart';
 import 'package:tincan/src/settings.dart';
+import 'package:tincan/src/vault.dart';
 
 class FakeBridge implements Bridge {
   final controller = StreamController<Map<String, dynamic>>.broadcast();
@@ -164,8 +165,23 @@ class FakeBridge implements Bridge {
   @override
   Future<void> setActivePeer(String? peer) async => activePeer = peer;
 
+  final calls = <String>[];
+
+  /// Runs as the transport stops, before the fake says it has.
+  void Function()? onStop;
+
   @override
-  Future<void> lock() async => locks++;
+  Future<void> stopTransport() async {
+    calls.add('stop');
+    onStop?.call();
+    await pumpEventQueue();
+  }
+
+  @override
+  Future<void> lock() async {
+    calls.add('lock');
+    locks++;
+  }
 
 
 
@@ -710,6 +726,21 @@ void main() {
     expect(state.selectedId, isNull);
     state.handleEvent({'type': 'peer-added', 'peer': 'nk:1', 'name': 'nia'});
     expect(state.conversations, isEmpty);
+  });
+
+  test('what lands while the transport stops is saved before the vault locks', () async {
+    TestWidgetsFlutterBinding.ensureInitialized();
+    final dir = Directory.systemTemp.createTempSync('tc-lock');
+    addTearDown(() => dir.delete(recursive: true));
+    final stateDir = '${dir.path}/state';
+    await state.init(
+        stateDir: stateDir, downloadDir: '${dir.path}/media', vault: VaultManager(bridge, stateDir));
+    state.handleEvent({'type': 'peer-added', 'peer': 'nk:1', 'name': 'nia'});
+    bridge.onStop = () => bridge.controller
+        .add({'type': 'message', 'peer': 'nk:1', 'id': 'm1', 'ts': 1000, 'body': 'late'});
+    await state.lockNow();
+    expect(bridge.calls, ['stop', 'lock']);
+    expect(bridge.states.values.whereType<String>().any((j) => j.contains('"late"')), isTrue);
   });
 
   test('history is one file per conversation, written only when it changed', () async {

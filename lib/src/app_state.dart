@@ -386,13 +386,19 @@ class AppState extends ChangeNotifier {
   Future<void> lockNow() async {
     if (locked || _locking) return;
     _locking = true;
+    _sweepTimer?.cancel();
+    _cancelAllReconnects();
+    // Go acks what it hands over, so everything up to the stop is saved.
+    try {
+      await _bridge.stopTransport();
+    } catch (e) {
+      debugPrint('tincan: stopping the transport: $e');
+    }
     final store = _store;
     await store?.flush();
     // Its timers must not fire on the emptied conversations.
     await store?.close();
     _store = null;
-    _sweepTimer?.cancel();
-    _cancelAllReconnects();
     try {
       await _bridge.lock();
     } catch (e) {
@@ -1102,7 +1108,7 @@ class AppState extends ChangeNotifier {
   /// Dials every known peer that isn't connected. [reset] starts their
   /// backoff over: the network or the app just came back.
   void dialAll({bool reset = false}) {
-    if (locked) return;
+    if (locked || _locking) return;
     for (final c in conversations.values.toList()) {
       if (c.connected || c.blocked || c.token == null) continue;
       if (reset) _reconnectAttempts.remove(c.id);
@@ -1137,7 +1143,7 @@ class AppState extends ChangeNotifier {
 
   void _scheduleReconnect(String peerId) {
     final convo = conversations[peerId];
-    if (convo == null || convo.token == null || convo.blocked || locked || _disposed) return;
+    if (convo == null || convo.token == null || convo.blocked || locked || _locking || _disposed) return;
     final attempt = _reconnectAttempts[peerId] ?? 0;
     _reconnectTimers.remove(peerId)?.cancel();
     // Slow retries are for when the user is looking; resume redials.

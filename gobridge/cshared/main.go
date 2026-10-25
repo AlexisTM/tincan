@@ -28,6 +28,10 @@ var (
 	mgr   *bridge.Manager
 	vault *bridge.Vault
 
+	// draining is a stopped Manager whose queued events the pump still
+	// hands over until the vault locks.
+	draining *bridge.Manager
+
 	// life keeps Lock from closing a Manager while a call is bringing
 	// its server up; taken before mu.
 	life sync.Mutex
@@ -309,7 +313,7 @@ func TincanStart(cfgJSON *C.char) *C.char {
 		mu.Unlock()
 		return result(nil, err)
 	}
-	mgr = m
+	mgr, draining = m, nil
 	mu.Unlock()
 	return result(m.Start())
 }
@@ -362,6 +366,9 @@ func nextEvent(gen int, d time.Duration) string {
 
 	mu.Lock()
 	m := mgr
+	if m == nil {
+		m = draining
+	}
 	mu.Unlock()
 	if m == nil {
 		select {
@@ -544,6 +551,29 @@ func TincanSetActivePeer(peer *C.char) *C.char {
 	})
 }
 
+// TincanStopTransport closes the transport but keeps the vault open,
+// so the host can save what the last events brought. Its events end
+// with "transport-stopped".
+//
+//export TincanStopTransport
+func TincanStopTransport() *C.char { return result(nil, stopTransport()) }
+
+func stopTransport() error {
+	life.Lock()
+	defer life.Unlock()
+	mu.Lock()
+	m := mgr
+	if m != nil {
+		mgr, draining = nil, m
+	}
+	mu.Unlock()
+	if m == nil {
+		return errors.New("bridge not started")
+	}
+	m.Stop()
+	return nil
+}
+
 // TincanLock stops the transport and forgets the data key; unlock and
 // start again to come back.
 //
@@ -553,7 +583,7 @@ func TincanLock() *C.char {
 	defer life.Unlock()
 	mu.Lock()
 	m, v := mgr, vault
-	mgr, vault = nil, nil
+	mgr, vault, draining = nil, nil, nil
 	mu.Unlock()
 	if m != nil {
 		m.Close()

@@ -86,3 +86,39 @@ func TestRetiredPumpLeavesEventForNewer(t *testing.T) {
 		t.Fatalf("current pump got %q, want the peer-blocked event", ev)
 	}
 }
+
+func TestStoppedTransportDrainsBeforeMarker(t *testing.T) {
+	resetPumps(t)
+	dir := t.TempDir()
+	if err := bridge.CreateVault(dir, "pw", "password"); err != nil {
+		t.Fatal(err)
+	}
+	v, err := bridge.OpenVault(dir, "pw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := bridge.New(bridge.Config{Vault: v, StateDir: dir})
+	mu.Lock()
+	mgr = m
+	mu.Unlock()
+	t.Cleanup(func() {
+		mu.Lock()
+		mgr, draining = nil, nil
+		mu.Unlock()
+	})
+
+	gen := attachEvents()
+	m.Block("x")
+	if err := stopTransport(); err != nil {
+		t.Fatal(err)
+	}
+	if ev := nextEvent(gen, time.Second); !strings.Contains(ev, `"peer-blocked"`) {
+		t.Fatalf("got %q, want the event queued before the stop", ev)
+	}
+	if ev := nextEvent(gen, time.Second); !strings.Contains(ev, `"transport-stopped"`) {
+		t.Fatalf("got %q, want the stop marker", ev)
+	}
+	if err := stopTransport(); err == nil {
+		t.Error("stopping twice should say the bridge is not started")
+	}
+}

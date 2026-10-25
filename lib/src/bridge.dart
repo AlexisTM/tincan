@@ -75,6 +75,10 @@ abstract class Bridge {
   /// The chat on screen gets a status ping every 5 s, others every 30 s.
   Future<void> setActivePeer(String? peer);
 
+  /// Stops the transport but keeps the store open, completing once every
+  /// event it produced has come through [events].
+  Future<void> stopTransport();
+
   /// Stops the transport and forgets the data key until the next unlock.
   Future<void> lock();
 
@@ -160,7 +164,12 @@ class TincanBridge implements Bridge {
           _pumpPort.close();
         case String ev:
           try {
-            _events.add(jsonDecode(ev) as Map<String, dynamic>);
+            final decoded = jsonDecode(ev) as Map<String, dynamic>;
+            if (decoded['type'] == 'transport-stopped') {
+              if (_stopped case final c? when !c.isCompleted) c.complete();
+            } else {
+              _events.add(decoded);
+            }
           } catch (_) {}
         case null:
           // Died unexpectedly; the next one resumes our generation, so it
@@ -175,6 +184,7 @@ class TincanBridge implements Bridge {
   final _pumpPort = RawReceivePort();
   bool _pumpRetired = false;
   int? _pumpGen;
+  Completer<void>? _stopped;
   var _spawnFailures = 0;
 
   void _spawnPump() {
@@ -287,6 +297,20 @@ class TincanBridge implements Bridge {
   Future<void> setActivePeer(String? peer) => _call('TincanSetActivePeer', [peer ?? '']);
 
   @override
+  Future<void> stopTransport() async {
+    final stopped = _stopped = Completer<void>();
+    try {
+      await _call('TincanStopTransport');
+      // A dead pump mustn't hold up locking.
+      await stopped.future.timeout(const Duration(seconds: 3), onTimeout: () {});
+    } on BridgeException {
+      // Never started: nothing in flight.
+    } finally {
+      if (identical(_stopped, stopped)) _stopped = null;
+    }
+  }
+
+  @override
   Future<void> lock() => _call('TincanLock');
 
   @override
@@ -370,8 +394,8 @@ class TincanBridge implements Bridge {
 /// an isolate of their own, so the pool keeps serving sends.
 const _slowCalls = {
   'TincanStart', 'TincanSetRelay', 'TincanRestart', 'TincanResetIdentity', 'TincanConnect',
-  'TincanLock', 'TincanExportAccount', 'TincanImportAccount', 'TincanSealFile', 'TincanOpenFile',
-  'TincanUnlock', 'TincanVaultCreate', 'TincanChangeSecret',
+  'TincanLock', 'TincanStopTransport', 'TincanExportAccount', 'TincanImportAccount',
+  'TincanSealFile', 'TincanOpenFile', 'TincanUnlock', 'TincanVaultCreate', 'TincanChangeSecret',
 };
 
 // Redials fire for every offline contact at once, each up to a minute.

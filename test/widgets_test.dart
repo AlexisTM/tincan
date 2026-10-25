@@ -60,6 +60,9 @@ class _NullBridge implements Bridge {
   Future<void> setActivePeer(String? peer) async {}
 
   @override
+  Future<void> stopTransport() async {}
+
+  @override
   Future<void> lock() async {}
 
   @override
