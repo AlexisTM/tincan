@@ -18,8 +18,12 @@ enum LockMode {
   password,
 
   /// A random secret in the platform keystore, released without asking.
-  /// Protects a copied disk, not an unlocked device.
-  none,
+  /// Protects a copied disk, not an unlocked device. No longer offered;
+  /// stores made with it keep working.
+  none;
+
+  /// What setup and lock changes offer.
+  static const choices = [device, password];
 }
 
 /// Unlocks the encrypted store. The key never leaves the transport: the
@@ -43,6 +47,9 @@ class VaultManager {
   /// How the store is locked, as last read or set here.
   LockMode? mode;
 
+  /// An old store that opens without asking; Settings offers a real lock.
+  bool get canUpgradeLock => mode == LockMode.none;
+
   /// Whether a store already exists here, and how it is locked.
   Future<({bool exists, LockMode? mode})> status() async {
     final s = await _bridge.vaultStatus(_stateDir);
@@ -62,6 +69,7 @@ class VaultManager {
 
   /// Creates the store. Returns an error message, or null.
   Future<String?> create(LockMode mode, {String password = ''}) async {
+    if (!LockMode.choices.contains(mode)) return 'Pick a device lock or a password.';
     final err = await _withNewSecret(mode, password,
         (secret) => _bridge.vaultCreate(stateDir: _stateDir, secret: secret, mode: mode.name));
     if (err == null) this.mode = mode;
@@ -106,9 +114,9 @@ class VaultManager {
   }
 
   /// Moves the account in a backup file into a store [create] just made.
-  Future<String?> recover(String backup) async {
+  Future<String?> recover(String backup, {String password = ''}) async {
     try {
-      await _bridge.importAccount(backup);
+      await _bridge.importAccount(backup, password: password);
       return null;
     } catch (e) {
       return '$e';
@@ -131,6 +139,7 @@ class VaultManager {
 
   /// Switches how the store is locked, keeping the data.
   Future<String?> changeLock(LockMode mode, {String password = ''}) async {
+    if (!LockMode.choices.contains(mode)) return 'Pick a device lock or a password.';
     final err = await _withNewSecret(
         mode, password, (secret) => _bridge.vaultChangeSecret(secret: secret, mode: mode.name));
     if (err == null) this.mode = mode;

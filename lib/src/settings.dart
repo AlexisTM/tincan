@@ -3,42 +3,67 @@ import 'package:path/path.dart' as p;
 
 import 'bridge.dart';
 
-/// Bounds the battery cost of holding the connection open.
-const maxBackgroundMinutes = 60;
+/// How long to keep receiving after leaving the app; 0 is off.
+const backgroundPresets = [0, 15, 60];
 
 class Settings {
   Settings({
-    this.receiveInBackground = true,
-    this.backgroundMinutes = 15,
-    this.derpHost = '',
-    this.derpMapUrl = '',
-  });
+    int backgroundMinutes = 15,
+    String relay = '',
+    this.named = false,
+    this.directOnly = false,
+  })  : backgroundMinutes = snapBackground(backgroundMinutes),
+        relay = relay.trim();
 
-  /// Keep receiving for [backgroundMinutes] after leaving the app.
-  bool receiveInBackground;
-
-  /// Up to [maxBackgroundMinutes]; remembered while receiving is off.
+  /// 0 (off), 15 or 60.
   int backgroundMinutes;
 
-  /// A relay of your own, by hostname. Wins over [derpMapUrl].
-  String derpHost;
+  /// A relay hostname, or an http(s) URL of a relay map. Empty is the
+  /// default relays.
+  String relay;
 
-  /// A relay map to pick relays from, instead of the default one.
-  String derpMapUrl;
+  /// The user picked a display name once.
+  bool named;
+
+  /// Chat only over direct paths; the relay just introduces peers.
+  bool directOnly;
+
+  static int snapBackground(int minutes) {
+    var best = backgroundPresets.first;
+    for (final p in backgroundPresets) {
+      if ((p - minutes).abs() < (best - minutes).abs()) best = p;
+    }
+    return best;
+  }
+
+  // Older saves had a hostname and a map URL, the hostname winning.
+  static String _relayFrom(String? relay, String? host, String? mapUrl) {
+    for (final r in [relay, host, mapUrl]) {
+      if (r != null && r.trim().isNotEmpty) return r;
+    }
+    return '';
+  }
 
   Map<String, dynamic> toJson() => {
-        'receiveInBackground': receiveInBackground,
         'backgroundMinutes': backgroundMinutes,
-        if (derpHost.isNotEmpty) 'derpHost': derpHost,
-        if (derpMapUrl.isNotEmpty) 'derpMapUrl': derpMapUrl,
+        if (relay.isNotEmpty) 'relay': relay,
+        if (named) 'named': true,
+        if (directOnly) 'directOnly': true,
       };
 
   static Settings fromJson(Map<String, dynamic> j) => Settings(
-        receiveInBackground: j['receiveInBackground'] as bool? ?? true,
-        backgroundMinutes:
-            ((j['backgroundMinutes'] as num?)?.toInt() ?? 15).clamp(1, maxBackgroundMinutes),
-        derpHost: j['derpHost'] as String? ?? '',
-        derpMapUrl: j['derpMapUrl'] as String? ?? '',
+        // receiveInBackground predates backgroundMinutes.
+        backgroundMinutes: j['receiveInBackground'] == false ? 0 : (j['backgroundMinutes'] as num?)?.toInt() ?? 15,
+        relay: _relayFrom(j['relay'] as String?, j['derpHost'] as String?, j['derpMapUrl'] as String?),
+        named: j['named'] == true,
+        directOnly: j['directOnly'] == true,
+      );
+
+  Settings copyWith({int? backgroundMinutes, String? relay, bool? named, bool? directOnly}) => Settings(
+        backgroundMinutes: backgroundMinutes ?? this.backgroundMinutes,
+        relay: relay ?? this.relay,
+        named: named ?? this.named,
+        directOnly: directOnly ?? this.directOnly,
       );
 
   static const _file = 'preferences.json';

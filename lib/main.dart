@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter/material.dart';
+import 'package:fvp/fvp.dart' as fvp;
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -9,11 +10,14 @@ import 'src/app_state.dart';
 import 'src/bridge.dart';
 import 'src/theme.dart';
 import 'src/ui/home_screen.dart';
+import 'src/ui/onboarding.dart';
 import 'src/ui/unlock_screen.dart';
 import 'src/vault.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
+  // Android keeps the stock ExoPlayer backend; desktop has none without this.
+  fvp.registerWith(options: {'platforms': ['linux', 'windows']});
   runApp(const TincanApp());
 }
 
@@ -26,6 +30,8 @@ class TincanApp extends StatelessWidget {
       title: 'Tincan',
       debugShowCheckedModeBanner: false,
       theme: tincanTheme(),
+      darkTheme: tincanDarkTheme(),
+      themeMode: ThemeMode.system,
       home: const _Boot(),
     );
   }
@@ -113,12 +119,28 @@ class _BootState extends State<_Boot> {
     await _vault!.erase();
     final media = Directory(_downloadDir!);
     if (await media.exists()) await media.delete(recursive: true);
-    if (mounted) setState(() => _needsSetup = true);
+    if (mounted) {
+      setState(() {
+        _needsSetup = true;
+        _open = false;
+      });
+    }
   }
 
   Future<void> _start() async {
-    await _state.init(stateDir: _stateDir!, downloadDir: _downloadDir!, vault: _vault!);
-    if (mounted) setState(() => _open = true);
+    if (_state.locked) {
+      // Erased while locked: the store is new, the app is already up.
+      _state.lockMode = _vault!.mode;
+      await _state.reopen();
+    } else {
+      await _state.init(stateDir: _stateDir!, downloadDir: _downloadDir!, vault: _vault!);
+    }
+    if (mounted) {
+      setState(() {
+        _needsSetup = false;
+        _open = true;
+      });
+    }
   }
 
   @override
@@ -129,25 +151,42 @@ class _BootState extends State<_Boot> {
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     if (_error != null) {
       return Scaffold(
-        backgroundColor: Tc.bg,
         body: Center(
           child: Padding(
             padding: const EdgeInsets.all(32),
             child: SelectableText('Tincan could not start.\n\n$_error',
                 textAlign: TextAlign.center,
-                style: const TextStyle(fontSize: 13, color: Tc.danger)),
+                style: TextStyle(fontSize: 13, color: tc.danger)),
           ),
         ),
       );
     }
-    if (_open) return HomeScreen(state: _state);
+    if (_open) {
+      return ListenableBuilder(
+        listenable: _state,
+        builder: (context, _) {
+          if (_state.locked) {
+            return UnlockScreen(
+              key: const ValueKey('relock'),
+              vault: _state.vault,
+              mode: _state.lockMode ?? LockMode.password,
+              autoUnlock: false,
+              onUnlocked: _state.reopen,
+              onErase: _erase,
+            );
+          }
+          if (_state.needsName && !_state.starting) return NameStep(state: _state);
+          return HomeScreen(state: _state);
+        },
+      );
+    }
     final vault = _vault;
     if (vault == null) {
-      return const Scaffold(
-        backgroundColor: Tc.bg,
-        body: Center(child: CircularProgressIndicator(color: Tc.accent)),
+      return Scaffold(
+        body: Center(child: CircularProgressIndicator(color: tc.accent)),
       );
     }
     if (_needsSetup) {

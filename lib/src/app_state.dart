@@ -10,7 +10,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 import 'package:path/path.dart' as p;
 
-import 'backup.dart';
+import 'backup.dart' as backup;
 import 'background.dart';
 import 'bridge.dart';
 import 'chat_store.dart';
@@ -21,6 +21,9 @@ import 'notifier.dart';
 import 'profile.dart';
 import 'settings.dart';
 import 'vault.dart';
+
+/// Wire cap on a text body, in UTF-8 bytes.
+const maxBodyBytes = 64 * 1024;
 
 class AppState extends ChangeNotifier {
   AppState(this._bridge, {Notifier? notifier}) : _notifier = notifier ?? SystemNotifier();
@@ -41,11 +44,18 @@ class AppState extends ChangeNotifier {
   String selfStatus = '';
   String? selfAvatarPath; // sealed, under stateDir/avatars
   bool starting = true;
+
+  /// lockNow ran: the store is shut until [reopen].
+  bool locked = false;
+
+  /// Another device is running this identity.
+  bool identityConflict = false;
+
   String? _fatal;
   String? _transportError;
-  String? _historyError;
-  String? get startError => _fatal ?? _transportError ?? _historyError;
+  String? get startError => _fatal ?? _transportError ?? _store?.error;
   AppLifecycleListener? _lifecycle;
+  StreamSubscription<Map<String, dynamic>>? _eventSub;
   ChatStore? _store;
   String? _downloadDir;
 
@@ -60,17 +70,28 @@ class AppState extends ChangeNotifier {
   String? selectedId;
   String? _stateDir;
 
+  /// A message the open thread should scroll to and flash, as (peer, id).
+  final focused = ValueNotifier<(String, String)?>(null);
+
   final _reconnectAttempts = <String, int>{};
   final _jitter = Random();
   final _reconnectTimers = <String, Timer>{};
+  final _dialing = <String>{};
+  final _peerErrors = <String, String>{};
 
-  /// Dials in flight, by peer, completed with an error or null.
-  final _dials = <String, Completer<String?>>{};
+  /// Each peer's outbox drain, run one at a time and in order.
+  final _drains = <String, Future<void>>{};
 
-  /// Each peer's latest dial outcome, numbered: events come by another
-  /// isolate and can beat connect's own reply.
-  final _outcomes = <String, (int, String?)>{};
-  var _outcomeSeq = 0;
+  /// Picked files waiting to go out, by message id, until sealed.
+  final _sources = <String, String>{};
+  Timer? _sweepTimer;
+  Timer? _cacheTimer;
+
+  /// Why the last connection to peer was refused, if it was.
+  String? peerError(String peer) => _peerErrors[peer];
+
+  /// True until the user picks a display name.
+  bool get needsName => !settings.named;
 
   static const _netifChannel = MethodChannel('tincan/netifs');
 
@@ -83,14 +104,17 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Decrypted copies of sealed files live here, wiped every launch so
-  /// plaintext never outlives the session. Sealed paths never change
-  /// content (avatars are named by it), so a copy is made only once.
+  /// Decrypted copies of sealed files live here, wiped on lock, on exit
+  /// and once backgrounded past the window, so plaintext doesn't outlive
+  /// its use. Sealed paths never change content (avatars are named by
+  /// it), so a copy is made only once.
   String? _cacheDir;
   String? _dataDir;
   final _decrypted = <String, Future<String?>>{};
   final _media = <String, ValueNotifier<String?>>{};
   static final _noMedia = ValueNotifier<String?>(null);
+  var _cacheGen = 0;
+  bool _cacheWiped = false;
 
   /// The displayable copy of a sealed file, null until it lands or if it
   /// can't be read. Each path has its own notifier, so only what shows
@@ -99,9 +123,16 @@ class AppState extends ChangeNotifier {
     if (sealed == null || sealed.isEmpty) return _noMedia;
     return _media.putIfAbsent(sealed, () {
       final n = ValueNotifier<String?>(null);
-      unawaited(decryptForOpen(sealed).then((path) => n.value = path));
+      _fill(sealed, n);
       return n;
     });
+  }
+
+  void _fill(String sealed, ValueNotifier<String?> n) {
+    final gen = _cacheGen;
+    unawaited(decryptForOpen(sealed).then((path) {
+      if (gen == _cacheGen) n.value = path;
+    }));
   }
 
   /// What [plaintext] holds right now.
@@ -125,6 +156,41 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Drops every plaintext copy. Shown media refills on the next resume
+  /// unless [forget], which is for lock.
+  Future<void> _wipeCache({bool forget = false}) async {
+    _cacheTimer?.cancel();
+    _cacheGen++;
+    _decrypted.clear();
+    for (final n in _media.values) {
+      n.value = null;
+    }
+    if (forget) _media.clear();
+    _cacheWiped = _media.isNotEmpty;
+    if (_cacheDir case final dir?) {
+      try {
+        await _freshCache(dir);
+      } catch (e) {
+        debugPrint('tincan: wiping the cache: $e');
+      }
+    }
+  }
+
+  void _refillCache() {
+    if (!_cacheWiped) return;
+    _cacheWiped = false;
+    _media.forEach(_fill);
+  }
+
+  /// Forgets a sealed file's plaintext copy, which goes with it.
+  void _forgetPlaintext(String sealed) {
+    final copy = _decrypted.remove(sealed);
+    _media.remove(sealed)?.value = null;
+    unawaited(copy?.then((path) async {
+      if (path != null) await File(path).delete();
+    }).then((_) {}, onError: (_) {}));
+  }
+
   Conversation? get selected => selectedId == null ? null : conversations[selectedId];
 
   List<Conversation> get ordered {
@@ -132,6 +198,12 @@ class AppState extends ChangeNotifier {
     list.sort((a, b) => b.lastActivity.compareTo(a.lastActivity));
     return list;
   }
+
+  static String get _fallbackName =>
+      Platform.environment['TINCAN_NAME'] ??
+      Platform.environment['USER'] ??
+      Platform.environment['USERNAME'] ??
+      'me';
 
   Future<void> init({
     required String stateDir,
@@ -145,53 +217,79 @@ class AppState extends ChangeNotifier {
       lockMode = vault.mode;
       _dataDir = p.dirname(stateDir);
       _cacheDir = p.join(_dataDir!, 'cache');
-      await _freshCache(_cacheDir!);
-      _store = ChatStore(_bridge, stateDir, conversations);
-      final (loaded, historyError) = await (
-        Settings.load(_bridge, stateDir),
-        // The store won't save until a load succeeds, so the file is safe.
-        _store!.load().then<String?>((_) => null,
-            onError: (Object e) => 'Chat history couldn\'t be read: $e'),
-      ).wait;
-      settings = loaded;
-      _historyError = historyError;
-      _background
-        ..update(settings)
-        ..start();
-      // The debounced history write must not die with the app.
       _lifecycle = AppLifecycleListener(
-        onStateChange: (s) {
-          _foreground = s == AppLifecycleState.resumed;
-          if (!_foreground) unawaited(_store?.flush());
-          if (_foreground && selectedId != null) unawaited(_notifier.clear(selectedId!));
-        },
+        onStateChange: _onLifecycle,
         onExitRequested: () async {
           await _store?.flush();
+          await _wipeCache(forget: true);
           return AppExitResponse.exit;
         },
       );
-      selfName = Platform.environment['TINCAN_NAME'] ??
-          Platform.environment['USER'] ??
-          Platform.environment['USERNAME'] ??
-          'me';
+      selfName = _fallbackName;
       if (Platform.isAndroid) {
         // Go can't enumerate interfaces on Android; feed them in first,
         // then again on every network change.
         _netifChannel.setMethodCallHandler((call) async {
-          if (call.method == 'changed') await _feedInterfaces(call.arguments as List?);
+          switch (call.method) {
+            case 'changed':
+              await _feedInterfaces(call.arguments as List?);
+            case 'onNetworkChanged':
+              dialAll(reset: true);
+          }
         });
         await _feedInterfaces(await _netifChannel.invokeMethod<List<dynamic>>('list'));
       }
       await _notifier.init(_openFromNotification);
       unawaited(_notifier.requestPermission());
-      _bridge.events.listen(handleEvent);
-      unawaited(_startTransport());
+      _eventSub = _bridge.events.listen(handleEvent);
+      await _open();
     } catch (e, st) {
       _transportError = 'Transport failed to start: $e';
       debugPrint('tincan: start failed: $e\n$st');
     }
     starting = false;
     notifyListeners();
+  }
+
+  /// Loads what the unlocked store holds and brings the transport up.
+  Future<void> _open() async {
+    await _freshCache(_cacheDir!);
+    _cacheWiped = false;
+    _store = ChatStore(_bridge, _stateDir!, conversations, onError: notifyListeners);
+    final (loaded, _) = await (Settings.load(_bridge, _stateDir!), _store!.load()).wait;
+    settings = loaded;
+    _background
+      ..update(settings)
+      ..start();
+    sweepExpired();
+    _sweepTimer?.cancel();
+    _sweepTimer = Timer.periodic(const Duration(minutes: 1), (_) => sweepExpired());
+    unawaited(_startTransport());
+  }
+
+  void _onLifecycle(AppLifecycleState s) {
+    final was = _foreground;
+    _foreground = s == AppLifecycleState.resumed;
+    // The debounced history write must not die with the app.
+    if (!_foreground) unawaited(_store?.flush());
+    if (s == AppLifecycleState.detached) {
+      unawaited(_wipeCache(forget: true));
+    } else if (s == AppLifecycleState.paused || s == AppLifecycleState.hidden) {
+      _armCacheWipe();
+    }
+    if (_foreground && !was) {
+      _cacheTimer?.cancel();
+      _refillCache();
+      if (selectedId != null) unawaited(_notifier.clear(selectedId!));
+      dialAll(reset: true);
+    }
+  }
+
+  /// Plaintext lasts as long as the app keeps receiving in the back.
+  void _armCacheWipe() {
+    if (_cacheTimer?.isActive ?? false) return;
+    final minutes = _background.supported ? settings.backgroundMinutes : 15;
+    _cacheTimer = Timer(Duration(minutes: minutes), () => unawaited(_wipeCache()));
   }
 
   /// Swaps in an empty cache, deleting the old one and any a crash left
@@ -218,8 +316,8 @@ class AppState extends ChangeNotifier {
         stateDir: _stateDir!,
         downloadDir: _downloadDir!,
         name: selfName,
-        derpHost: settings.derpHost,
-        derpMapUrl: settings.derpMapUrl,
+        relay: settings.relay,
+        directOnly: settings.directOnly,
       ));
     } catch (e, st) {
       _transportError = 'Transport failed to start: $e';
@@ -246,6 +344,53 @@ class AppState extends ChangeNotifier {
     for (final c in conversations.values) {
       c.blocked = ids.contains(c.id);
     }
+  }
+
+  // Lock
+
+  /// Shuts the store: flushes history, stops the transport, forgets the
+  /// key and every plaintext copy. The UI shows the unlock screen while
+  /// [locked], then calls [reopen].
+  Future<void> lockNow() async {
+    if (locked) return;
+    await _store?.flush();
+    _store = null;
+    _sweepTimer?.cancel();
+    for (final t in _reconnectTimers.values) {
+      t.cancel();
+    }
+    _reconnectTimers.clear();
+    _reconnectAttempts.clear();
+    try {
+      await _bridge.lock();
+    } catch (e) {
+      debugPrint('tincan: locking: $e');
+    }
+    locked = true;
+    await _wipeCache(forget: true);
+    conversations.clear();
+    requests.clear();
+    blockedPeers.clear();
+    _peerErrors.clear();
+    _sources.clear();
+    selectedId = null;
+    selfAddress = null;
+    notifyListeners();
+  }
+
+  /// Picks up again once the vault is unlocked after [lockNow].
+  Future<void> reopen() async {
+    if (!locked) return;
+    locked = false;
+    starting = true;
+    notifyListeners();
+    try {
+      await _open();
+    } catch (e) {
+      _transportError = 'Transport failed to start: $e';
+    }
+    starting = false;
+    notifyListeners();
   }
 
   // Profile
@@ -281,6 +426,7 @@ class AppState extends ChangeNotifier {
       selfName = name;
       selfDescription = description.trim();
       selfStatus = status.trim();
+      await _markNamed();
       notifyListeners();
       return null;
     } catch (e) {
@@ -290,14 +436,26 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  Future<void> _markNamed() async {
+    if (settings.named) return;
+    settings.named = true;
+    try {
+      if (_stateDir case final dir?) await settings.save(_bridge, dir);
+    } catch (e) {
+      debugPrint('tincan: saving settings: $e');
+    }
+  }
+
   /// Persists settings and applies them. Changing the relay restarts
   /// the transport, which changes the address; if the new relay fails
   /// while the old one works, the bridge keeps it and nothing is saved.
   Future<String?> saveSettings(Settings next) async {
     try {
-      if (next.derpHost != settings.derpHost || next.derpMapUrl != settings.derpMapUrl) {
-        handleEvent(await _bridge.setDerp(host: next.derpHost, mapUrl: next.derpMapUrl));
+      if (next.relay != settings.relay) {
+        handleEvent(await _bridge.setRelay(next.relay));
       }
+      if (next.directOnly != settings.directOnly) await _applyDirectOnly(next.directOnly);
+      next.named = next.named || settings.named;
       settings = next;
       if (_stateDir case final dir?) await next.save(_bridge, dir);
       _background.update(next);
@@ -305,6 +463,20 @@ class AppState extends ChangeNotifier {
       return null;
     } catch (e) {
       return '$e';
+    }
+  }
+
+  /// Chat only over direct paths; the relay just introduces peers.
+  Future<String?> setDirectOnly(bool on) => saveSettings(settings.copyWith(directOnly: on));
+
+  Future<void> _applyDirectOnly(bool on) async {
+    await _bridge.setDirectOnly(on);
+    if (on) return;
+    for (final c in conversations.values) {
+      if (!c.awaitingDirect) continue;
+      c
+        ..awaitingDirect = false
+        ..repaint();
     }
   }
 
@@ -322,10 +494,11 @@ class AppState extends ChangeNotifier {
 
   // Backup & restore
 
-  /// Writes identity, profile and roster to path. Contains the private key.
-  Future<String?> saveAccount(String path) async {
+  /// Writes identity, profile and roster to path. Contains the private
+  /// key; a password seals it.
+  Future<String?> exportAccount(String path, {String password = ''}) async {
     try {
-      await _bridge.exportAccount(path);
+      await _bridge.exportAccount(path, password: password);
       return null;
     } catch (e) {
       return '$e';
@@ -333,9 +506,9 @@ class AppState extends ChangeNotifier {
   }
 
   /// Restarts the transport under a restored identity. History stays.
-  Future<String?> restoreAccount(String path) async {
+  Future<String?> importAccount(String path, {String password = ''}) async {
     try {
-      await _bridge.importAccount(path);
+      await _bridge.importAccount(path, password: password);
       handleEvent(await _bridge.restart());
       await _reloadBlocked();
       notifyListeners();
@@ -345,18 +518,20 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  Future<String?> saveChats(String path) async {
+  Future<String?> exportChats(String path, {String password = ''}) async {
     try {
-      await exportChats(conversations.values, _bridge.decryptMedia, path);
+      await backup.exportChats(conversations.values, _bridge.decryptMedia, path,
+          password: password, seal: _bridge.sealFile);
       return null;
     } catch (e) {
       return '$e';
     }
   }
 
-  Future<String?> restoreChats(String path) async {
+  Future<String?> importChats(String path, {String password = ''}) async {
     try {
-      final imported = await importChats(path, _downloadDir!, _bridge.importMedia);
+      final imported = await backup.importChats(path, _downloadDir!, _bridge.importMedia,
+          password: password, open: _bridge.openFile);
       for (final c in imported) {
         final existing = conversations[c.id];
         if (existing == null) {
@@ -404,6 +579,19 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  /// Drops a request without blocking; they can ask again.
+  Future<String?> ignoreRequest(String peer) async {
+    try {
+      await _bridge.ignore(peer);
+      requests.removeWhere((r) => r.peer == peer);
+      unawaited(_notifier.clear(peer));
+      notifyListeners();
+      return null;
+    } on BridgeException catch (e) {
+      return e.message;
+    }
+  }
+
   /// Refuses a peer for good. Undo from the blocked-peers list.
   Future<String?> blockPeer(String peer) async {
     try {
@@ -414,22 +602,34 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Drops a conversation and its history. The peer stays accepted, so
-  /// either side can start again; blockPeer refuses them for good.
+  /// Drops a conversation, its history and its media. The peer stays
+  /// accepted, so either side can start again; blockPeer refuses them
+  /// for good.
   Future<String?> deleteConversation(String peer) async {
     try {
       await _bridge.disconnect(peer);
     } on BridgeException catch (e) {
       return e.message;
     } finally {
-      conversations.remove(peer);
+      final convo = conversations.remove(peer);
       requests.removeWhere((r) => r.peer == peer);
       if (selectedId == peer) selectedId = null;
       _cancelReconnect(peer);
       _store?.scheduleSave();
       notifyListeners();
+      if (convo != null) await _deleteMedia(convo.messages);
     }
     return null;
+  }
+
+  Future<void> _deleteMedia(Iterable<ChatMessage> msgs) async {
+    for (final m in msgs) {
+      _sources.remove(m.id);
+      final path = m.path;
+      if (path == null) continue;
+      _forgetPlaintext(path);
+      await File(path).delete().then((_) {}, onError: (_) {});
+    }
   }
 
   Future<String?> unblockPeer(String peer) async {
@@ -441,46 +641,135 @@ class AppState extends ChangeNotifier {
     }
   }
 
+  // Per-chat settings
+
+  /// A local name for the peer; null or empty goes back to theirs.
+  void setNickname(String peer, String? name) {
+    final convo = conversations[peer];
+    if (convo == null) return;
+    final n = name?.trim();
+    convo.nickname = n == null || n.isEmpty ? null : n;
+    _changed(convo);
+  }
+
+  Future<String?> setVerified(String peer, bool verified) async {
+    final convo = conversations[peer];
+    if (convo == null) return null;
+    try {
+      await _bridge.setVerified(peer, verified);
+    } on BridgeException catch (e) {
+      return e.message;
+    }
+    convo.verified = verified;
+    _changed(convo);
+    return null;
+  }
+
+  /// Muted chats don't notify.
+  void setMuted(String peer, bool muted) {
+    final convo = conversations[peer];
+    if (convo == null) return;
+    convo.muted = muted;
+    if (muted) unawaited(_notifier.clear(peer));
+    _changed(convo);
+  }
+
+  /// Sets the chat's disappearing timer on both sides; null turns it
+  /// off. Only messages from now on expire.
+  Future<void> setDisappearing(String peer, Duration? d) async {
+    final convo = conversations[peer];
+    if (convo == null) return;
+    convo
+      ..disappearAfter = d == null || d <= Duration.zero ? null : d
+      ..timerPending = true;
+    _changed(convo);
+    await _flush(peer);
+  }
+
+  DateTime? _expiry(Conversation convo) =>
+      convo.disappearAfter == null ? null : DateTime.now().add(convo.disappearAfter!);
+
+  /// Deletes expired messages and their media.
+  @visibleForTesting
+  void sweepExpired() {
+    final now = DateTime.now();
+    for (final convo in conversations.values) {
+      final gone = [
+        for (final m in convo.messages)
+          if (m.expiresAt case final at? when !at.isAfter(now)) m,
+      ];
+      if (gone.isEmpty) continue;
+      convo.messages.removeWhere(gone.contains);
+      unawaited(_deleteMedia(gone));
+      convo.changed();
+      _store?.scheduleSave();
+    }
+  }
+
+  // Messages
+
   void select(String? id) {
     selectedId = id;
-    conversations[id]?.unread = 0;
+    final convo = conversations[id];
+    if (convo != null && convo.unread > 0) {
+      convo
+        ..unread = 0
+        ..changed();
+      _store?.scheduleSave();
+    }
     if (id != null) unawaited(_notifier.clear(id));
+    unawaited(_bridge.setActivePeer(id).then((_) {}, onError: (_) {}));
     notifyListeners();
+  }
+
+  /// Opens [peer] and brings [msgId] into view.
+  void focusMessage(String peer, String msgId) {
+    if (selectedId != peer) select(peer);
+    focused.value = (peer, msgId);
   }
 
   void _openFromNotification(String peer) {
     if (conversations.containsKey(peer)) select(peer);
   }
 
-  /// Unless the user is already reading that conversation.
+  bool _onScreen(String peer) => _foreground && selectedId == peer;
+
+  /// Unless the user is already reading that conversation, or muted it.
   void _notifyIncoming(Conversation convo, ChatMessage msg) {
-    if (_foreground && selectedId == convo.id) return;
+    if (convo.muted || _onScreen(convo.id)) return;
     final line = switch (msg.kind) {
       MessageKind.text => msg.body,
       MessageKind.image => '📷 Photo',
       MessageKind.video => '🎬 Video',
       _ => '📎 ${msg.name ?? 'File'}',
     };
-    unawaited(_notifier.message(convo.id, convo.name, line));
+    unawaited(_notifier.message(convo.id, convo.displayName, line));
   }
 
-  /// Dials a raw tc… address or a shared profile blob.
-  Future<String?> connect(String input) async {
+  /// Dials a raw tc… address or a shared profile blob. [verified] is for
+  /// a QR code scanned in person.
+  Future<String?> connect(String input, {bool verified = false}) async {
     final parsed = parseConnectInput(input);
     if (parsed == null) {
       return input.trim().isEmpty
-          ? 'Paste an address or shared profile first.'
-          : 'That doesn\'t look like a Tincan address or profile.';
+          ? 'Paste a Tincan ID first.'
+          : 'That doesn\'t look like a Tincan ID.';
     }
     try {
-      final peer = await _dial(parsed.token);
-      final convo = conversations[peer];
-      if (convo != null) {
-        convo.token = parsed.token;
-        if (parsed.name case final n? when convo.name.isEmpty) convo.name = n;
-        convo.changed();
-        _store?.scheduleSave();
+      final peer = await _bridge.connect(parsed.token);
+      final convo = conversations[peer] ??= Conversation(id: peer, name: '');
+      convo.token = parsed.token;
+      if (parsed.name case final n? when convo.name.isEmpty) convo.name = n;
+      if (verified && !convo.verified) {
+        try {
+          await _bridge.setVerified(peer, true);
+          convo.verified = true;
+        } on BridgeException catch (e) {
+          debugPrint('tincan: marking verified: $e');
+        }
       }
+      convo.changed();
+      _store?.scheduleSave();
       select(peer);
       return null;
     } on BridgeException catch (e) {
@@ -488,138 +777,314 @@ class AppState extends ChangeNotifier {
     }
   }
 
-  /// Dials token and waits for the outcome, returning the peer's id.
-  Future<String> _dial(String token) async {
-    final since = _outcomeSeq;
-    final peer = await _bridge.connect(token);
-    final err = switch (_outcomes[peer]) {
-      (final seq, final err) when seq > since => err,
-      _ => await (_dials[peer] ??= Completer()).future,
-    };
-    if (err != null) throw BridgeException(err);
-    return peer;
-  }
-
-  void _settleDial(String peer, String? err) {
-    _outcomes[peer] = (++_outcomeSeq, err);
-    _dials.remove(peer)?.complete(err);
-  }
-
-  Future<void> sendText(String peerId, String body) async {
+  /// Queues a text; it goes out now if the peer is connected, else when
+  /// they are. Returns an error, or null.
+  Future<String?> sendText(String peerId, String body, {String? replyTo}) async {
     body = body.trim();
     final convo = conversations[peerId];
-    if (body.isEmpty || convo == null) return;
+    if (body.isEmpty || convo == null) return null;
+    if (utf8.encode(body).length > maxBodyBytes) return 'That message is too long.';
     final msg = ChatMessage(
       id: newMessageId(),
       outgoing: true,
       ts: DateTime.now(),
       kind: MessageKind.text,
       body: body,
-      status: MessageStatus.sending,
+      status: MessageStatus.queued,
+      replyTo: replyTo,
+      expiresAt: _expiry(convo),
     );
     convo.messages.add(msg);
     _changed(convo);
-    try {
-      await _bridge.sendText(peerId, msg.id, body);
-      msg.status = MessageStatus.sent;
-    } catch (_) {
-      msg.status = MessageStatus.failed;
-    }
-    convo.changed();
-    _store?.scheduleSave();
+    await _flush(peerId);
+    return null;
   }
 
-  /// Resends a failed message as a fresh one at the end of the thread.
+  /// Sends a failed message again under the same id, so the peer never
+  /// shows it twice.
   Future<void> retry(String peerId, ChatMessage msg) async {
     final convo = conversations[peerId];
-    final resendable = msg.kind == MessageKind.text || msg.path != null;
+    final resendable = msg.kind == MessageKind.text || msg.path != null || _sources.containsKey(msg.id);
     if (convo == null ||
+        !msg.outgoing ||
         msg.status != MessageStatus.failed ||
         !resendable ||
-        !convo.messages.remove(msg)) {
+        !convo.messages.contains(msg)) {
       return;
     }
-    if (msg.kind == MessageKind.text) {
-      await sendText(peerId, msg.body);
-    } else {
-      await sendFile(peerId, msg.path!);
-    }
+    msg.status = MessageStatus.queued;
+    convo.changed();
+    _store?.scheduleSave();
+    await _flush(peerId);
+  }
+
+  /// Toggles my reaction on a message; another emoji replaces it.
+  Future<void> react(String peerId, String msgId, String emoji) async {
+    final convo = conversations[peerId];
+    final msg = convo?.messageById(msgId);
+    if (convo == null || msg == null) return;
+    final next = msg.reactionOf('me') == emoji ? '' : emoji;
+    msg.setReaction('me', next);
+    convo.pendingReactions[msgId] = next;
+    convo.changed();
+    _store?.scheduleSave();
+    await _flush(peerId);
+  }
+
+  /// Removes a message here only, with its media.
+  Future<void> deleteForMe(String peerId, String msgId) async {
+    final convo = conversations[peerId];
+    final msg = convo?.messageById(msgId);
+    if (convo == null || msg == null) return;
+    convo.messages.remove(msg);
+    convo.pendingReactions.remove(msgId);
+    _changed(convo);
+    await _deleteMedia([msg]);
+  }
+
+  /// Messages matching q in any chat, newest first.
+  List<(Conversation, ChatMessage)> search(String q) {
+    final needle = q.trim().toLowerCase();
+    if (needle.isEmpty) return const [];
+    final hits = [
+      for (final c in conversations.values)
+        for (final m in c.messages)
+          if (m.body.toLowerCase().contains(needle) ||
+              (m.kind != MessageKind.text && (m.name?.toLowerCase().contains(needle) ?? false)))
+            (c, m),
+    ];
+    hits.sort((a, b) => b.$2.ts.compareTo(a.$2.ts));
+    return hits;
   }
 
   Future<void> attachAndSendFile(String peerId) async {
     final path = await pickFile(const [mediaTypes, XTypeGroup(label: 'Any file')]);
     if (path == null) return;
     await sendFile(peerId, path);
-    // The bridge holds it open by now, and keeps its own sealed copy.
+    // The bridge holds it open by now, or keeps its own sealed copy.
     unawaited(releasePicked(path));
   }
 
+  static MessageKind _kindOf(String path) {
+    final ext = p.extension(path).replaceFirst('.', '').toLowerCase();
+    if (imageExtensions.contains(ext)) return MessageKind.image;
+    if (videoExtensions.contains(ext)) return MessageKind.video;
+    return MessageKind.file;
+  }
+
+  /// Stops a file going either way. An outgoing one fails and can be
+  /// retried; an incoming one is interrupted.
+  Future<void> cancelTransfer(String peerId, String msgId) async {
+    final convo = conversations[peerId];
+    final msg = convo?.messageById(msgId);
+    if (convo == null || msg == null || !msg.isMedia) return;
+    try {
+      await _bridge.cancelTransfer(peerId, msgId);
+    } catch (e) {
+      debugPrint('tincan: cancelling a transfer: $e');
+    }
+    _markCancelled(msg);
+    convo.changed();
+    _store?.scheduleSave();
+  }
+
+  static void _markCancelled(ChatMessage msg) => msg
+    ..setProgress(null)
+    ..status = msg.outgoing ? MessageStatus.failed : MessageStatus.interrupted;
+
+  /// Like [sendText]: offline, a sealed copy waits in the outbox.
   Future<void> sendFile(String peerId, String path) async {
     final convo = conversations[peerId];
     if (convo == null) return;
-    final id = newMessageId();
     final msg = ChatMessage(
-      id: id,
+      id: newMessageId(),
       outgoing: true,
       ts: DateTime.now(),
-      kind: MessageKind.file,
+      kind: _kindOf(path),
       name: p.basename(path),
-      progress: 0,
-      status: MessageStatus.sending,
+      status: MessageStatus.queued,
+      expiresAt: _expiry(convo),
     );
+    _sources[msg.id] = path;
     convo.messages.add(msg);
     _changed(convo);
+    await _flush(peerId);
+    if (msg.status == MessageStatus.queued && msg.path == null) await _keepCopy(convo, msg);
+  }
+
+  /// Seals the picked file into the store, since the original may go.
+  Future<void> _keepCopy(Conversation convo, ChatMessage msg) async {
+    final src = _sources.remove(msg.id);
+    if (src == null || msg.path != null) return;
     try {
-      final meta = await _bridge.sendFile(peerId, id, path);
-      msg
-        ..kind = kindFromWire(meta.kind)
-        ..name = meta.name
-        ..size = meta.size
-        ..path = meta.path;
-    } catch (_) {
+      msg.path = await _bridge.importMedia(src, _downloadDir ?? p.dirname(src), p.basename(src));
+    } catch (e) {
+      debugPrint('tincan: keeping a queued file: $e');
       msg.status = MessageStatus.failed;
-      msg.progress.value = null;
     }
     convo.changed();
     _store?.scheduleSave();
   }
 
-  Future<String?> reconnect(String peerId) async {
-    final token = conversations[peerId]?.token;
-    if (token == null) return 'This peer connected to you; they have to reconnect.';
-    return connect(token);
+  // Outbox
+
+  /// Sends what waits for peer, in order, behind any drain already
+  /// running. [resend] also covers what went out but was never acked.
+  Future<void> _flush(String peerId, {bool resend = false}) {
+    final next = (_drains[peerId] ?? Future.value()).then((_) => _drain(peerId, resend));
+    _drains[peerId] = next;
+    return next.whenComplete(() {
+      if (identical(_drains[peerId], next)) _drains.remove(peerId);
+    });
+  }
+
+  static bool _offline(Object e) => '$e'.contains('no connected peer') || '$e'.contains('No direct path');
+
+  Future<void> _drain(String peerId, bool resend) async {
+    final convo = conversations[peerId];
+    if (convo == null || !convo.connected) return;
+    if (convo.timerPending) {
+      try {
+        await _bridge.sendTimer(peerId, newMessageId(), convo.disappearAfter?.inSeconds ?? 0);
+        convo.timerPending = false;
+        convo.changed();
+        _store?.scheduleSave();
+      } catch (e) {
+        debugPrint('tincan: sending timer: $e');
+        return;
+      }
+    }
+    for (final msg in List.of(convo.messages)) {
+      if (!msg.outgoing) continue;
+      final due = msg.status == MessageStatus.queued ||
+          (resend && (msg.status == MessageStatus.sending || msg.status == MessageStatus.sent));
+      if (!due || !convo.messages.contains(msg)) continue;
+      if (!convo.connected) return;
+      msg.status = MessageStatus.sending;
+      convo.changed();
+      try {
+        if (msg.kind == MessageKind.text) {
+          await _bridge.sendText(peerId, msg.id, msg.body, replyTo: msg.replyTo);
+          if (msg.status == MessageStatus.sending) msg.status = MessageStatus.sent;
+        } else {
+          final src = msg.path ?? _sources[msg.id];
+          if (src == null) {
+            msg.status = MessageStatus.failed;
+            continue;
+          }
+          msg.setProgress(0);
+          final meta = await _bridge.sendFile(peerId, msg.id, src);
+          _sources.remove(msg.id);
+          msg
+            ..kind = kindFromWire(meta.kind)
+            ..name = meta.name
+            ..size = meta.size
+            ..path = meta.path;
+          // file-done marks it sent.
+        }
+      } catch (e) {
+        msg.setProgress(null);
+        final gone = _offline(e) || !convo.connected;
+        msg.status = gone ? MessageStatus.queued : MessageStatus.failed;
+        convo.changed();
+        _store?.scheduleSave();
+        if (gone) {
+          if (msg.path == null && _sources.containsKey(msg.id)) await _keepCopy(convo, msg);
+          return;
+        }
+        continue;
+      }
+      convo.changed();
+      _store?.scheduleSave();
+    }
+    for (final MapEntry(key: ref, value: emoji) in Map.of(convo.pendingReactions).entries) {
+      if (!convo.connected) return;
+      try {
+        await _bridge.sendReaction(peerId, newMessageId(), ref, emoji);
+      } catch (e) {
+        debugPrint('tincan: sending a reaction: $e');
+        if (_offline(e) || !convo.connected) return;
+      }
+      if (convo.pendingReactions[ref] == emoji) convo.pendingReactions.remove(ref);
+      convo.changed();
+      _store?.scheduleSave();
+    }
   }
 
   // Reconnect policy
 
+  Future<String?> reconnect(String peerId) async {
+    final convo = conversations[peerId];
+    final token = convo?.token;
+    if (convo == null) return null;
+    if (token == null) return 'They connected to you; they have to reconnect.';
+    _cancelReconnect(peerId);
+    return _redial(peerId);
+  }
+
   /// Delay before redialing a dropped peer, given how many redials have
-  /// already failed. Null means give up and leave it to the Reconnect
-  /// button: 2s, 4s … 64s, about two minutes in all.
-  static Duration? reconnectDelay(int attempt) =>
-      attempt < 6 ? Duration(seconds: 2 << attempt) : null;
+  /// already failed: 2s, 4s … 64s, then every 5 minutes while the app is
+  /// in front.
+  static Duration reconnectDelay(int attempt) =>
+      attempt < 6 ? Duration(seconds: 2 << attempt) : const Duration(minutes: 5);
+
+  /// Dials every known peer that isn't connected. [reset] starts their
+  /// backoff over: the network or the app just came back.
+  void dialAll({bool reset = false}) {
+    if (locked) return;
+    for (final c in conversations.values.toList()) {
+      if (c.connected || c.blocked || c.token == null) continue;
+      if (reset) _reconnectAttempts.remove(c.id);
+      _reconnectTimers.remove(c.id)?.cancel();
+      unawaited(_redial(c.id));
+    }
+  }
+
+  /// One dial; on failure the next is scheduled. Returns the error.
+  Future<String?> _redial(String peerId) async {
+    final convo = conversations[peerId];
+    final token = convo?.token;
+    if (convo == null || token == null || convo.blocked || convo.connected) return null;
+    if (!_dialing.add(peerId)) return null;
+    convo
+      ..reconnecting = true
+      ..repaint();
+    try {
+      await _bridge.connect(token);
+      return null;
+    } catch (e) {
+      conversations[peerId]?.awaitingDirect = false;
+      _reconnectAttempts[peerId] = (_reconnectAttempts[peerId] ?? 0) + 1;
+      _scheduleReconnect(peerId);
+      conversations[peerId]?.repaint();
+      return e is BridgeException ? e.message : '$e';
+    } finally {
+      _dialing.remove(peerId);
+    }
+  }
 
   void _scheduleReconnect(String peerId) {
     final convo = conversations[peerId];
-    final token = convo?.token;
-    if (convo == null || token == null || convo.blocked) return;
+    if (convo == null || convo.token == null || convo.blocked || locked) return;
     final attempt = _reconnectAttempts[peerId] ?? 0;
-    final delay = reconnectDelay(attempt);
     _reconnectTimers.remove(peerId)?.cancel();
-    convo.reconnecting = delay != null;
-    if (delay == null) return;
+    // Slow retries are for when the user is looking; resume redials.
+    final slow = attempt >= 6;
+    convo.reconnecting = !slow || _foreground;
+    if (!convo.reconnecting) return;
     // Spreads redials out; the bridge settles two that cross anyway.
-    final jittered = delay * (1 + _jitter.nextDouble() / 2);
-    _reconnectTimers[peerId] = Timer(jittered, () async {
+    final jittered = reconnectDelay(attempt) * (1 + _jitter.nextDouble() / 2);
+    _reconnectTimers[peerId] = Timer(jittered, () {
       _reconnectTimers.remove(peerId);
-      if (conversations[peerId]?.connected ?? true) return;
-      _reconnectAttempts[peerId] = attempt + 1;
-      try {
-        // Not connect(): a background redial mustn't change the selection.
-        await _dial(token);
-      } on BridgeException {
-        _scheduleReconnect(peerId);
-        conversations[peerId]?.repaint();
+      final c = conversations[peerId];
+      if (c == null || c.connected) return;
+      if (slow && !_foreground) {
+        c
+          ..reconnecting = false
+          ..repaint();
+        return;
       }
+      unawaited(_redial(peerId));
     });
   }
 
@@ -628,12 +1093,10 @@ class AppState extends ChangeNotifier {
     _reconnectAttempts.remove(peerId);
   }
 
-  // Bridge events
+  @visibleForTesting
+  bool hasReconnectTimer(String peerId) => _reconnectTimers.containsKey(peerId);
 
-  static DateTime _evTs(Map<String, dynamic> ev) => switch (ev['ts']) {
-        final num ms => DateTime.fromMillisecondsSinceEpoch(ms.toInt()),
-        _ => DateTime.now(),
-      };
+  // Bridge events
 
   /// Whether no conversation sorts above c.
   bool _isNewest(Conversation c) =>
@@ -649,57 +1112,88 @@ class AppState extends ChangeNotifier {
 
   @visibleForTesting
   void handleEvent(Map<String, dynamic> ev) {
+    if (locked) return;
     var convo = conversations[ev['peer']];
     var app = true; // repaint app-wide, not just convo
     var save = false; // history changed
     switch (ev['type']) {
       case 'server-started' || 'self-profile':
-        if (ev['type'] == 'server-started') {
+        final started = ev['type'] == 'server-started';
+        if (started) {
           _transportError = null;
           stdout.writeln('tincan: listening at ${ev['address']}');
         }
         selfAddress = ev['address'] as String? ?? selfAddress;
-        if (ev['name'] case final String n when n.isNotEmpty) selfName = n;
+        if (ev['name'] case final String n when n.isNotEmpty) {
+          selfName = n;
+          // Someone who named themselves before onboarding asked.
+          if (n != _fallbackName) unawaited(_markNamed());
+        }
         selfDescription = ev['description'] as String? ?? selfDescription;
         selfStatus = ev['status'] as String? ?? selfStatus;
         final avatar = ev['avatarPath'] as String? ?? '';
         selfAvatarPath = avatar.isEmpty ? null : avatar;
         plaintext(selfAvatarPath); // decrypt ahead of the first paint
+        if (started) dialAll(reset: true);
 
       case 'transport-error':
         _transportError = 'Transport failed to start: ${ev['error']}';
+
+      case 'identity-conflict':
+        identityConflict = true;
+
+      case 'peer-error':
+        final id = ev['peer'] as String? ?? '';
+        final body = ev['body'] as String? ?? '';
+        _peerErrors[id] = body.isNotEmpty ? body : ev['code'] as String? ?? 'Connection refused.';
 
       case 'peer-added':
         final id = ev['peer'] as String;
         final c = convo ??= conversations[id] = Conversation(id: id, name: '');
         final name = ev['name'] as String? ?? '';
         final token = ev['token'] as String? ?? '';
+        final fp = ev['fp'] as String? ?? '';
+        final verified = ev['verified'] as bool?;
         save = c.name.isEmpty ||
             (name.isNotEmpty && name != c.name) ||
-            (token.isNotEmpty && token != c.token);
+            (token.isNotEmpty && token != c.token) ||
+            (fp.isNotEmpty && fp != c.fp) ||
+            (verified != null && verified != c.verified);
         if (name.isNotEmpty || c.name.isEmpty) c.name = name.isEmpty ? 'peer' : name;
         if (token.isNotEmpty) c.token = token;
+        if (fp.isNotEmpty) c.fp = fp;
+        if (verified != null) c.verified = verified;
         c
           ..connected = true
           ..direct = null
           ..blocked = false
           ..remotePending = ev['remotePending'] == true
-          ..reconnecting = false;
+          ..reconnecting = false
+          ..awaitingDirect = false;
         requests.removeWhere((r) => r.peer == id);
+        _peerErrors.remove(id);
         _cancelReconnect(id);
-        _settleDial(id, null);
+        unawaited(_flush(id, resend: true));
+        if (id == selectedId) unawaited(_bridge.setActivePeer(id).then((_) {}, onError: (_) {}));
 
       case 'connect-error':
-        _settleDial(ev['peer'] as String, ev['error'] as String? ?? 'Couldn\'t connect.');
-        return;
+        // connect itself reports it.
+        if (convo == null || !convo.awaitingDirect) return;
+        convo.awaitingDirect = false;
+        app = false;
 
       case 'peer-request':
         final id = ev['peer'] as String;
-        final request = ChatRequest(peer: id, name: ev['name'] as String? ?? '');
+        final request = ChatRequest(
+          peer: id,
+          name: ev['name'] as String? ?? '',
+          fp: ev['fp'] as String? ?? '',
+          first: ev['first'] as String? ?? '',
+        );
         requests
           ..removeWhere((r) => r.peer == id)
           ..add(request);
-        if (!_foreground) unawaited(_notifier.request(id, request.displayName));
+        if (!_onScreen(id)) unawaited(_notifier.request(id, request.displayName));
 
       case 'peer-request-gone':
         requests.removeWhere((r) => r.peer == ev['peer']);
@@ -760,11 +1254,27 @@ class AppState extends ChangeNotifier {
         app = false;
         if (convo == null) return;
         convo.markOffline();
+        // Cut off mid-send: it goes again, same id, on reconnect.
+        for (final m in convo.messages) {
+          if (m.outgoing && m.status == MessageStatus.sending && (m.kind == MessageKind.text || m.path != null)) {
+            m
+              ..status = MessageStatus.queued
+              ..setProgress(null);
+            save = true;
+          }
+        }
         _scheduleReconnect(convo.id);
 
       case 'peer-status':
         app = false;
-        if (convo == null || !convo.connected) return;
+        if (convo == null) return;
+        // Direct-only mode: reached, but waiting for a direct path.
+        if (ev['held'] case final bool held) {
+          if (held == convo.awaitingDirect || held && convo.connected) return;
+          convo.awaitingDirect = held;
+          break;
+        }
+        if (!convo.connected) return;
         final direct = ev['direct'] == true;
         final addr = ev['addr'] as String? ?? '';
         final relay = ev['relay'] as String? ?? '';
@@ -786,29 +1296,70 @@ class AppState extends ChangeNotifier {
 
       case 'message':
         if (convo == null) return;
+        final id = ev['id'] as String? ?? newMessageId();
+        // A resend after a lost ack.
+        if (convo.messageById(id) != null) return;
         save = true;
         final msg = ChatMessage(
-          id: ev['id'] as String? ?? newMessageId(),
+          id: id,
           outgoing: false,
-          ts: _evTs(ev),
+          ts: DateTime.now(),
           kind: MessageKind.text,
           body: ev['body'] as String? ?? '',
+          replyTo: ev['reply'] as String?,
+          expiresAt: _expiry(convo),
         );
         app = _receive(convo, msg);
         _notifyIncoming(convo, msg);
 
+      case 'react':
+        app = false;
+        final msg = convo?.messageById(ev['ref'] as String? ?? '');
+        if (msg == null) return;
+        save = true;
+        msg.setReaction(convo!.id, ev['body'] as String? ?? '');
+
+      case 'delivered':
+        app = false;
+        final msg = convo?.messageById(ev['id'] as String? ?? '');
+        if (msg == null || !msg.outgoing || msg.status == MessageStatus.delivered) return;
+        save = true;
+        msg
+          ..status = MessageStatus.delivered
+          ..setProgress(null);
+
+      case 'peer-timer':
+        app = false;
+        if (convo == null) return;
+        final secs = (ev['seconds'] as num?)?.toInt() ?? 0;
+        save = true;
+        convo
+          ..disappearAfter = secs > 0 ? Duration(seconds: secs) : null
+          ..timerPending = false;
+
       case 'file-begin':
         if (convo == null) return;
         save = true;
+        final id = ev['id'] as String;
+        final existing = convo.messageById(id);
+        if (existing != null) {
+          // The sender resumed a broken transfer.
+          app = false;
+          existing
+            ..status = MessageStatus.sending
+            ..setProgress(0);
+          break;
+        }
         final msg = ChatMessage(
-          id: ev['id'] as String,
+          id: id,
           outgoing: false,
-          ts: _evTs(ev),
+          ts: DateTime.now(),
           kind: kindFromWire(ev['kind'] as String?),
           name: ev['name'] as String?,
           size: (ev['size'] as num?)?.toInt(),
           progress: 0,
           status: MessageStatus.sending,
+          expiresAt: _expiry(convo),
         );
         app = _receive(convo, msg);
         _notifyIncoming(convo, msg);
@@ -827,11 +1378,18 @@ class AppState extends ChangeNotifier {
         if (msg == null) return;
         save = true;
         msg
-          ..progress.value = null
-          ..status = MessageStatus.sent
+          ..setProgress(null)
+          ..status = msg.status == MessageStatus.delivered ? MessageStatus.delivered : MessageStatus.sent
           ..path = ev['path'] as String? ?? msg.path
           ..name = ev['name'] as String? ?? msg.name
           ..size = (ev['size'] as num?)?.toInt() ?? msg.size;
+
+      case 'transfer-cancelled':
+        app = false;
+        final msg = convo?.messageById(ev['id'] as String? ?? '');
+        if (msg == null) return;
+        save = true;
+        _markCancelled(msg);
 
       case 'send-error' || 'recv-error':
         app = false;
@@ -839,10 +1397,13 @@ class AppState extends ChangeNotifier {
         if (msg == null) return;
         save = true;
         msg
-          ..progress.value = null
-          ..status = ev['type'] == 'send-error'
-              ? MessageStatus.failed
-              : MessageStatus.interrupted;
+          ..setProgress(null)
+          ..status = switch (ev['type']) {
+            'recv-error' => MessageStatus.interrupted,
+            // Dropped with the connection: it resumes on reconnect.
+            _ when !convo!.connected && msg.path != null => MessageStatus.queued,
+            _ => MessageStatus.failed,
+          };
 
       case 'fatal':
         _fatal = ev['error'] as String? ?? 'bridge crashed';
@@ -868,9 +1429,14 @@ class AppState extends ChangeNotifier {
     for (final t in _reconnectTimers.values) {
       t.cancel();
     }
+    _sweepTimer?.cancel();
+    _cacheTimer?.cancel();
+    unawaited(_eventSub?.cancel());
     _lifecycle?.dispose();
     _background.dispose();
     _store?.dispose();
+    focused.dispose();
+    unawaited(_wipeCache(forget: true));
     super.dispose();
   }
 }

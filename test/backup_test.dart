@@ -52,4 +52,38 @@ void main() {
     rc.mergeFrom(again);
     expect(rc.messages, hasLength(2));
   });
+
+  test('a password-sealed chats backup needs its password', () async {
+    final dir = Directory.systemTemp.createTempSync('tc-chats-pw');
+    addTearDown(() => dir.delete(recursive: true));
+    final convo = Conversation(id: 'nk:1', name: 'nia')
+      ..messages.add(ChatMessage(
+          id: 'm1', outgoing: true, ts: DateTime(2026), kind: MessageKind.text, body: 'hey',
+          status: MessageStatus.delivered));
+    // A byte flip stands in for the sealing.
+    Future<void> flip(String src, String dst, String pw) async =>
+        File(dst).writeAsBytesSync([for (final b in File(src).readAsBytesSync()) b ^ pw.length]);
+    final out = '${dir.path}/chats.tincan';
+    await exportChats([convo], (s, d) async {}, out, password: 'pw', seal: flip);
+    Future<String> seal(String src, String d, String name) async => '$d/$name';
+
+    await expectLater(importChats(out, dir.path, seal), throwsFormatException);
+    final back = await importChats(out, dir.path, seal, password: 'pw', open: flip);
+    expect(back.single.messages.single.body, 'hey');
+    expect(back.single.messages.single.status, MessageStatus.delivered);
+  });
+
+  test('a failed export leaves no half-written file', () async {
+    final dir = Directory.systemTemp.createTempSync('tc-chats-fail');
+    addTearDown(() => dir.delete(recursive: true));
+    final out = '${dir.path}/chats.tincan';
+    Future<void> broken(String src, String dst, String pw) async {
+      File(dst).writeAsStringSync('partial');
+      throw const FileSystemException('disk full');
+    }
+    await expectLater(
+        exportChats([Conversation(id: 'a', name: 'nia')], (s, d) async {}, out, password: 'pw', seal: broken),
+        throwsA(isA<FileSystemException>()));
+    expect(File(out).existsSync(), isFalse);
+  });
 }

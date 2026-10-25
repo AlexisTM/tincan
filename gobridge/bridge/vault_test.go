@@ -111,6 +111,9 @@ func TestVaultChunkedMedia(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
 	f.Close()
 
 	onDisk, err := os.ReadFile(sealed)
@@ -232,7 +235,7 @@ func TestImportAccountDropsWhatBackupLacks(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := v.WriteFile(filepath.Join(dir, identityFile), []byte(`{}`), 0600); err != nil {
+		if err := v.WriteFile(filepath.Join(dir, identityFile), testIdentity(t), 0600); err != nil {
 			t.Fatal(err)
 		}
 		return v
@@ -248,10 +251,10 @@ func TestImportAccountDropsWhatBackupLacks(t *testing.T) {
 		t.Fatal(err)
 	}
 	backup := filepath.Join(t.TempDir(), "account.json")
-	if err := bare.ExportAccount(backup); err != nil {
+	if err := bare.ExportAccount(backup, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := full.ImportAccount(backup); err != nil {
+	if err := full.ImportAccount(backup, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, f := range []string{filepath.Join(full.dir, rosterFile), filepath.Join(full.dir, profileFile), avatar} {

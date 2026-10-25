@@ -23,22 +23,41 @@ const (
 	chunkSize     = 256 << 10
 	transferIDLen = 16
 
-	protoVersion = 1
+	// A stranger's frames are capped near the largest thing they may
+	// send: a profile with a picture.
+	maxPendingFrame = maxAvatarBytes + 64<<10
+
+	// Texts, reactions and error reasons.
+	maxBody = 64 << 10
+
+	protoVersion = 2
+	protoMin     = 2
 )
 
+// features this side speaks, offered in the hello.
+var features = []string{"ack", "react", "reply", "resume", "timer"}
+
 type wireMsg struct {
-	T       string `json:"t"`
-	V       int    `json:"v,omitempty"`
-	Name    string `json:"name,omitempty"`
-	Key     string `json:"key,omitempty"`     // sender's stable identity (server node key)
-	ConnKey string `json:"connKey,omitempty"` // sender's WireGuard key on this connection
-	Proof   []byte `json:"proof,omitempty"`   // dialer's hello: helloProof sealed from Key to the server
-	ID      string `json:"id,omitempty"`
-	TS      int64  `json:"ts,omitempty"`
-	Body    string `json:"body,omitempty"`
-	File    string `json:"file,omitempty"`
-	Size    int64  `json:"size,omitempty"`
-	Kind    string `json:"kind,omitempty"`
+	T       string   `json:"t"`
+	V       int      `json:"v,omitempty"`
+	VMin    int      `json:"vmin,omitempty"`
+	VMax    int      `json:"vmax,omitempty"`
+	Feat    []string `json:"feat,omitempty"`
+	Inst    string   `json:"inst,omitempty"` // random per process; tells two devices on one identity apart
+	Name    string   `json:"name,omitempty"`
+	Key     string   `json:"key,omitempty"`     // sender's stable identity (server node key)
+	ConnKey string   `json:"connKey,omitempty"` // sender's WireGuard key on this connection
+	Proof   []byte   `json:"proof,omitempty"`   // dialer's hello: helloProof sealed from Key to the server
+	ID      string   `json:"id,omitempty"`
+	TS      int64    `json:"ts,omitempty"`
+	Body    string   `json:"body,omitempty"`
+	File    string   `json:"file,omitempty"`
+	Size    int64    `json:"size,omitempty"`
+	Kind    string   `json:"kind,omitempty"`
+	Ref     string   `json:"ref,omitempty"`   // ack, react, file-resume: the message it is about
+	Reply   string   `json:"reply,omitempty"` // text: id of the quoted message
+	Have    int64    `json:"have,omitempty"`  // file-resume: bytes already held; -1 refuses
+	Code    string   `json:"code,omitempty"`  // error
 
 	// profile messages
 	SelfAddr string `json:"saddr,omitempty"` // sender's own connection token
@@ -134,8 +153,8 @@ func writeBlobFrame(w io.Writer, id string, chunk []byte) error {
 	return writeFrame(w, frameBlob, append(payload, chunk...))
 }
 
-func readFrame(r io.Reader) (kind byte, payload []byte, err error) {
-	buf, err := readLenPrefixed(r, maxFrame)
+func readFrame(r io.Reader, max uint32) (kind byte, payload []byte, err error) {
+	buf, err := readLenPrefixed(r, max)
 	if err != nil {
 		return 0, nil, err
 	}

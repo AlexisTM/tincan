@@ -14,21 +14,40 @@ abstract class Bridge {
 
   /// Returns the server-started event. If the transport can't come up
   /// yet this throws, and the bridge keeps trying, reporting by events.
+  /// [relay] is a relay hostname, or an http(s) URL of a relay map.
+  /// [directOnly]: see [setDirectOnly].
   Future<Map<String, dynamic>> start({
     required String stateDir,
     required String downloadDir,
     required String name,
-    String derpHost,
-    String derpMapUrl,
+    String relay,
+    bool directOnly,
   });
 
-  /// Starts dialing and returns the peer's id at once; the outcome
-  /// arrives as a peer-added or connect-error event.
+  /// Chat only over a direct path; the relay just introduces peers. A
+  /// dial waits up to a minute for one, reporting `peer-status` with
+  /// `held: true` meanwhile. Applies at once, keeping the address.
+  Future<void> setDirectOnly(bool on);
+
+  /// Dials and waits for the outcome: returns the peer's id, or throws
+  /// with the reason. Events still fire.
   Future<String> connect(String token);
-  Future<void> sendText(String peer, String id, String body);
+  Future<void> sendText(String peer, String id, String body, {String? replyTo});
+
+  /// Reacts to message [ref] with [emoji]; empty removes the reaction.
+  Future<void> sendReaction(String peer, String id, String ref, String emoji);
+
+  /// Sets the chat's disappearing timer on both sides; 0 turns it off.
+  Future<void> sendTimer(String peer, String id, int seconds);
+
   /// Sends a file, sealing a copy into the store as it goes; a path
-  /// already in the store is sent from as is.
+  /// already in the store is sent from as is. Resumes when the receiver
+  /// kept a partial copy.
   Future<FileMeta> sendFile(String peer, String id, String path);
+
+  /// Stops a file going either way; the peer gets `transfer-cancelled`
+  /// and drops its partial copy.
+  Future<void> cancelTransfer(String peer, String id);
   Future<void> setProfile({
     required String name,
     String description,
@@ -47,6 +66,16 @@ abstract class Bridge {
   Future<void> accept(String peer);
   Future<void> block(String peer);
   Future<void> unblock(String peer);
+
+  /// Drops a pending request without blocking the peer.
+  Future<void> ignore(String peer);
+  Future<void> setVerified(String peer, bool verified);
+
+  /// The chat on screen gets a status ping every 5 s, others every 30 s.
+  Future<void> setActivePeer(String? peer);
+
+  /// Stops the transport and forgets the data key until the next unlock.
+  Future<void> lock();
 
   /// Whether an encrypted store exists here, and how it is locked.
   Future<({bool exists, String mode})> vaultStatus(String stateDir);
@@ -77,15 +106,19 @@ abstract class Bridge {
   /// returning where it landed.
   Future<String> importMedia(String src, String dir, String name);
 
-  /// Account backup, in plaintext because it must open on another
-  /// device. It carries the private key.
-  Future<void> exportAccount(String dst);
-  Future<void> importAccount(String src);
+  /// Account backup. It carries the private key: plaintext without a
+  /// password, sealed with one.
+  Future<void> exportAccount(String dst, {String password = ''});
+  Future<void> importAccount(String src, {String password = ''});
+
+  /// Password-wraps an arbitrary file (chat backups), and back.
+  Future<void> sealFile(String src, String dst, String password);
+  Future<void> openFile(String src, String dst, String password);
 
   /// Switches the relay. If it fails the old one stays in use, unless
   /// the transport is down: then the new one is kept and retried, and
   /// the result is empty.
-  Future<Map<String, dynamic>> setDerp({required String host, required String mapUrl});
+  Future<Map<String, dynamic>> setRelay(String relay);
 
   /// Drops a peer without blocking them.
   Future<void> disconnect(String peer);
@@ -112,18 +145,32 @@ class BridgeException implements Exception {
 /// I/O, and a dedicated isolate pumps events from the start.
 class TincanBridge implements Bridge {
   TincanBridge() {
-    final port = ReceivePort();
-    port.listen((raw) {
-      if (raw is String) {
+    _pumpPort.handler = (Object? raw) {
+      if (raw == _retired) {
+        _pumpRetired = true;
+      } else if (raw is String) {
         try {
           _events.add(jsonDecode(raw) as Map<String, dynamic>);
         } catch (_) {}
       }
-    });
-    Isolate.spawn(_eventPump, port.sendPort, debugName: 'tincan-events');
+    };
+    _exitPort.handler = (_) {
+      // Died unexpectedly: start another, unless a newer engine took over.
+      if (!_pumpRetired) Timer(const Duration(seconds: 1), _spawnPump);
+    };
+    _spawnPump();
   }
 
   final _events = StreamController<Map<String, dynamic>>.broadcast();
+  final _pumpPort = RawReceivePort();
+  final _exitPort = RawReceivePort();
+  bool _pumpRetired = false;
+
+  void _spawnPump() {
+    Isolate.spawn(_eventPump, _pumpPort.sendPort,
+            debugName: 'tincan-events', onExit: _exitPort.sendPort)
+        .ignore();
+  }
 
   @override
   Stream<Map<String, dynamic>> get events => _events.stream;
@@ -133,16 +180,16 @@ class TincanBridge implements Bridge {
     required String stateDir,
     required String downloadDir,
     required String name,
-    String derpHost = '',
-    String derpMapUrl = '',
+    String relay = '',
+    bool directOnly = false,
   }) =>
       _call('TincanStart', [
         jsonEncode({
           'stateDir': stateDir,
           'downloadDir': downloadDir,
           'name': name,
-          'derpHost': derpHost,
-          'derpMapUrl': derpMapUrl,
+          'relay': relay,
+          'directOnly': directOnly,
           'verbose': Platform.environment['TINCAN_VERBOSE'] == '1',
         })
       ]);
@@ -152,8 +199,16 @@ class TincanBridge implements Bridge {
       (await _call('TincanConnect', [token]))['peer'] as String;
 
   @override
-  Future<void> sendText(String peer, String id, String body) =>
-      _call('TincanSendText', [peer, id, body]);
+  Future<void> sendText(String peer, String id, String body, {String? replyTo}) =>
+      _call('TincanSendText', [peer, id, body, replyTo ?? '']);
+
+  @override
+  Future<void> sendReaction(String peer, String id, String ref, String emoji) =>
+      _call('TincanSendReaction', [peer, id, ref, emoji]);
+
+  @override
+  Future<void> sendTimer(String peer, String id, int seconds) =>
+      _call('TincanSendTimer', [peer, id, '$seconds']);
 
   @override
   Future<FileMeta> sendFile(String peer, String id, String path) async {
@@ -161,6 +216,12 @@ class TincanBridge implements Bridge {
     return FileMeta(res['name'] as String, res['kind'] as String,
         (res['size'] as num).toInt(), res['path'] as String);
   }
+
+  @override
+  Future<void> cancelTransfer(String peer, String id) => _call('TincanCancelTransfer', [peer, id]);
+
+  @override
+  Future<void> setDirectOnly(bool on) => _call('TincanSetDirectOnly', ['$on']);
 
   @override
   Future<void> setProfile({
@@ -197,6 +258,19 @@ class TincanBridge implements Bridge {
 
   @override
   Future<void> unblock(String peer) => _call('TincanUnblock', [peer]);
+
+  @override
+  Future<void> ignore(String peer) => _call('TincanIgnore', [peer]);
+
+  @override
+  Future<void> setVerified(String peer, bool verified) =>
+      _call('TincanSetVerified', [peer, '$verified']);
+
+  @override
+  Future<void> setActivePeer(String? peer) => _call('TincanSetActivePeer', [peer ?? '']);
+
+  @override
+  Future<void> lock() => _call('TincanLock');
 
   @override
   Future<({bool exists, String mode})> vaultStatus(String stateDir) async {
@@ -243,16 +317,23 @@ class TincanBridge implements Bridge {
       (await _call('TincanImportMedia', [src, dir, name]))['path'] as String;
 
   @override
-  Future<void> exportAccount(String dst) => _call('TincanExportAccount', [dst]);
+  Future<void> exportAccount(String dst, {String password = ''}) =>
+      _call('TincanExportAccount', [dst, password]);
 
   @override
-  Future<void> importAccount(String src) => _call('TincanImportAccount', [src]);
+  Future<void> importAccount(String src, {String password = ''}) =>
+      _call('TincanImportAccount', [src, password]);
 
   @override
-  Future<Map<String, dynamic>> setDerp({required String host, required String mapUrl}) =>
-      _call('TincanSetDERP', [
-        {'host': host, 'mapUrl': mapUrl}
-      ]);
+  Future<void> sealFile(String src, String dst, String password) =>
+      _call('TincanSealFile', [src, dst, password]);
+
+  @override
+  Future<void> openFile(String src, String dst, String password) =>
+      _call('TincanOpenFile', [src, dst, password]);
+
+  @override
+  Future<Map<String, dynamic>> setRelay(String relay) => _call('TincanSetRelay', [relay]);
 
   @override
   Future<void> disconnect(String peer) => _call('TincanDisconnect', [peer]);
@@ -268,9 +349,12 @@ class TincanBridge implements Bridge {
   }
 }
 
-/// Calls that can block for long (picking a relay takes up to a minute)
-/// get an isolate of their own, so the pool keeps serving sends.
-const _slowCalls = {'TincanStart', 'TincanSetDERP', 'TincanRestart', 'TincanResetIdentity'};
+/// Calls that can block for long (a dial, picking a relay, argon2) get
+/// an isolate of their own, so the pool keeps serving sends.
+const _slowCalls = {
+  'TincanStart', 'TincanSetRelay', 'TincanRestart', 'TincanResetIdentity', 'TincanConnect',
+  'TincanLock', 'TincanExportAccount', 'TincanImportAccount', 'TincanSealFile', 'TincanOpenFile',
+};
 
 /// Non-string args are sent as JSON.
 Future<Map<String, dynamic>> _call(String symbol, [List<Object> args = const []]) async =>
@@ -290,33 +374,64 @@ Map<String, dynamic> _checked(Map<String, dynamic> res) {
 
 final _workers = _WorkerPool(3);
 
+class _Worker {
+  _Worker(this.port);
+  final Future<SendPort> port;
+  final pending = <Completer<Map<String, dynamic>>>{};
+  int busy = 0;
+}
+
 /// Long-lived isolates that run bridge calls, each binding the library
-/// once. Several, so a slow dial can't hold up sends behind it.
+/// once. Several, so a slow dial can't hold up sends behind it. A worker
+/// that dies fails its calls and is replaced on the next one.
 class _WorkerPool {
-  _WorkerPool(this.size) : _busy = List.filled(size, 0);
+  _WorkerPool(this.size) : _slots = List.filled(size, null);
 
   final int size;
-  final List<int> _busy;
-  final _ports = <Future<SendPort>>[];
+  final List<_Worker?> _slots;
+
+  _Worker _spawn(int i) {
+    final exit = RawReceivePort();
+    late final _Worker w;
+    w = _Worker(_spawnWorker(i, exit.sendPort));
+    exit.handler = (_) {
+      exit.close();
+      _retire(i, w, 'bridge worker died');
+    };
+    w.port.catchError((Object e) {
+      exit.close();
+      _retire(i, w, '$e');
+      return Future<SendPort>.error(e);
+    }).ignore();
+    return w;
+  }
+
+  void _retire(int i, _Worker w, String why) {
+    if (identical(_slots[i], w)) _slots[i] = null;
+    for (final c in w.pending) {
+      if (!c.isCompleted) c.completeError(BridgeException(why));
+    }
+  }
 
   Future<Map<String, dynamic>> call(String symbol, List<Object> args) async {
-    if (_ports.isEmpty) {
-      for (var i = 0; i < size; i++) {
-        _ports.add(_spawnWorker(i));
-      }
-    }
     var pick = 0;
     for (var i = 1; i < size; i++) {
-      if (_busy[i] < _busy[pick]) pick = i;
+      if ((_slots[i]?.busy ?? 0) < (_slots[pick]?.busy ?? 0)) pick = i;
     }
-    _busy[pick]++;
-    final reply = ReceivePort();
+    final w = _slots[pick] ??= _spawn(pick);
+    final done = Completer<Map<String, dynamic>>();
+    final reply = RawReceivePort((Object? r) {
+      if (!done.isCompleted) done.complete(r as Map<String, dynamic>);
+    });
+    w.busy++;
+    w.pending.add(done);
     try {
-      (await _ports[pick]).send((symbol, args, reply.sendPort));
-      return await reply.first as Map<String, dynamic>;
+      (await w.port).send((symbol, args, reply.sendPort));
+      return await done.future;
     } finally {
       reply.close();
-      _busy[pick]--;
+      w.pending.remove(done);
+      w.busy--;
     }
   }
 }
@@ -324,12 +439,15 @@ class _WorkerPool {
 // Top-level on purpose: an isolate entry point that closed over `this`
 // would drag the bridge and everything it references into the message,
 // failing with "object is unsendable".
-Future<SendPort> _spawnWorker(int i) async {
+Future<SendPort> _spawnWorker(int i, SendPort onExit) async {
   final ready = ReceivePort();
-  await Isolate.spawn(_workerMain, ready.sendPort, debugName: 'tincan-bridge-$i');
-  final port = await ready.first as SendPort;
-  ready.close();
-  return port;
+  try {
+    await Isolate.spawn(_workerMain, ready.sendPort,
+        debugName: 'tincan-bridge-$i', onExit: onExit, onError: onExit);
+    return await ready.first as SendPort;
+  } finally {
+    ready.close();
+  }
 }
 
 void _workerMain(SendPort ready) {
@@ -380,6 +498,8 @@ final DynamicLibrary _lib = _openLib();
 typedef _NativeStr1 = Pointer<Utf8> Function(Pointer<Utf8>);
 typedef _NativeStr2 = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>);
 typedef _NativeStr3 = Pointer<Utf8> Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
+typedef _NativeStr4 = Pointer<Utf8> Function(
+    Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>);
 
 final _free = _lib.lookupFunction<Void Function(Pointer<Utf8>), void Function(Pointer<Utf8>)>('TincanFree');
 final _attachEvents = _lib.lookupFunction<Int32 Function(), int Function()>('TincanAttachEvents');
@@ -399,7 +519,8 @@ Map<String, dynamic> _invoke(String symbol, List<String> args) {
     0 => _lib.lookupFunction<Pointer<Utf8> Function(), Pointer<Utf8> Function()>(symbol),
     1 => _lib.lookupFunction<_NativeStr1, _NativeStr1>(symbol),
     2 => _lib.lookupFunction<_NativeStr2, _NativeStr2>(symbol),
-    _ => _lib.lookupFunction<_NativeStr3, _NativeStr3>(symbol),
+    3 => _lib.lookupFunction<_NativeStr3, _NativeStr3>(symbol),
+    _ => _lib.lookupFunction<_NativeStr4, _NativeStr4>(symbol),
   };
   final ptrs = [for (final a in args) a.toNativeUtf8()];
   try {
@@ -407,28 +528,46 @@ Map<String, dynamic> _invoke(String symbol, List<String> args) {
       [] => (fn as Pointer<Utf8> Function())(),
       [final a] => (fn as _NativeStr1)(a),
       [final a, final b] => (fn as _NativeStr2)(a, b),
-      [final a, final b, final c, ...] => (fn as _NativeStr3)(a, b, c),
+      [final a, final b, final c] => (fn as _NativeStr3)(a, b, c),
+      [final a, final b, final c, final d, ...] => (fn as _NativeStr4)(a, b, c, d),
     };
     return jsonDecode(_take(out)) as Map<String, dynamic>;
   } finally {
-    ptrs.forEach(malloc.free);
+    for (final ptr in ptrs) {
+      // Args carry secrets and message bodies; don't leave them in freed memory.
+      ptr.cast<Uint8>().asTypedList(ptr.length).fillRange(0, ptr.length, 0);
+      malloc.free(ptr);
+    }
   }
 }
 
+const _retired = 'retired';
+
 /// Runs until a newer bridge attaches: Android can replace the engine
 /// while this isolate lives on, and it must not keep taking events.
+/// Other failures are reported once and retried with backoff.
 void _eventPump(SendPort port) {
   int? gen;
+  var failures = 0;
   while (true) {
     try {
       gen ??= _attachEvents();
       // A thread parked forever in a native call wedges VM shutdown.
       final ev = _take(_nextEvent(gen, 500));
-      if (ev == 'stale') return;
+      failures = 0;
+      if (ev == 'stale') {
+        port.send(_retired);
+        return;
+      }
       if (ev.isNotEmpty) port.send(ev);
-    } catch (e) {
+    } on BridgeException catch (e) {
+      // No library: nothing to retry.
       port.send(jsonEncode({'type': 'fatal', 'error': '$e'}));
+      port.send(_retired);
       return;
+    } catch (e) {
+      if (failures++ == 0) port.send(jsonEncode({'type': 'fatal', 'error': '$e'}));
+      sleep(Duration(seconds: failures < 5 ? failures : 5));
     }
   }
 }

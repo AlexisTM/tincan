@@ -40,7 +40,7 @@ void main() {
     FlutterSecureStorage.setMockInitialValues({current: 'old'});
     final bridge = _VaultBridge()..failRewrap = true;
     final vault = VaultManager(bridge, '/s');
-    expect(await vault.changeLock(LockMode.none), isNotNull);
+    expect(await vault.changeLock(LockMode.device), isNotNull);
     expect(await storage.read(key: current), 'old');
     expect(await vault.unlock(LockMode.none), isNull);
   });
@@ -54,5 +54,17 @@ void main() {
     expect(await storage.read(key: staged), isNull);
     expect(await dir.exists(), isFalse);
     expect(vault.mode, isNull);
+  });
+
+  test('setup offers only a device lock or a password; old open stores can upgrade', () async {
+    FlutterSecureStorage.setMockInitialValues({});
+    final vault = VaultManager(_VaultBridge(), '/s');
+    expect(LockMode.choices, [LockMode.device, LockMode.password]);
+    expect(await vault.create(LockMode.none), isNotNull);
+    expect(vault.mode, isNull);
+    vault.mode = LockMode.none;
+    expect(vault.canUpgradeLock, isTrue);
+    vault.mode = LockMode.password;
+    expect(vault.canUpgradeLock, isFalse);
   });
 }

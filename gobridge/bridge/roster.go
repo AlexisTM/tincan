@@ -19,43 +19,28 @@ const rosterFile = "peers.json"
 type rosterData struct {
 	Accepted map[string]string `json:"accepted"` // peer key -> last seen name
 	Blocked  map[string]string `json:"blocked"`
+	Verified map[string]bool   `json:"verified,omitempty"` // safety number checked in person
 }
 
-func (m *Manager) loadRoster() error {
+// readRoster loads the roster without installing it.
+func (m *Manager) readRoster() (rosterData, error) {
 	var r rosterData
 	err := m.loadJSON(rosterFile, &r)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		err = nil
 	}
-	if err != nil {
-		return err
-	}
-	m.accepted = r.Accepted
-	m.blocked = r.Blocked
-	return nil
+	return r, err
 }
 
-type rosterSnapshot struct {
-	rosterData
-	seq uint64
-}
-
-// rosterLocked copies the roster for saveRoster; m.mu held.
-func (m *Manager) rosterLocked() rosterSnapshot {
-	m.rosterSeq++
-	return rosterSnapshot{rosterData{maps.Clone(m.accepted), maps.Clone(m.blocked)}, m.rosterSeq}
-}
-
-// saveRoster persists a snapshot outside m.mu, unless a newer one
-// already landed.
-func (m *Manager) saveRoster(r rosterSnapshot) {
+// saveRoster persists the roster as it is now. Writers queue on saveMu
+// and each snapshots after getting it, so the last write is the latest.
+func (m *Manager) saveRoster() {
 	m.saveMu.Lock()
 	defer m.saveMu.Unlock()
-	if r.seq <= m.rosterSaved {
-		return
-	}
-	m.rosterSaved = r.seq
-	if err := m.saveJSON(rosterFile, r.rosterData); err != nil {
+	m.mu.Lock()
+	r := rosterData{maps.Clone(m.accepted), maps.Clone(m.blocked), maps.Clone(m.verified)}
+	m.mu.Unlock()
+	if err := m.saveJSON(rosterFile, r); err != nil {
 		m.logf("tincan: saving roster: %v", err)
 	}
 }
@@ -73,14 +58,13 @@ func (m *Manager) Accept(peerID string) error {
 	drop := m.installPeerLocked(p, false)
 	live := m.peers[peerID]
 	mapSet(&m.accepted, peerID, p.name)
-	roster := m.rosterLocked()
 	texts := p.pendingTexts
 	p.pendingTexts = nil
 	profile := p.pendingProfile
 	p.pendingProfile = nil
 	m.mu.Unlock()
 
-	m.saveRoster(roster)
+	m.saveRoster()
 	drop.close()
 	m.emit(m.peerAddedEvent(live))
 	if profile != nil {
@@ -89,13 +73,47 @@ func (m *Manager) Accept(peerID string) error {
 	for _, t := range texts {
 		m.emit(messageEvent(p, t))
 	}
-	if live != p {
-		return nil // a connection of their own dialing won the tie-break
+	if live == p {
+		if err := p.writeMsg(&wireMsg{T: "accepted"}); err != nil {
+			return err
+		}
 	}
-	if err := p.writeMsg(&wireMsg{T: "accepted"}); err != nil {
-		return err
+	// Acks go on whichever connection survived the tie-break.
+	go func() {
+		live.writeMsg(m.profileMsg())
+		for _, t := range texts {
+			live.writeMsg(&wireMsg{T: "ack", Ref: t.ID})
+		}
+	}()
+	return nil
+}
+
+// Ignore drops a pending request without blocking; they may ask again.
+func (m *Manager) Ignore(peerID string) error {
+	m.mu.Lock()
+	p := m.pending[peerID]
+	if p != nil {
+		delete(m.pending, peerID)
 	}
-	go p.writeMsg(m.profileMsg())
+	m.mu.Unlock()
+	if p == nil {
+		return fmt.Errorf("no pending request from %v", peerID)
+	}
+	m.dropPeer(p, false)
+	return nil
+}
+
+// SetVerified records whether the user checked this peer's safety
+// number.
+func (m *Manager) SetVerified(peerID string, verified bool) error {
+	m.mu.Lock()
+	if verified {
+		mapSet(&m.verified, peerID, true)
+	} else {
+		delete(m.verified, peerID)
+	}
+	m.mu.Unlock()
+	m.saveRoster()
 	return nil
 }
 
@@ -113,9 +131,8 @@ func (m *Manager) Block(peerID string) error {
 	}
 	delete(m.accepted, peerID)
 	mapSet(&m.blocked, peerID, name)
-	roster := m.rosterLocked()
 	m.mu.Unlock()
-	m.saveRoster(roster)
+	m.saveRoster()
 
 	live.close()
 	pend.close()
@@ -131,9 +148,8 @@ func (m *Manager) Unblock(peerID string) error {
 		return errors.New("peer is not blocked")
 	}
 	delete(m.blocked, peerID)
-	roster := m.rosterLocked()
 	m.mu.Unlock()
-	m.saveRoster(roster)
+	m.saveRoster()
 	m.emit(map[string]any{"type": "peer-unblocked", "peer": peerID})
 	return nil
 }

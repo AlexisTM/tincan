@@ -7,9 +7,9 @@ import 'package:path/path.dart' as p;
 
 import 'models.dart';
 
-/// Backup files, both plaintext because they have to open on another
-/// device. The account one holds the private key; treat it like a
-/// password. The chats one zips the history with its media.
+/// Backup files, opening on another device: plaintext, or sealed under
+/// a password the user picks. The account one holds the private key.
+/// The chats one zips the history with its media.
 ///
 /// The account side lives in the transport, which holds the encryption
 /// key; only the chat history is assembled here.
@@ -26,15 +26,23 @@ String _uniqueName(String name, bool Function(String) taken) {
   return candidate;
 }
 
+/// Password-wraps a file, or unwraps one.
+typedef FileCrypt = Future<void> Function(String src, String dst, String password);
+
 /// Zips the chat history plus every referenced media file into
 /// [outPath], decrypting each one through [decrypt] on the way out.
-/// Streams through disk so big media never sits in memory.
+/// Streams through disk so big media never sits in memory. With a
+/// [password] the zip is sealed through [seal].
 Future<void> exportChats(
   Iterable<Conversation> conversations,
   Future<void> Function(String src, String dst) decrypt,
-  String outPath,
-) async {
+  String outPath, {
+  String password = '',
+  FileCrypt? seal,
+}) async {
+  if (password.isNotEmpty && seal == null) throw ArgumentError('seal is required with a password');
   final scratch = await Directory.systemTemp.createTemp('tincan-export-');
+  var done = false;
   try {
     final mediaNames = <String, String>{}; // sealed path -> archive name
     final used = <String>{};
@@ -62,10 +70,18 @@ Future<void> exportChats(
       }
       convos.add(j);
     }
-    final index = jsonEncode({'v': 1, 'kind': _chatsKind, 'conversations': convos});
-    await _zipInIsolate(outPath, files, index);
+    final index = jsonEncode({'v': 2, 'kind': _chatsKind, 'conversations': convos});
+    if (password.isEmpty) {
+      await _zipInIsolate(outPath, files, index);
+    } else {
+      final zip = p.join(scratch.path, 'chats.zip');
+      await _zipInIsolate(zip, files, index);
+      await seal!(zip, outPath, password);
+    }
+    done = true;
   } finally {
-    await scratch.delete(recursive: true);
+    await scratch.delete(recursive: true).then((_) {}, onError: (_) {});
+    if (!done) await File(outPath).delete().then((_) {}, onError: (_) {});
   }
 }
 
@@ -91,15 +107,29 @@ Future<void> _zip(String outPath, List<(String, String)> files, String index) as
 }
 
 /// Unpacks the chats zip at [zipPath], sealing each media file into
-/// mediaDir through [seal], which picks a free name and returns it.
+/// mediaDir through [seal], which picks a free name and returns it. A
+/// [password] backup is opened through [open] first.
 Future<List<Conversation>> importChats(
   String zipPath,
   String mediaDir,
-  Future<String> Function(String src, String dir, String name) seal,
-) async {
+  Future<String> Function(String src, String dir, String name) seal, {
+  String password = '',
+  FileCrypt? open,
+}) async {
+  if (password.isNotEmpty && open == null) throw ArgumentError('open is required with a password');
   final scratch = await Directory.systemTemp.createTemp('tincan-import-');
   try {
-    final (index, media) = await _unzipInIsolate(zipPath, scratch.path);
+    var zip = zipPath;
+    if (password.isNotEmpty) {
+      zip = p.join(scratch.path, 'chats.zip');
+      await open!(zipPath, zip, password);
+    }
+    final (Map index, media) = await _unzipInIsolate(zip, scratch.path).catchError(
+        (Object e) => throw FormatException(password.isEmpty
+            ? 'Not a Tincan chats file, or it needs its password.'
+            : 'Not a Tincan chats file: $e'),
+        test: (e) => e is! FileSystemException);
+    final legacy = (index['v'] as num? ?? 1) < 2;
     final restored = <String, String>{}; // archive name -> sealed path
     for (final (name, tmp) in media) {
       restored[name] = await seal(tmp, mediaDir, p.basename(name));
@@ -120,11 +150,11 @@ Future<List<Conversation>> importChats(
           }
         }
       }
-      out.add(Conversation.fromJson(map));
+      out.add(Conversation.fromJson(map, legacy: legacy));
     }
     return out;
   } finally {
-    await scratch.delete(recursive: true);
+    await scratch.delete(recursive: true).then((_) {}, onError: (_) {});
   }
 }
 

@@ -1,49 +1,62 @@
+import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 
 import '../app_state.dart';
+import '../files.dart';
 import '../settings.dart';
 import '../theme.dart';
 import '../vault.dart';
 import 'radio_row.dart';
+import 'sidebar.dart' show AdvancedToggle;
 import 'text_input.dart';
 import 'toast.dart';
-import 'unlock_screen.dart' show LockPicker;
+import 'unlock_screen.dart' show LockPicker, PasswordField;
 
 Future<void> showSettingsDialog(BuildContext context, AppState state) {
-  return showDialog(context: context, builder: (_) => SettingsDialog(state: state));
+  return showTincanDialog(context, (_) => SettingsDialog(state: state));
 }
 
+/// Only a real lock can be locked; an unlocked store would just reopen.
+bool canLockNow(AppState state) =>
+    state.lockMode == LockMode.device || state.lockMode == LockMode.password;
+
 class SettingsDialog extends StatefulWidget {
-  const SettingsDialog({super.key, required this.state});
+  const SettingsDialog({super.key, required this.state, this.pickBackup = _pick});
 
   final AppState state;
+
+  /// Picks a backup to restore, given its file type; null if cancelled.
+  final Future<String?> Function(XTypeGroup type) pickBackup;
+
+  static Future<String?> _pick(XTypeGroup type) => pickFile([type]);
 
   @override
   State<SettingsDialog> createState() => _SettingsDialogState();
 }
 
 class _SettingsDialogState extends State<SettingsDialog> {
-  late bool _receive = widget.state.settings.receiveInBackground;
-  late final _minutes =
-      PlainTextEditingController(text: '${widget.state.settings.backgroundMinutes}');
-  late final _derpHost = PlainTextEditingController(text: widget.state.settings.derpHost);
-  late final _derpMapUrl = PlainTextEditingController(text: widget.state.settings.derpMapUrl);
+  late int _background = widget.state.settings.backgroundMinutes;
+  late bool _directOnly = widget.state.settings.directOnly;
+  late final String _relayWas = widget.state.settings.relay;
+  late final _relay = PlainTextEditingController(text: _relayWas);
+  final _backupPassword = PlainTextEditingController();
+  late bool _advanced = _relayWas.isNotEmpty;
   String? _error;
+  String? _note;
+  bool _noteIsError = false;
   bool _busy = false;
 
   @override
   void dispose() {
-    _minutes.dispose();
-    _derpHost.dispose();
-    _derpMapUrl.dispose();
+    _relay.dispose();
+    _backupPassword.dispose();
     super.dispose();
   }
 
   Future<void> _changeLock(BuildContext context) async {
-    await showDialog<void>(
-      context: context,
-      builder: (dialogContext) => Dialog(
+    await showTincanDialog<void>(
+      context,
+      (dialogContext) => Dialog(
         child: Container(
           width: 420,
           padding: const EdgeInsets.all(24),
@@ -55,8 +68,11 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 const Text('Change the lock',
                     style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
                 const SizedBox(height: 6),
-                const Text('Your data stays as it is; only what unlocks it changes.',
-                    style: TextStyle(fontSize: 12.5, height: 1.5, color: Tc.inkMuted)),
+                Text('Your data stays as it is; only what unlocks it changes.',
+                    style: TextStyle(
+                        fontSize: 12.5,
+                        height: 1.5,
+                        color: TincanColors.of(dialogContext).inkMuted)),
                 const SizedBox(height: 10),
                 LockPicker(
                   vault: widget.state.vault,
@@ -78,35 +94,146 @@ class _SettingsDialogState extends State<SettingsDialog> {
   }
 
   Future<void> _save() async {
-    final minutes = int.tryParse(_minutes.text.trim());
-    if (_receive &&
-        (minutes == null || minutes < 1 || minutes > maxBackgroundMinutes)) {
-      setState(() => _error = 'Enter between 1 and $maxBackgroundMinutes minutes.');
+    final relay = _relay.text.trim();
+    if (relay != _relayWas &&
+        !await confirmDialog(context,
+            title: 'Change the relay?',
+            body: 'Tincan reconnects through the new relay and your Tincan ID changes. '
+                'Anyone holding the old one has to be given the new one.',
+            action: 'Change relay',
+            destructive: false)) {
       return;
     }
-    setState(() => _busy = true);
-    final err = await widget.state.saveSettings(Settings(
-      receiveInBackground: _receive,
-      backgroundMinutes: minutes ?? widget.state.settings.backgroundMinutes,
-      derpHost: _derpHost.text.trim(),
-      derpMapUrl: _derpMapUrl.text.trim(),
-    ));
-    if (mounted) setState(() => _busy = false);
+    if (!mounted) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final err = await widget.state.saveSettings(
+        widget.state.settings.copyWith(backgroundMinutes: _background, relay: relay));
     if (!mounted) return;
     if (err != null) {
-      setState(() => _error = err);
+      setState(() {
+        _busy = false;
+        _error = err;
+      });
       return;
     }
     Navigator.of(context).pop();
   }
 
+  Future<void> _run(Future<String?> Function() op, String doneNote) async {
+    setState(() => _busy = true);
+    final err = await op();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _note = err ?? doneNote;
+      _noteIsError = err != null;
+    });
+    showToast(context, err == null ? doneNote : 'Failed: $err');
+  }
+
+  Future<void> _setDirectOnly(bool on) async {
+    setState(() {
+      _directOnly = on;
+      _busy = true;
+    });
+    final err = await widget.state.setDirectOnly(on);
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      if (err != null) _directOnly = !on;
+    });
+    if (err != null) showToast(context, 'Failed: $err');
+  }
+
+  Future<void> _lockNow() async {
+    Navigator.of(context).pop();
+    await widget.state.lockNow();
+  }
+
+  Future<void> _regenerate() async {
+    if (!await confirmDialog(context,
+        title: 'Generate a new Tincan ID?',
+        body: 'Your current Tincan ID stops working for good, and every open conversation drops. Anyone who only has the old one can no longer reach you.',
+        action: 'New Tincan ID')) {
+      return;
+    }
+    await _run(widget.state.regenerateAddress, 'New Tincan ID generated.');
+  }
+
+  String get _password => _backupPassword.text;
+
+  static const _accountType = XTypeGroup(label: 'Account', extensions: ['json']);
+  static const _chatsType = XTypeGroup(label: 'Chats', extensions: ['zip']);
+
+  Future<void> _saveAccount() async {
+    final target = await chooseSaveTarget('tincan-account.json', const [_accountType]);
+    if (target == null) return;
+    final password = _password;
+    await _run(
+        () => target.write((path) => widget.state.exportAccount(path, password: password)),
+        password.isEmpty
+            ? 'Account saved. The file holds your private key, so guard it like a password.'
+            : 'Account saved, sealed with the backup password.');
+  }
+
+  Future<void> _restoreAccount() async {
+    final path = await widget.pickBackup(_accountType);
+    if (path == null) return;
+    try {
+      if (!mounted ||
+          !await confirmDialog(context,
+              title: 'Restore this account?',
+              body: 'Your current identity is replaced by the one in the backup, and every open conversation drops. Chat history on this device stays.',
+              action: 'Restore',
+              destructive: false) ||
+          !mounted) {
+        return;
+      }
+      final password = _password;
+      await _run(
+          () => widget.state.importAccount(path, password: password), 'Account restored.');
+    } finally {
+      // It holds the private key in plaintext.
+      await releasePicked(path);
+    }
+  }
+
+  Future<void> _saveChats() async {
+    final target = await chooseSaveTarget('tincan-chats.zip', const [_chatsType]);
+    if (target == null) return;
+    final password = _password;
+    await _run(() => target.write((path) => widget.state.exportChats(path, password: password)),
+        'Chats saved (messages and shared media).');
+  }
+
+  Future<void> _restoreChats() async {
+    final path = await widget.pickBackup(_chatsType);
+    if (path == null) return;
+    try {
+      final password = _password;
+      await _run(() => widget.state.importChats(path, password: password),
+          'Chats restored (merged with what was here).');
+    } finally {
+      await releasePicked(path);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     final narrow = MediaQuery.sizeOf(context).width < 700;
+    final blurb = TextStyle(fontSize: 12.5, height: 1.45, color: tc.inkMuted);
+    Widget section(String title) => Padding(
+          padding: const EdgeInsets.only(top: 22, bottom: 4),
+          child: Text(title, style: Tc.caps(tc.label)),
+        );
     return Dialog(
       insetPadding: EdgeInsets.all(narrow ? 14 : 40),
       child: Container(
-        width: 460,
+        width: 480,
         padding: const EdgeInsets.all(24),
         child: SingleChildScrollView(
           child: Column(
@@ -120,120 +247,164 @@ class _SettingsDialogState extends State<SettingsDialog> {
                 ),
                 IconButton(
                   tooltip: 'Close',
-                  onPressed: () => Navigator.of(context).pop(),
-                  icon: const Icon(Icons.close, size: 18, color: Tc.inkMuted),
+                  onPressed: _busy ? null : () => Navigator.of(context).pop(),
+                  icon: Icon(Icons.close, size: 18, color: tc.inkMuted),
                 ),
               ]),
-              const SizedBox(height: 10),
-              Text('RECEIVE MESSAGES IN THE BACKGROUND', style: Tc.caps(Tc.label)),
-              const SizedBox(height: 4),
+              section('RECEIVE IN THE BACKGROUND'),
               if (!widget.state.supportsBackgroundPolicy)
-                const Padding(
-                  padding: EdgeInsets.symmetric(vertical: 10),
+                Padding(
+                  padding: const EdgeInsets.symmetric(vertical: 6),
                   child: Text(
                       'On this platform the app keeps receiving as long as its window is open.',
-                      style: TextStyle(fontSize: 12.5, height: 1.5, color: Tc.inkMuted)),
+                      style: blurb),
                 )
               else ...[
-                RadioGroup<bool>(
-                  groupValue: _receive,
-                  onChanged: (v) => setState(() => _receive = v!),
+                RadioGroup<int>(
+                  groupValue: _background,
+                  onChanged: (v) => setState(() => _background = v!),
                   child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                RadioRow(
-                  value: false,
-                  title: 'Never',
-                  blurb: 'Messages arrive only while Tincan is open. Uses no battery in the background.',
-                  onTap: () => setState(() => _receive = false),
-                ),
-                RadioRow(
-                  value: true,
-                  title: 'For a while after leaving',
-                  blurb: 'Keeps receiving for up to an hour once you leave the app.',
-                  onTap: () => setState(() => _receive = true),
-                ),
-                if (_receive)
-                  Padding(
-                    padding: const EdgeInsets.only(left: 34, right: 8, bottom: 8),
-                    child: Row(children: [
-                      SizedBox(
-                        width: 92,
-                        child: TextField(
-                          controller: _minutes,
-                          keyboardType: TextInputType.number,
-                          inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-                          style: const TextStyle(fontSize: 14),
-                          decoration: const InputDecoration(
-                            isDense: true,
-                            contentPadding:
-                                EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-                          ),
-                        ),
+                    for (final m in backgroundPresets)
+                      RadioRow(
+                        value: m,
+                        title: switch (m) { 0 => 'Off', 60 => '1 hour', _ => '$m minutes' },
+                        blurb: m == 0 ? 'Messages arrive only while Tincan is open.' : '',
+                        onTap: () => setState(() => _background = m),
                       ),
-                      const SizedBox(width: 10),
-                      const Text('minutes', style: TextStyle(fontSize: 13, color: Tc.inkMuted)),
-                    ]),
-                  ),
                   ]),
                 ),
-                const SizedBox(height: 6),
-                const Text(
-                  'Android freezes backgrounded apps, so receiving needs an ongoing '
-                  'notification while it lasts, and it caps how long that may run — '
-                  'an hour is the most Tincan will ask for.',
-                  style: TextStyle(fontSize: 11.5, height: 1.4, color: Tc.inkFaint),
-                ),
+                Text('Android shows a notification while Tincan listens in the background.',
+                    style: blurb),
               ],
-              const SizedBox(height: 20),
-              Text('LOCK', style: Tc.caps(Tc.label)),
-              const SizedBox(height: 4),
+              section('CONNECTIONS'),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                value: _directOnly,
+                onChanged: _busy ? null : _setDirectOnly,
+                title: const Text('Direct connections only', style: TextStyle(fontSize: 14)),
+                subtitle: Text(
+                    'The relay only introduces you; messages never pass through it. '
+                    'Contacts on other networks may be unreachable.',
+                    style: blurb),
+              ),
+              section('LOCK'),
               Row(children: [
                 Expanded(
                   child: Text(
                     switch (widget.state.lockMode) {
                       LockMode.device => 'Unlocks with this device\'s fingerprint, face or screen lock.',
                       LockMode.password => 'Unlocks with your password.',
-                      LockMode.none => 'Opens without asking. The key sits in this device\'s keystore.',
+                      LockMode.none => 'Opens without asking, so anyone holding this device can read your messages. Pick a real lock.',
                       null => 'Lock unknown.',
                     },
-                    style: const TextStyle(fontSize: 12.5, height: 1.45, color: Tc.inkMuted),
+                    style: widget.state.lockMode == LockMode.none
+                        ? blurb.copyWith(color: tc.danger)
+                        : blurb,
                   ),
                 ),
                 const SizedBox(width: 8),
-                OutlinedButton(
-                  style: Tc.accentOutline,
-                  onPressed: _busy ? null : () => _changeLock(context),
-                  child: const Text('Change…'),
-                ),
+                // Old unlocked stores; same test as vault.canUpgradeLock.
+                if (widget.state.lockMode == LockMode.none)
+                  FilledButton(
+                    onPressed: _busy ? null : () => _changeLock(context),
+                    child: const Text('Set a lock…'),
+                  )
+                else
+                  OutlinedButton(
+                    style: tc.accentOutline,
+                    onPressed: _busy ? null : () => _changeLock(context),
+                    child: const Text('Change…'),
+                  ),
               ]),
-              const SizedBox(height: 20),
-              Text('RELAY', style: Tc.caps(Tc.label)),
-              const SizedBox(height: 4),
-              const Text(
-                'Peers talk directly when they can. When a network blocks that, '
-                'traffic is relayed — encrypted end to end, so a relay only ever '
-                'sees ciphertext. Leave these empty to use the default relays.',
-                style: TextStyle(fontSize: 12, height: 1.45, color: Tc.inkMuted),
+              if (canLockNow(widget.state)) ...[
+                const SizedBox(height: 8),
+                OutlinedButton.icon(
+                  onPressed: _busy ? null : _lockNow,
+                  icon: const Icon(Icons.lock_outline, size: 16),
+                  label: const Text('Lock now'),
+                ),
+              ],
+              section('ACCOUNT'),
+              Text('Your Tincan ID is how people reach you. A new one cuts off everyone holding the old one.',
+                  style: blurb),
+              const SizedBox(height: 8),
+              OutlinedButton.icon(
+                style: OutlinedButton.styleFrom(
+                    foregroundColor: tc.danger, padding: const EdgeInsets.symmetric(horizontal: 14)),
+                onPressed: _busy ? null : _regenerate,
+                icon: const Icon(Icons.refresh, size: 16),
+                label: const Text('Generate a new Tincan ID…'),
+              ),
+              section('BACKUPS'),
+              Text(
+                  'With a password, backups are encrypted and need it to restore. Without one, anyone holding the files can read them.',
+                  style: blurb),
+              const SizedBox(height: 10),
+              PasswordField(
+                controller: _backupPassword,
+                label: 'Backup password (optional)',
+                enabled: !_busy,
+                onSubmitted: () {},
               ),
               const SizedBox(height: 10),
-              _text(_derpHost, 'Relay hostname', 'relay.example.com'),
+              Row(children: [
+                Expanded(child: _ghostButton('Save account…', _saveAccount)),
+                const SizedBox(width: 8),
+                Expanded(child: _ghostButton('Restore account…', _restoreAccount)),
+              ]),
               const SizedBox(height: 8),
-              _text(_derpMapUrl, 'Or a relay map URL', 'https://example.com/relays.json'),
+              Row(children: [
+                Expanded(child: _ghostButton('Save chats…', _saveChats)),
+                const SizedBox(width: 8),
+                Expanded(child: _ghostButton('Restore chats…', _restoreChats)),
+              ]),
               const SizedBox(height: 6),
-              const Text(
-                'Changing the relay restarts the transport and changes your '
-                'address, so anyone holding the old one has to be given the new one.',
-                style: TextStyle(fontSize: 11.5, height: 1.4, color: Tc.inkFaint),
-              ),
+              Text(
+                  'The account file holds your private key. The chats file holds your history and shared media.',
+                  style: TextStyle(fontSize: 12, height: 1.4, color: tc.inkFaint)),
+              if (_note != null) ...[
+                const SizedBox(height: 8),
+                Text(_note!,
+                    style: TextStyle(
+                        fontSize: 12, height: 1.4, color: _noteIsError ? tc.danger : tc.inkMuted)),
+              ],
+              const SizedBox(height: 14),
+              AdvancedToggle(open: _advanced, onTap: () => setState(() => _advanced = !_advanced)),
+              if (_advanced) ...[
+                Text(
+                  'Peers talk directly when they can, and through a relay when a network blocks that. '
+                  'A relay only sees ciphertext. Leave empty for the default relays.',
+                  style: blurb,
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _relay,
+                  enabled: !_busy,
+                  autocorrect: false,
+                  enableSuggestions: false,
+                  style: const TextStyle(fontSize: 13.5),
+                  decoration: InputDecoration(
+                    labelText: 'Relay',
+                    hintText: 'relay.example.com or https://…/relays.json',
+                    hintStyle: TextStyle(fontSize: 13, color: tc.inkFaint),
+                    isDense: true,
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Text('Changing it changes your Tincan ID.',
+                    style: TextStyle(fontSize: 12, height: 1.4, color: tc.inkFaint)),
+              ],
               if (_error != null) ...[
                 const SizedBox(height: 10),
-                Text(_error!,
-                    style: const TextStyle(fontSize: 12, color: Tc.danger)),
+                Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
               ],
               const SizedBox(height: 18),
               Row(mainAxisAlignment: MainAxisAlignment.end, children: [
                 TextButton(
-                  onPressed: () => Navigator.of(context).pop(),
-                  child: const Text('Cancel', style: TextStyle(color: Tc.inkMuted)),
+                  style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
+                  onPressed: _busy ? null : () => Navigator.of(context).pop(),
+                  child: const Text('Cancel'),
                 ),
                 const SizedBox(width: 8),
                 FilledButton(
@@ -248,20 +419,10 @@ class _SettingsDialogState extends State<SettingsDialog> {
     );
   }
 
-  Widget _text(TextEditingController c, String label, String hint) {
-    return TextField(
-      controller: c,
-      enabled: !_busy,
-      autocorrect: false,
-      enableSuggestions: false,
-      style: const TextStyle(fontSize: 13.5),
-      decoration: InputDecoration(
-        labelText: label,
-        hintText: hint,
-        hintStyle: const TextStyle(fontSize: 13, color: Tc.inkFaint),
-        isDense: true,
-        contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-      ),
+  Widget _ghostButton(String label, VoidCallback onTap) {
+    return OutlinedButton(
+      onPressed: _busy ? null : onTap,
+      child: Text(label, style: const TextStyle(fontSize: 12.5)),
     );
   }
 }

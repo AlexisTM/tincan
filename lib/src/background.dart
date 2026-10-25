@@ -77,7 +77,7 @@ class BackgroundController with WidgetsBindingObserver {
   }
 
   void _applyBackgroundPolicy() {
-    if (_settings.receiveInBackground) {
+    if (_settings.backgroundMinutes > 0) {
       _startService(_settings.backgroundMinutes);
     } else {
       _stopService();

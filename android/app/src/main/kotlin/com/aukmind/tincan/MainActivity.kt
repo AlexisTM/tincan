@@ -1,12 +1,7 @@
 package com.aukmind.tincan
 
-import android.net.ConnectivityManager
-import android.net.LinkProperties
-import android.net.Network
 import android.net.Uri
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.activity.result.contract.ActivityResultContracts
@@ -15,18 +10,10 @@ import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.embedding.engine.FlutterEngineCache
 import io.flutter.plugin.common.MethodChannel
 import java.io.File
-import java.net.NetworkInterface
-import java.util.concurrent.Executors
 
 // local_auth needs a FragmentActivity; on a plain FlutterActivity every
 // biometric prompt fails before it is shown.
 class MainActivity : FlutterFragmentActivity() {
-    private var netCallback: ConnectivityManager.NetworkCallback? = null
-    private val main = Handler(Looper.getMainLooper())
-    private var pushInterfaces: Runnable? = null
-    private var lastInterfaces: List<Map<String, Any>>? = null // main thread only
-
-    private val io = Executors.newSingleThreadExecutor()
     private var pendingPick: MethodChannel.Result? = null
     private var pendingCreate: MethodChannel.Result? = null
     private val openDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -42,13 +29,12 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        // Picked copies a killed process never released.
-        if (savedInstanceState == null) io.execute { File(cacheDir, "picked").deleteRecursively() }
-    }
-
-    override fun onDestroy() {
-        io.shutdown()
-        super.onDestroy()
+        // Picked copies a killed process never released; once per process,
+        // since a reopened activity may find one still being sent.
+        if (!pickedSwept) {
+            pickedSwept = true
+            io.execute { File(cacheDir, "picked").deleteRecursively() }
+        }
     }
 
     // One engine for the process: Back destroys the activity, but the app
@@ -63,22 +49,7 @@ class MainActivity : FlutterFragmentActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        // Go can't enumerate interfaces here (netlink is SELinux-blocked
-        // for apps), so Java does it and Dart passes them down.
-        val netifs = MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "tincan/netifs")
-        netifs.setMethodCallHandler { call, result ->
-            when (call.method) {
-                "list" -> io.execute {
-                    val list = listInterfaces()
-                    runOnUiThread {
-                        lastInterfaces = list
-                        result.success(list)
-                    }
-                }
-                else -> result.notImplemented()
-            }
-        }
-        watchNetworks(netifs)
+        NetWatcher.attach(this, flutterEngine)
 
         // The app decides the policy; this only starts and stops the
         // service that keeps the process alive.
@@ -132,13 +103,6 @@ class MainActivity : FlutterFragmentActivity() {
             }
     }
 
-    override fun cleanUpFlutterEngine(flutterEngine: FlutterEngine) {
-        netCallback?.let { getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(it) }
-        netCallback = null
-        pushInterfaces?.let { main.removeCallbacks(it) }
-        super.cleanUpFlutterEngine(flutterEngine)
-    }
-
     private fun offMain(result: MethodChannel.Result, work: () -> Any?) {
         io.execute {
             val out = runCatching(work)
@@ -162,63 +126,8 @@ class MainActivity : FlutterFragmentActivity() {
         return dst.path
     }
 
-    // Pushes the interface list when the default network changes. One
-    // change fires a burst of callbacks, so wait for it to settle.
-    private fun watchNetworks(channel: MethodChannel) {
-        val send = Runnable {
-            io.execute {
-                val list = listInterfaces()
-                runOnUiThread {
-                    if (list != lastInterfaces) {
-                        lastInterfaces = list
-                        channel.invokeMethod("changed", list)
-                    }
-                }
-            }
-        }
-        pushInterfaces = send
-        val push = {
-            main.removeCallbacks(send)
-            main.postDelayed(send, 300)
-        }
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) { push() }
-            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) { push() }
-            override fun onLost(network: Network) { push() }
-        }
-        getSystemService(ConnectivityManager::class.java).registerDefaultNetworkCallback(cb)
-        netCallback = cb
-    }
-
-    private fun listInterfaces(): List<Map<String, Any>> {
-        val out = mutableListOf<Map<String, Any>>()
-        try {
-            for (ni in NetworkInterface.getNetworkInterfaces()) {
-                val addrs = mutableListOf<String>()
-                try {
-                    for (ia in ni.interfaceAddresses) {
-                        val ip = ia.address.hostAddress ?: continue
-                        addrs.add("${ip.substringBefore('%')}/${ia.networkPrefixLength}")
-                    }
-                } catch (_: Exception) {}
-                out.add(
-                    mapOf(
-                        "name" to ni.name,
-                        "index" to ni.index,
-                        "mtu" to (runCatching { ni.mtu }.getOrDefault(1500)),
-                        "up" to (runCatching { ni.isUp }.getOrDefault(false)),
-                        "loopback" to (runCatching { ni.isLoopback }.getOrDefault(false)),
-                        "pointToPoint" to (runCatching { ni.isPointToPoint }.getOrDefault(false)),
-                        "multicast" to (runCatching { ni.supportsMulticast() }.getOrDefault(false)),
-                        "addrs" to addrs,
-                    )
-                )
-            }
-        } catch (_: Exception) {}
-        return out
-    }
-
     companion object {
         private const val ENGINE_ID = "main"
+        private var pickedSwept = false
     }
 }

@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"encoding/json"
+	"image"
+	"image/png"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -105,13 +107,16 @@ func newTestManager(t *testing.T, name string, reg *tailcfg.DERPRegion) *Manager
 	return m
 }
 
-// dialNow is Connect without the goroutine, so tests get the outcome.
-func dialNow(m *Manager, token string) (string, error) {
-	server, err := m.dialTarget(token)
-	if err != nil {
-		return "", err
+func dialNow(m *Manager, token string) (string, error) { return m.Connect(token) }
+
+// testPNG is a real image, as avatars must be.
+func testPNG(t *testing.T, w, h int) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, image.NewGray(image.Rect(0, 0, w, h))); err != nil {
+		t.Fatal(err)
 	}
-	return m.dial(token, server)
+	return buf.Bytes()
 }
 
 func livePeer(m *Manager, id string) *peer {
@@ -123,21 +128,22 @@ func livePeer(m *Manager, id string) *peer {
 // waitEvent discards events until one matches, or the test times out.
 func waitEvent(t *testing.T, m *Manager, what string, match func(map[string]any) bool) map[string]any {
 	t.Helper()
-	deadline := time.After(60 * time.Second)
-	for {
-		select {
-		case j := <-m.events:
-			ev := make(map[string]any)
-			if err := json.Unmarshal([]byte(j), &ev); err != nil {
-				t.Fatalf("bad event %q: %v", j, err)
-			}
-			if match(ev) {
-				return ev
-			}
-		case <-deadline:
-			t.Fatalf("timed out waiting for %s", what)
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		j, ok := m.NextEventTimeout(time.Second, nil)
+		if !ok {
+			continue
+		}
+		ev := make(map[string]any)
+		if err := json.Unmarshal([]byte(j), &ev); err != nil {
+			t.Fatalf("bad event %q: %v", j, err)
+		}
+		if match(ev) {
+			return ev
 		}
 	}
+	t.Fatalf("timed out waiting for %s", what)
+	return nil
 }
 
 func TestE2EChat(t *testing.T) {
@@ -162,7 +168,7 @@ func TestE2EChat(t *testing.T) {
 	}
 	bobID := req["peer"].(string)
 	waitEvent(t, bob, "peer-pending on bob", func(ev map[string]any) bool { return ev["type"] == "peer-pending" })
-	if err := bob.SendText(aliceID, "m1", "hello from bob"); err != nil {
+	if err := bob.SendText(aliceID, "m1", "hello from bob", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := bob.SendFile(aliceID, "early", "bridge.go"); err != nil {
@@ -183,7 +189,7 @@ func TestE2EChat(t *testing.T) {
 		t.Errorf("alice got %v", msg)
 	}
 	waitEvent(t, bob, "peer-accepted on bob", func(ev map[string]any) bool { return ev["type"] == "peer-accepted" })
-	if err := alice.SendText(bobID, "m2", "hi bob 👋"); err != nil {
+	if err := alice.SendText(bobID, "m2", "hi bob 👋", ""); err != nil {
 		t.Fatal(err)
 	}
 	msg = waitEvent(t, bob, "alice's text on bob", func(ev map[string]any) bool { return ev["type"] == "message" })
@@ -254,7 +260,7 @@ func TestE2EChat(t *testing.T) {
 		t.Error("alice's identity should have changed")
 	}
 	waitEvent(t, alice, "peer-added (auto-accepted) on alice", func(ev map[string]any) bool { return ev["type"] == "peer-added" })
-	if err := bob.SendText(aliceID2, "m3", "hello again"); err != nil {
+	if err := bob.SendText(aliceID2, "m3", "hello again", ""); err != nil {
 		t.Fatal(err)
 	}
 	msg = waitEvent(t, alice, "post-reset text", func(ev map[string]any) bool { return ev["type"] == "message" })
@@ -302,7 +308,7 @@ func TestPeerStatusBothSides(t *testing.T) {
 
 	// A rename and a new picture reach alice live.
 	avatarSrc := filepath.Join(t.TempDir(), "face.png")
-	avatarBytes := []byte("not really a png but bytes travel fine")
+	avatarBytes := testPNG(t, 4, 3)
 	if err := os.WriteFile(avatarSrc, avatarBytes, 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -391,7 +397,7 @@ func TestRestartLoadsRestoredProfile(t *testing.T) {
 	carol := newTestManager(t, "carol", reg)
 
 	face := filepath.Join(t.TempDir(), "face.png")
-	if err := os.WriteFile(face, []byte("img"), 0644); err != nil {
+	if err := os.WriteFile(face, testPNG(t, 2, 2), 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := alice.SetProfile("Alice A", "", "", face, true); err != nil {
@@ -401,10 +407,10 @@ func TestRestartLoadsRestoredProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	backup := filepath.Join(t.TempDir(), "carol.json")
-	if err := carol.cfg.Vault.ExportAccount(backup); err != nil {
+	if err := carol.cfg.Vault.ExportAccount(backup, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := alice.cfg.Vault.ImportAccount(backup); err != nil {
+	if err := alice.cfg.Vault.ImportAccount(backup, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := alice.Restart(); err != nil {
@@ -518,7 +524,8 @@ func TestProfileReachesAcceptorAfterRequest(t *testing.T) {
 	bob := newTestManager(t, "bob", reg)
 
 	avatar := filepath.Join(t.TempDir(), "bob.png")
-	if err := os.WriteFile(avatar, []byte("bob-picture-bytes"), 0644); err != nil {
+	bobPic := testPNG(t, 5, 5)
+	if err := os.WriteFile(avatar, bobPic, 0644); err != nil {
 		t.Fatal(err)
 	}
 	if err := bob.SetProfile("Bobby", "climbs rocks", "on the ridge", avatar, true); err != nil {
@@ -546,7 +553,7 @@ func TestProfileReachesAcceptorAfterRequest(t *testing.T) {
 	if err != nil {
 		t.Fatalf("avatar not stored: %v", err)
 	}
-	if string(got) != "bob-picture-bytes" {
+	if !bytes.Equal(got, bobPic) {
 		t.Error("avatar bytes differ")
 	}
 
@@ -656,10 +663,192 @@ func TestSimultaneousDialsKeepOneConnection(t *testing.T) {
 	if dialer != min(aliceID, bobID) {
 		t.Errorf("kept the connection dialed by %v, want the smaller key", dialer)
 	}
-	if err := alice.SendText(bobID, "x1", "still here"); err != nil {
+	if err := alice.SendText(bobID, "x1", "still here", ""); err != nil {
 		t.Fatal(err)
 	}
 	waitEvent(t, bob, "text over the kept connection", func(ev map[string]any) bool {
 		return ev["type"] == "message" && ev["body"] == "still here"
 	})
+}
+
+// rawDial opens a chat-port connection to m without saying hello.
+func rawDial(t *testing.T, m *Manager) (net.Conn, string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	cl := tailcat.NewClient(tailcat.ConnBlob(m.Address()))
+	t.Cleanup(func() { cl.Close() })
+	for {
+		if _, err := cl.Ping(ctx); err == nil {
+			break
+		} else if ctx.Err() != nil {
+			t.Fatalf("pinging: %v", err)
+		}
+		time.Sleep(time.Second)
+	}
+	conn, err := cl.DialTCPPort(ctx, ChatPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { conn.Close() })
+	conn.SetDeadline(time.Now().Add(20 * time.Second))
+	return conn, cl.PublicKey().String()
+}
+
+// A proof is only good on the tunnel it was made for: bob's genuine
+// proof for some other connection key gets nowhere, and an old
+// protocol gets a readable reason.
+func TestHelloBoundToTunnelAndVersioned(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e in -short mode")
+	}
+	reg := devDERP(t, logger.Discard)
+	alice := newTestManager(t, "alice", reg)
+	bob := newTestManager(t, "bob", reg)
+	var alicePub key.NodePublic
+	if err := alicePub.UnmarshalText([]byte(alice.selfID)); err != nil {
+		t.Fatal(err)
+	}
+	bobKey := bob.identityKey()
+
+	conn, _ := rawDial(t, alice)
+	other := key.NewNode().Public().String()
+	writeMsgFrame(conn, &wireMsg{
+		T: "hello", V: protoVersion, VMin: protoMin, VMax: protoVersion, Key: bob.selfID, ConnKey: other,
+		Proof: bobKey.SealTo(alicePub, helloProof(other)),
+	})
+	if _, err := readHello(conn); err == nil {
+		t.Fatal("alice answered a proof made for another tunnel")
+	}
+
+	conn, connKey := rawDial(t, alice)
+	writeMsgFrame(conn, &wireMsg{
+		T: "hello", V: 1, Key: bob.selfID, ConnKey: connKey,
+		Proof: bobKey.SealTo(alicePub, helloProof(connKey)),
+	})
+	reply, err := readHello(conn)
+	if err != nil || reply.T != "error" || reply.Code != "version" || reply.Body == "" {
+		t.Fatalf("v1 hello got %+v, %v; want a version error", reply, err)
+	}
+	waitEvent(t, alice, "peer-error", func(ev map[string]any) bool {
+		return ev["type"] == "peer-error" && ev["code"] == "version" && ev["peer"] == bob.selfID
+	})
+}
+
+// acceptedPair connects bob to alice and has alice accept.
+func acceptedPair(t *testing.T) (alice, bob *Manager, aliceID, bobID string) {
+	reg := devDERP(t, logger.Discard)
+	alice = newTestManager(t, "alice", reg)
+	bob = newTestManager(t, "bob", reg)
+	aliceID, err := dialNow(bob, alice.Address())
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := waitEvent(t, alice, "request", func(ev map[string]any) bool { return ev["type"] == "peer-request" })
+	bobID = req["peer"].(string)
+	if req["fp"] == "" || req["verified"] != false {
+		t.Errorf("request lacks fp/verified: %v", req)
+	}
+	if err := alice.Accept(bobID); err != nil {
+		t.Fatal(err)
+	}
+	waitEvent(t, bob, "accepted", func(ev map[string]any) bool { return ev["type"] == "peer-accepted" })
+	return alice, bob, aliceID, bobID
+}
+
+func TestAcksRepliesReactionsTimers(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e in -short mode")
+	}
+	alice, bob, aliceID, bobID := acceptedPair(t)
+
+	if err := bob.SendText(aliceID, "m1", "first", ""); err != nil {
+		t.Fatal(err)
+	}
+	waitEvent(t, bob, "delivered m1", func(ev map[string]any) bool { return ev["type"] == "delivered" && ev["id"] == "m1" })
+	if err := alice.SendText(bobID, "m2", "answer", "m1"); err != nil {
+		t.Fatal(err)
+	}
+	msg := waitEvent(t, bob, "reply", func(ev map[string]any) bool { return ev["type"] == "message" && ev["id"] == "m2" })
+	if msg["reply"] != "m1" {
+		t.Errorf("reply lost: %v", msg)
+	}
+	waitEvent(t, alice, "delivered m2", func(ev map[string]any) bool { return ev["type"] == "delivered" && ev["id"] == "m2" })
+
+	if err := bob.SendReaction(aliceID, "r1", "m2", "👍"); err != nil {
+		t.Fatal(err)
+	}
+	re := waitEvent(t, alice, "react", func(ev map[string]any) bool { return ev["type"] == "react" })
+	if re["ref"] != "m2" || re["body"] != "👍" || re["peer"] != bobID {
+		t.Errorf("react = %v", re)
+	}
+	waitEvent(t, bob, "delivered r1", func(ev map[string]any) bool { return ev["type"] == "delivered" && ev["id"] == "r1" })
+
+	if err := alice.SendTimer(bobID, "t1", 3600); err != nil {
+		t.Fatal(err)
+	}
+	tm := waitEvent(t, bob, "peer-timer", func(ev map[string]any) bool { return ev["type"] == "peer-timer" })
+	if tm["seconds"] != float64(3600) {
+		t.Errorf("timer = %v", tm)
+	}
+
+	if err := alice.SetVerified(bobID, true); err != nil {
+		t.Fatal(err)
+	}
+	alice.Resync()
+	added := waitEvent(t, alice, "resynced peer", func(ev map[string]any) bool { return ev["type"] == "peer-added" })
+	if added["verified"] != true || added["fp"] != fingerprint(aliceID, bobID) {
+		t.Errorf("peer-added = %v", added)
+	}
+}
+
+// A transfer cut off midway resumes from the kept part.
+func TestFileResumes(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e in -short mode")
+	}
+	alice, bob, aliceID, bobID := acceptedPair(t)
+
+	blob := make([]byte, 3*chunkSize+777)
+	rand.Read(blob)
+	src := filepath.Join(t.TempDir(), "clip.mp4")
+	if err := os.WriteFile(src, blob, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// What an earlier, interrupted attempt left on alice's side.
+	part := alice.partPath(bobID + "\x00" + "f1")
+	os.MkdirAll(filepath.Dir(part), 0700)
+	f, err := os.OpenFile(part, os.O_RDWR|os.O_CREATE, 0600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w, _, err := alice.cfg.Vault.ResumePart(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(blob[:2*chunkSize]); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	if _, err := bob.SendFile(aliceID, "f1", src); err != nil {
+		t.Fatal(err)
+	}
+	begin := waitEvent(t, alice, "file-begin", func(ev map[string]any) bool { return ev["type"] == "file-begin" })
+	if begin["have"] != float64(2*chunkSize) {
+		t.Errorf("resumed from %v, want %d", begin["have"], 2*chunkSize)
+	}
+	done := waitEvent(t, alice, "file-done", func(ev map[string]any) bool { return ev["type"] == "file-done" })
+	got, err := alice.cfg.Vault.ReadMedia(done["path"].(string))
+	if err != nil || !bytes.Equal(got, blob) {
+		t.Fatalf("resumed file differs (err %v, %d bytes)", err, len(got))
+	}
+	waitEvent(t, bob, "file delivered", func(ev map[string]any) bool { return ev["type"] == "delivered" && ev["id"] == "f1" })
+	if _, err := os.Stat(part); !os.IsNotExist(err) {
+		t.Errorf("part left behind: %v", err)
+	}
+	if _, err := bob.SendFile(aliceID, "an-id-way-too-long", src); err == nil {
+		t.Error("an id longer than a blob frame holds was accepted")
+	}
 }

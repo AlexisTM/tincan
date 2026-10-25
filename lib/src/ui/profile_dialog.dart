@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
 import '../app_state.dart';
@@ -12,7 +11,7 @@ import 'text_input.dart';
 import 'toast.dart';
 
 Future<void> showProfileDialog(BuildContext context, AppState state) {
-  return showDialog(context: context, builder: (_) => ProfileDialog(state: state));
+  return showTincanDialog(context, (_) => ProfileDialog(state: state));
 }
 
 class ProfileDialog extends StatefulWidget {
@@ -29,8 +28,7 @@ class _ProfileDialogState extends State<ProfileDialog> {
   late final _status = PlainTextEditingController(text: widget.state.selfStatus);
   late final _desc = PlainTextEditingController(text: widget.state.selfDescription);
   String? _newAvatarSource;
-  String? _note;
-  bool _noteIsError = false;
+  String? _error;
   bool _busy = false;
 
   @override
@@ -64,80 +62,16 @@ class _ProfileDialogState extends State<ProfileDialog> {
     } else {
       setState(() {
         _busy = false;
-        _note = err;
-        _noteIsError = true;
+        _error = err;
       });
-    }
-  }
-
-  Future<void> _run(Future<String?> Function() op, String doneNote) async {
-    setState(() => _busy = true);
-    final err = await op();
-    if (!mounted) return;
-    setState(() {
-      _busy = false;
-      _note = err ?? doneNote;
-      _noteIsError = err != null;
-    });
-  }
-
-  Future<void> _saveAccount() async {
-    final target = await chooseSaveTarget('tincan-account.json',
-        const [XTypeGroup(label: 'Account', extensions: ['json'])]);
-    if (target == null) return;
-    await _run(() => target.write(widget.state.saveAccount),
-        'Account saved. The file contains your PRIVATE KEY — guard it like a password.');
-  }
-
-  Future<void> _restoreAccount() async {
-    final path = await pickFile(const [
-      XTypeGroup(label: 'Account', extensions: ['json'])
-    ]);
-    if (path == null) return;
-    try {
-      if (!mounted ||
-          !await confirmDialog(context,
-              title: 'Restore this account?',
-              body: 'Your current identity is replaced by the one in the backup, and every open conversation drops. Chat history on this device stays.',
-              action: 'Restore',
-              destructive: false) ||
-          !mounted) {
-        return;
-      }
-      await _run(() => widget.state.restoreAccount(path), 'Account restored.');
-    } finally {
-      // It holds the private key in plaintext.
-      await releasePicked(path);
-    }
-    if (mounted) {
-      _name.text = widget.state.selfName;
-      _status.text = widget.state.selfStatus;
-      _desc.text = widget.state.selfDescription;
-      setState(() {});
-    }
-  }
-
-  Future<void> _saveChats() async {
-    final target = await chooseSaveTarget(
-        'tincan-chats.zip', const [XTypeGroup(label: 'Chats', extensions: ['zip'])]);
-    if (target == null) return;
-    await _run(() => target.write(widget.state.saveChats),
-        'Chats saved (messages and shared media).');
-  }
-
-  Future<void> _restoreChats() async {
-    final path = await pickFile(const [XTypeGroup(label: 'Chats', extensions: ['zip'])]);
-    if (path == null) return;
-    try {
-      await _run(() => widget.state.restoreChats(path),
-          'Chats restored (merged with what was here).');
-    } finally {
-      await releasePicked(path);
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    // On a phone the keyboard would cover half the dialog straight away.
+    final wide = MediaQuery.sizeOf(context).width >= 700;
     final avatarPreview =
         _newAvatarSource ?? widget.state.plaintextPath(widget.state.selfAvatarPath);
     return Dialog(
@@ -152,8 +86,8 @@ class _ProfileDialogState extends State<ProfileDialog> {
               const Text('Your profile',
                   style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
               const SizedBox(height: 6),
-              const Text('Peers see all of this when you connect; changes reach them live.',
-                  style: TextStyle(fontSize: 12.5, color: Tc.inkMuted)),
+              Text('Peers see all of this when you connect; changes reach them live.',
+                  style: TextStyle(fontSize: 12.5, color: tc.inkMuted)),
               const SizedBox(height: 16),
               Row(children: [
                 AvatarCircle(
@@ -169,42 +103,21 @@ class _ProfileDialogState extends State<ProfileDialog> {
                 ),
               ]),
               const SizedBox(height: 16),
-              _field(_name, 'Nickname', maxLength: 40, autofocus: true),
+              _field(_name, 'Nickname', maxLength: 40, autofocus: wide),
               const SizedBox(height: 12),
               _field(_status, 'Status', maxLength: 80),
               const SizedBox(height: 12),
               _field(_desc, 'Description', maxLength: 300, lines: 3),
-              const SizedBox(height: 18),
-              Text('BACKUP', style: Tc.caps(Tc.label)),
-              const SizedBox(height: 8),
-              Row(children: [
-                Expanded(child: _ghostButton('Save account…', _saveAccount)),
-                const SizedBox(width: 8),
-                Expanded(child: _ghostButton('Restore account…', _restoreAccount)),
-              ]),
-              const SizedBox(height: 8),
-              Row(children: [
-                Expanded(child: _ghostButton('Save chats…', _saveChats)),
-                const SizedBox(width: 8),
-                Expanded(child: _ghostButton('Restore chats…', _restoreChats)),
-              ]),
-              const SizedBox(height: 6),
-              const Text(
-                  'The account file contains your private key. The chats file contains your history and shared media.',
-                  style: TextStyle(fontSize: 11.5, height: 1.4, color: Tc.inkFaint)),
-              if (_note != null) ...[
-                const SizedBox(height: 8),
-                Text(_note!,
-                    style: TextStyle(
-                        fontSize: 12,
-                        height: 1.4,
-                        color: _noteIsError ? Tc.danger : Tc.inkMuted)),
+              if (_error != null) ...[
+                const SizedBox(height: 10),
+                Text(_error!, style: TextStyle(fontSize: 12, height: 1.4, color: tc.danger)),
               ],
               const SizedBox(height: 16),
               Row(mainAxisAlignment: MainAxisAlignment.end, children: [
                 TextButton(
+                  style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
                   onPressed: _busy ? null : () => Navigator.of(context).pop(),
-                  child: const Text('Cancel', style: TextStyle(color: Tc.inkMuted)),
+                  child: const Text('Cancel'),
                 ),
                 const SizedBox(width: 8),
                 FilledButton(
@@ -237,13 +150,6 @@ class _ProfileDialogState extends State<ProfileDialog> {
         counterText: '',
         alignLabelWithHint: true,
       ),
-    );
-  }
-
-  Widget _ghostButton(String label, VoidCallback onTap) {
-    return OutlinedButton(
-      onPressed: _busy ? null : onTap,
-      child: Text(label, style: const TextStyle(fontSize: 12.5)),
     );
   }
 }

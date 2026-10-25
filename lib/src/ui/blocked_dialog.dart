@@ -5,7 +5,7 @@ import '../theme.dart';
 import 'toast.dart';
 
 Future<void> showBlockedDialog(BuildContext context, AppState state) {
-  return showDialog(context: context, builder: (_) => BlockedDialog(state: state));
+  return showTincanDialog(context, (_) => BlockedDialog(state: state));
 }
 
 class BlockedDialog extends StatelessWidget {
@@ -22,6 +22,7 @@ class BlockedDialog extends StatelessWidget {
         child: ListenableBuilder(
           listenable: state,
           builder: (context, _) {
+            final tc = TincanColors.of(context);
             final blocked = state.blockedPeers;
             return Column(
               mainAxisSize: MainAxisSize.min,
@@ -35,13 +36,13 @@ class BlockedDialog extends StatelessWidget {
                   IconButton(
                     tooltip: 'Close',
                     onPressed: () => Navigator.of(context).pop(),
-                    icon: const Icon(Icons.close, size: 18, color: Tc.inkMuted),
+                    icon: Icon(Icons.close, size: 18, color: tc.inkMuted),
                   ),
                 ]),
                 const SizedBox(height: 6),
-                const Text(
-                  'Blocked peers can\'t reach you at all — to them you look offline. Unblocking lets them send a new chat request.',
-                  style: TextStyle(fontSize: 12.5, height: 1.5, color: Tc.inkMuted),
+                Text(
+                  'Blocked peers can\'t reach you at all; to them you look offline. Unblocking lets them send a new chat request.',
+                  style: TextStyle(fontSize: 12.5, height: 1.5, color: tc.inkMuted),
                 ),
                 const SizedBox(height: 14),
                 if (blocked.isEmpty)
@@ -49,12 +50,12 @@ class BlockedDialog extends StatelessWidget {
                     width: double.infinity,
                     padding: const EdgeInsets.symmetric(vertical: 26),
                     decoration: BoxDecoration(
-                      color: const Color(0xFFF3F1EC),
+                      color: tc.fieldFill,
                       borderRadius: BorderRadius.circular(12),
                     ),
-                    child: const Text('Nobody is blocked.',
+                    child: Text('Nobody is blocked.',
                         textAlign: TextAlign.center,
-                        style: TextStyle(fontSize: 13, color: Tc.inkMuted)),
+                        style: TextStyle(fontSize: 13, color: tc.inkMuted)),
                   )
                 else
                   ConstrainedBox(
@@ -62,7 +63,7 @@ class BlockedDialog extends StatelessWidget {
                     child: ListView.separated(
                       shrinkWrap: true,
                       itemCount: blocked.length,
-                      separatorBuilder: (_, _) => const Divider(height: 1, color: Tc.border),
+                      separatorBuilder: (_, _) => Divider(height: 1, color: tc.border),
                       itemBuilder: (context, i) {
                         final b = blocked[i];
                         return Padding(
@@ -79,12 +80,12 @@ class BlockedDialog extends StatelessWidget {
                                   Text(b.shortKey,
                                       maxLines: 1,
                                       overflow: TextOverflow.ellipsis,
-                                      style: Tc.mono(11, Tc.inkFaint)),
+                                      style: Tc.mono(11, tc.inkFaint)),
                                 ],
                               ),
                             ),
                             OutlinedButton(
-                              style: Tc.accentOutline,
+                              style: tc.accentOutline,
                               onPressed: () => showError(context, state.unblockPeer(b.peer)),
                               child: const Text('Unblock'),
                             ),

@@ -3,6 +3,8 @@ package main
 import (
 	"testing"
 	"time"
+
+	"tincan.dev/gobridge/bridge"
 )
 
 func TestNewerPumpRetiresOlder(t *testing.T) {
@@ -27,11 +29,22 @@ func TestNewerPumpRetiresOlder(t *testing.T) {
 	}
 }
 
-func TestCarriedEventGoesToNewPump(t *testing.T) {
+func TestQueuedEventGoesToNewPump(t *testing.T) {
+	m := bridge.New(bridge.Config{})
+	mu.Lock()
+	mgr = m
+	mu.Unlock()
+	t.Cleanup(func() {
+		mu.Lock()
+		mgr = nil
+		mu.Unlock()
+	})
+	old := attachEvents()
+	m.Requeue(`{"type":"message"}`)
 	cur := attachEvents()
-	pumpMu.Lock()
-	carried = append(carried, `{"type":"message"}`)
-	pumpMu.Unlock()
+	if ev := nextEvent(old, time.Millisecond); ev != staleEvent {
+		t.Fatalf("old pump got %q", ev)
+	}
 	if ev := nextEvent(cur, time.Millisecond); ev != `{"type":"message"}` {
 		t.Fatalf("got %q", ev)
 	}

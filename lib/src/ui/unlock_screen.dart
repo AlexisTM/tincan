@@ -69,8 +69,9 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     final backup = _backup;
-    return _Sheet(
+    return SetupSheet(
       title: backup == null ? 'Protect your messages' : 'Recover your account',
       blurb: 'Your key, your conversations and everything people send you '
           'are encrypted on this device. Choose what unlocks them.',
@@ -79,18 +80,18 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
           Container(
             padding: const EdgeInsets.fromLTRB(12, 4, 4, 4),
             decoration: BoxDecoration(
-              border: Border.all(color: Tc.border),
+              border: Border.all(color: tc.border),
               borderRadius: BorderRadius.circular(10),
             ),
             child: Row(children: [
-              const Icon(Icons.restore, size: 18, color: Tc.inkMuted),
+              Icon(Icons.restore, size: 18, color: tc.inkMuted),
               const SizedBox(width: 8),
               Expanded(
                 child: Text(p.basename(backup),
                     overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 13)),
               ),
               TextButton(
-                style: TextButton.styleFrom(foregroundColor: Tc.inkMuted),
+                style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
                 onPressed: _dropBackup,
                 child: const Text('Start new instead', style: TextStyle(fontSize: 12.5)),
               ),
@@ -108,7 +109,7 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
           const SizedBox(height: 8),
           Center(
             child: TextButton(
-              style: TextButton.styleFrom(foregroundColor: Tc.inkMuted),
+              style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
               onPressed: _chooseBackup,
               child: const Text('Recover an account from a backup…',
                   style: TextStyle(fontSize: 12.5)),
@@ -120,7 +121,7 @@ class _VaultSetupScreenState extends State<VaultSetupScreen> {
   }
 }
 
-/// Device lock, password or no lock, with the password typed twice. Used
+/// Device lock or password, with the password typed twice. Used
 /// at setup and to change the lock later. Phones offer only the device
 /// lock until the user asks for the alternatives.
 class LockPicker extends StatefulWidget {
@@ -148,8 +149,9 @@ class LockPicker extends StatefulWidget {
 class _LockPickerState extends State<LockPicker> {
   final _password = PlainTextEditingController();
   final _confirm = PlainTextEditingController();
-  late LockMode _mode = widget.initial;
-  late bool _showAll = !(Platform.isAndroid || Platform.isIOS) || widget.initial != LockMode.device;
+  // Old stores may be unlocked; that is never offered again.
+  late LockMode _mode = LockMode.choices.contains(widget.initial) ? widget.initial : LockMode.device;
+  late bool _showAll = !(Platform.isAndroid || Platform.isIOS) || _mode != LockMode.device;
   bool _deviceAvailable = true;
   bool _busy = false;
   String? _error;
@@ -203,6 +205,7 @@ class _LockPickerState extends State<LockPicker> {
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     return Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
       RadioGroup<LockMode>(
         groupValue: _mode,
@@ -214,8 +217,6 @@ class _LockPickerState extends State<LockPicker> {
           if (_showAll || !_deviceAvailable) ...[
             _choice(LockMode.password, 'A password',
                 'Only you know it. There is no way to recover it.'),
-            _choice(LockMode.none, 'No lock',
-                'Tincan opens straight away, without asking.'),
           ],
         ]),
       ),
@@ -223,48 +224,26 @@ class _LockPickerState extends State<LockPicker> {
         Align(
           alignment: Alignment.centerLeft,
           child: TextButton(
-            style: TextButton.styleFrom(foregroundColor: Tc.inkMuted),
+            style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
             onPressed: () => setState(() => _showAll = true),
             child: const Text('Other options', style: TextStyle(fontSize: 12.5)),
           ),
         ),
-      if (_mode == LockMode.none) ...[
-        const SizedBox(height: 8),
-        Container(
-          padding: const EdgeInsets.all(12),
-          decoration: BoxDecoration(
-            color: Tc.relayAmberBg,
-            border: Border.all(color: Tc.relayAmberBorder),
-            borderRadius: BorderRadius.circular(10),
-          ),
-          child: const Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Icon(Icons.warning_amber_rounded, size: 18, color: Tc.relayAmberInk),
-            SizedBox(width: 8),
-            Expanded(
-              child: Text(
-                'Your messages stay encrypted, but anyone who can open this '
-                'device can read them and take over your identity.',
-                style: TextStyle(fontSize: 12, height: 1.4, color: Tc.relayAmberInk),
-              ),
-            ),
-          ]),
-        ),
-      ],
       if (_mode == LockMode.password) ...[
         const SizedBox(height: 8),
         _field(_password, 'Password'),
         const SizedBox(height: 8),
         _field(_confirm, 'Repeat password'),
         const SizedBox(height: 6),
-        const Text(
+        Text(
           'Forgetting it means losing the messages. Nothing is stored '
           'anywhere else, so nobody can reset it for you.',
-          style: TextStyle(fontSize: 12, height: 1.4, color: Tc.inkFaint),
+          style: TextStyle(fontSize: 12, height: 1.4, color: tc.inkFaint),
         ),
       ],
       if (_error != null) ...[
         const SizedBox(height: 10),
-        Text(_error!, style: const TextStyle(fontSize: 12.5, color: Tc.danger)),
+        Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
       ],
       const SizedBox(height: 20),
       _PrimaryButton(label: widget.action, busy: _busy, onPressed: _submit),
@@ -274,14 +253,11 @@ class _LockPickerState extends State<LockPicker> {
   Widget _choice(LockMode mode, String title, String blurb) => RadioRow(
       value: mode, title: title, blurb: blurb, onTap: () => setState(() => _mode = mode));
 
-  Widget _field(TextEditingController c, String label) => TextField(
+  Widget _field(TextEditingController c, String label) => PasswordField(
         controller: c,
-        obscureText: true,
+        label: label,
         enabled: !_busy,
-        autocorrect: false,
-        enableSuggestions: false,
-        onSubmitted: (_) => _submit(),
-        decoration: _inputDecoration(label),
+        onSubmitted: _submit,
       );
 }
 
@@ -293,11 +269,15 @@ class UnlockScreen extends StatefulWidget {
     required this.mode,
     required this.onUnlocked,
     required this.onErase,
+    this.autoUnlock = true,
   });
 
   final VaultManager vault;
   final LockMode mode;
   final VoidCallback onUnlocked;
+
+  /// Off after "Lock now", or a desktop keyring would reopen it at once.
+  final bool autoUnlock;
 
   /// Deletes everything here so setup can start over or recover.
   final Future<void> Function() onErase;
@@ -314,7 +294,7 @@ class _UnlockScreenState extends State<UnlockScreen> {
   @override
   void initState() {
     super.initState();
-    if (widget.mode == LockMode.device) {
+    if (widget.mode == LockMode.device && widget.autoUnlock) {
       WidgetsBinding.instance.addPostFrameCallback((_) => _unlock());
     }
   }
@@ -369,35 +349,36 @@ class _UnlockScreenState extends State<UnlockScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     final byPassword = widget.mode == LockMode.password;
-    return _Sheet(
+    return SetupSheet(
       title: 'Tincan is locked',
       blurb: byPassword
           ? 'Enter your password to open your messages.'
           : 'Unlock with your fingerprint, face or screen lock.',
       children: [
         if (byPassword) ...[
-          TextField(
+          PasswordField(
             controller: _password,
-            obscureText: true,
+            label: 'Password',
             autofocus: true,
             enabled: !_busy,
-            autocorrect: false,
-            enableSuggestions: false,
-            onSubmitted: (_) => _unlock(),
-            decoration: _inputDecoration('Password'),
+            onSubmitted: _unlock,
           ),
           const SizedBox(height: 12),
         ],
         if (_error != null) ...[
-          Text(_error!, style: const TextStyle(fontSize: 12.5, color: Tc.danger)),
+          Text(_error!, style: TextStyle(fontSize: 12.5, color: tc.danger)),
           const SizedBox(height: 12),
         ],
-        _PrimaryButton(label: byPassword ? 'Unlock' : 'Try again', busy: _busy, onPressed: _unlock),
+        _PrimaryButton(
+            label: byPassword || !widget.autoUnlock ? 'Unlock' : 'Try again',
+            busy: _busy,
+            onPressed: _unlock),
         const SizedBox(height: 8),
         Center(
           child: TextButton(
-            style: TextButton.styleFrom(foregroundColor: Tc.inkMuted),
+            style: TextButton.styleFrom(foregroundColor: tc.inkMuted),
             onPressed: _busy ? null : _erase,
             child: const Text("Can't unlock? Recover or start over…",
                 style: TextStyle(fontSize: 12.5)),
@@ -414,6 +395,53 @@ InputDecoration _inputDecoration(String label) => InputDecoration(
       contentPadding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
     );
 
+/// A password box with a show/hide toggle.
+class PasswordField extends StatefulWidget {
+  const PasswordField({
+    super.key,
+    required this.controller,
+    required this.label,
+    required this.onSubmitted,
+    this.enabled = true,
+    this.autofocus = false,
+  });
+
+  final TextEditingController controller;
+  final String label;
+  final VoidCallback onSubmitted;
+  final bool enabled;
+  final bool autofocus;
+
+  @override
+  State<PasswordField> createState() => _PasswordFieldState();
+}
+
+class _PasswordFieldState extends State<PasswordField> {
+  bool _shown = false;
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    return TextField(
+      controller: widget.controller,
+      obscureText: !_shown,
+      autofocus: widget.autofocus,
+      enabled: widget.enabled,
+      autocorrect: false,
+      enableSuggestions: false,
+      onSubmitted: (_) => widget.onSubmitted(),
+      decoration: _inputDecoration(widget.label).copyWith(
+        suffixIcon: IconButton(
+          tooltip: _shown ? 'Hide password' : 'Show password',
+          onPressed: () => setState(() => _shown = !_shown),
+          icon: Icon(_shown ? Icons.visibility_off_outlined : Icons.visibility_outlined,
+              size: 19, color: tc.inkMuted),
+        ),
+      ),
+    );
+  }
+}
+
 class _PrimaryButton extends StatelessWidget {
   const _PrimaryButton({required this.label, required this.busy, required this.onPressed});
 
@@ -423,10 +451,10 @@ class _PrimaryButton extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => SizedBox(
-        height: 46,
         width: double.infinity,
         child: FilledButton(
           style: FilledButton.styleFrom(
+            minimumSize: const Size.fromHeight(48),
             shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
           ),
           onPressed: busy ? null : onPressed,
@@ -438,8 +466,10 @@ class _PrimaryButton extends StatelessWidget {
       );
 }
 
-class _Sheet extends StatelessWidget {
-  const _Sheet({required this.title, required this.blurb, required this.children});
+/// Full-screen card the first-run and unlock steps sit on.
+class SetupSheet extends StatelessWidget {
+  const SetupSheet(
+      {super.key, required this.title, required this.blurb, required this.children});
 
   final String title;
   final String blurb;
@@ -447,8 +477,8 @@ class _Sheet extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     return Scaffold(
-      backgroundColor: Tc.bg,
       body: Center(
         child: SingleChildScrollView(
           padding: const EdgeInsets.all(24),
@@ -461,7 +491,7 @@ class _Sheet extends StatelessWidget {
                 Text(title, style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w700)),
                 const SizedBox(height: 8),
                 Text(blurb,
-                    style: const TextStyle(fontSize: 13.5, height: 1.5, color: Tc.inkMuted)),
+                    style: TextStyle(fontSize: 13.5, height: 1.5, color: tc.inkMuted)),
                 const SizedBox(height: 20),
                 ...children,
               ],

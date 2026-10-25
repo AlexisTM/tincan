@@ -1,56 +1,373 @@
+import 'dart:async';
 import 'dart:io';
 import 'dart:math';
 
+import 'package:desktop_drop/desktop_drop.dart';
 import 'package:flutter/material.dart';
-import 'package:open_filex/open_filex.dart';
+import 'package:flutter/services.dart';
 
 import '../app_state.dart';
 import '../models.dart';
 import '../theme.dart';
 import 'composer.dart';
+import 'image_viewer.dart';
+import 'media_video.dart';
+import 'message_actions.dart';
 import 'sidebar.dart';
 import 'toast.dart';
 
-class ThreadView extends StatelessWidget {
-  const ThreadView({super.key, required this.state, required this.convo, this.onBack});
+/// Consecutive messages from one side closer than this share a header.
+const _groupGap = Duration(minutes: 5);
+
+const _timerChoices = <(Duration?, String)>[
+  (null, 'Off'),
+  (Duration(hours: 1), '1 hour'),
+  (Duration(days: 1), '1 day'),
+  (Duration(days: 7), '1 week'),
+];
+
+String _timerLabel(Duration d) {
+  for (final (c, label) in _timerChoices) {
+    if (c == d) return label;
+  }
+  if (d.inDays >= 1) return '${d.inDays} d';
+  if (d.inHours >= 1) return '${d.inHours} h';
+  return '${max(1, d.inMinutes)} min';
+}
+
+final bool _isDesktop = Platform.isLinux || Platform.isWindows || Platform.isMacOS;
+
+class ThreadView extends StatefulWidget {
+  const ThreadView({
+    super.key,
+    required this.state,
+    required this.convo,
+    this.onBack,
+  });
 
   final AppState state;
   final Conversation convo;
   final VoidCallback? onBack;
 
   @override
+  State<ThreadView> createState() => _ThreadViewState();
+}
+
+class _ThreadViewState extends State<ThreadView> {
+  bool _dragging = false;
+  final _reply = ValueNotifier<ChatMessage?>(null);
+  final _scroll = ScrollController();
+  final _flash = ValueNotifier<String?>(null);
+  final _keys = <String, GlobalKey>{};
+  Timer? _flashTimer;
+
+  bool _searching = false;
+  final _query = TextEditingController();
+  List<String> _hits = const []; // message ids, newest first
+  int _hit = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    widget.state.focused.addListener(_onFocus);
+    _onFocus();
+  }
+
+  @override
+  void didUpdateWidget(ThreadView old) {
+    super.didUpdateWidget(old);
+    if (old.state != widget.state) {
+      old.state.focused.removeListener(_onFocus);
+      widget.state.focused.addListener(_onFocus);
+    }
+    if (old.convo.id == widget.convo.id) return;
+    _reply.value = null;
+    _keys.clear();
+    _closeSearch();
+    _onFocus();
+  }
+
+  // The focus may land before this thread is built, so wait a frame.
+  void _onFocus() {
+    final f = widget.state.focused.value;
+    if (f == null || f.$1 != widget.convo.id) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || widget.state.focused.value != f) return;
+      widget.state.focused.value = null;
+      unawaited(_scrollTo(f.$2));
+    });
+  }
+
+  @override
+  void dispose() {
+    widget.state.focused.removeListener(_onFocus);
+    _flashTimer?.cancel();
+    _reply.dispose();
+    _scroll.dispose();
+    _flash.dispose();
+    _query.dispose();
+    super.dispose();
+  }
+
+  Future<void> _dropped(DropDoneDetails details) async {
+    setState(() => _dragging = false);
+    final paths = [
+      for (final f in details.files)
+        if (f is! DropItemDirectory && f.path.isNotEmpty) f.path
+    ];
+    await sendFiles(context, widget.state, widget.convo, paths);
+  }
+
+  /// Scrolls the lazily built list until [id] is on screen, then flashes it.
+  Future<void> _scrollTo(String id) async {
+    final msgs = widget.convo.messages;
+    final target = msgs.indexWhere((m) => m.id == id);
+    if (target < 0) return;
+    for (var i = 0; i < 400 && mounted; i++) {
+      final ctx = _keys[id]?.currentContext;
+      if (ctx != null && ctx.mounted) {
+        _flashTimer?.cancel();
+        _flash.value = id;
+        _flashTimer = Timer(const Duration(milliseconds: 1400), () => _flash.value = null);
+        await Scrollable.ensureVisible(ctx,
+            alignment: 0.5, duration: const Duration(milliseconds: 250));
+        return;
+      }
+      if (!_scroll.hasClients) return;
+      final built = [
+        for (var j = 0; j < msgs.length; j++)
+          if (_keys[msgs[j].id]?.currentContext != null) j
+      ];
+      // Reversed list: older messages sit further along.
+      final older = built.isEmpty || target < built.reduce(min);
+      final pos = _scroll.position;
+      final step = pos.viewportDimension * 0.8;
+      final to = (pos.pixels + (older ? step : -step)).clamp(0.0, pos.maxScrollExtent);
+      if (to == pos.pixels) return;
+      _scroll.jumpTo(to);
+      await WidgetsBinding.instance.endOfFrame;
+    }
+  }
+
+  void _openSearch() => setState(() => _searching = true);
+
+  void _closeSearch() {
+    if (!_searching) return;
+    setState(() {
+      _searching = false;
+      _query.clear();
+      _hits = const [];
+      _hit = 0;
+    });
+  }
+
+  void _search(String q) {
+    final needle = q.trim().toLowerCase();
+    final msgs = widget.convo.messages;
+    setState(() {
+      _hits = needle.isEmpty
+          ? const []
+          : [
+              for (var i = msgs.length - 1; i >= 0; i--)
+                if (msgs[i].body.toLowerCase().contains(needle) ||
+                    (msgs[i].isMedia && (msgs[i].name?.toLowerCase().contains(needle) ?? false)))
+                  msgs[i].id
+            ];
+      _hit = 0;
+    });
+    if (_hits.isNotEmpty) unawaited(_scrollTo(_hits.first));
+  }
+
+  void _step(int by) {
+    if (_hits.isEmpty) return;
+    setState(() => _hit = (_hit + by) % _hits.length);
+    unawaited(_scrollTo(_hits[_hit]));
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ListenableBuilder(listenable: convo, builder: (context, _) {
+    final convo = widget.convo;
+    final peerError = widget.state.peerError(convo.id);
+    final thread = ListenableBuilder(listenable: convo, builder: (context, _) {
+      final tc = TincanColors.of(context);
       final gutter = MediaQuery.sizeOf(context).width < 700 ? 12.0 : 28.0;
       final msgs = convo.messages;
       return Column(children: [
-        _Header(state: state, convo: convo, onBack: onBack),
+        _Header(
+            state: widget.state, convo: convo, onBack: widget.onBack, onSearch: _openSearch),
+        if (_searching) _searchBar(tc),
+        if (peerError != null) _ErrorBanner(text: peerError),
         Expanded(
           child: msgs.isEmpty
               ? Center(
-                  child: Text('No messages yet — say hi to ${convo.name}.',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(fontSize: 13, color: Tc.inkMuted)),
+                  child: Padding(
+                    padding: const EdgeInsets.all(24),
+                    child: Text('No messages yet. Say hi to ${convo.displayName}.',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(fontSize: 13, color: tc.inkMuted)),
+                  ),
                 )
               : ListView.builder(
+                  controller: _scroll,
                   reverse: true,
                   padding: EdgeInsets.fromLTRB(gutter, 20, gutter, 8),
                   itemCount: msgs.length,
                   itemBuilder: (context, i) {
                     final idx = msgs.length - 1 - i;
                     final msg = msgs[idx];
+                    final next = idx + 1 < msgs.length ? msgs[idx + 1] : null;
+                    final groupedWithNext = next != null &&
+                        next.outgoing == msg.outgoing &&
+                        sameDay(next.ts, msg.ts) &&
+                        next.ts.difference(msg.ts) < _groupGap;
                     final row = Padding(
-                      padding: const EdgeInsets.only(bottom: 14),
-                      child: _MessageRow(state: state, convo: convo, msg: msg),
+                      key: _keys.putIfAbsent(msg.id, GlobalKey.new),
+                      padding: EdgeInsets.only(
+                          bottom: (groupedWithNext ? 3 : 14) + (msg.reactions.isEmpty ? 0 : 6)),
+                      child: ValueListenableBuilder(
+                        valueListenable: _flash,
+                        builder: (context, flash, child) => AnimatedContainer(
+                          duration: const Duration(milliseconds: 300),
+                          decoration: BoxDecoration(
+                            color: flash == msg.id
+                                ? tc.highlight.withValues(alpha: 0.14)
+                                : tc.highlight.withValues(alpha: 0),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: child,
+                        ),
+                        child: _MessageRow(
+                          state: widget.state,
+                          convo: convo,
+                          msg: msg,
+                          lastInGroup: !groupedWithNext,
+                          showStatus: !groupedWithNext || next.status != msg.status,
+                          onReply: (m) => _reply.value = m,
+                          onJump: (id) => widget.state.focusMessage(convo.id, id),
+                        ),
+                      ),
                     );
                     if (idx > 0 && sameDay(msgs[idx - 1].ts, msg.ts)) return row;
                     return Column(children: [_DayDivider(day: msg.ts), row]);
                   },
                 ),
         ),
-        Composer(key: ValueKey(convo.id), state: state, convo: convo),
+        Composer(key: ValueKey(convo.id), state: widget.state, convo: convo, reply: _reply),
       ]);
     });
+    if (!_isDesktop) return thread;
+    final tc = TincanColors.of(context);
+    return DropTarget(
+      onDragEntered: (_) => setState(() => _dragging = true),
+      onDragExited: (_) => setState(() => _dragging = false),
+      onDragDone: _dropped,
+      child: Stack(children: [
+        thread,
+        if (_dragging)
+          Positioned.fill(
+            child: IgnorePointer(
+              child: Container(
+                margin: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: tc.accentSoft.withValues(alpha: 0.85),
+                  border: Border.all(color: tc.accent, width: 2),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                alignment: Alignment.center,
+                child: Text('Drop to send to ${convo.displayName}',
+                    style: TextStyle(
+                        fontSize: 16, fontWeight: FontWeight.w600, color: tc.accent)),
+              ),
+            ),
+          ),
+      ]),
+    );
+  }
+
+  Widget _searchBar(TincanColors tc) {
+    final count = _query.text.trim().isEmpty
+        ? ''
+        : _hits.isEmpty
+            ? 'No matches'
+            : '${_hit + 1} of ${_hits.length}';
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 4, 8, 4),
+      decoration: BoxDecoration(
+        color: tc.panel,
+        border: Border(bottom: BorderSide(color: tc.border)),
+      ),
+      child: CallbackShortcuts(
+        bindings: {
+          const SingleActivator(LogicalKeyboardKey.escape): _closeSearch,
+          const SingleActivator(LogicalKeyboardKey.enter): () => _step(1),
+          const SingleActivator(LogicalKeyboardKey.enter, shift: true): () => _step(-1),
+        },
+        child: Row(children: [
+          Icon(Icons.search, size: 18, color: tc.inkMuted),
+          const SizedBox(width: 8),
+          Expanded(
+            child: TextField(
+              controller: _query,
+              autofocus: true,
+              onChanged: _search,
+              style: TextStyle(fontSize: 13.5, color: tc.ink),
+              decoration: InputDecoration.collapsed(
+                hintText: 'Search in this chat',
+                hintStyle: TextStyle(fontSize: 13.5, color: tc.inkFaint),
+              ).copyWith(enabledBorder: InputBorder.none, focusedBorder: InputBorder.none),
+            ),
+          ),
+          Semantics(
+            liveRegion: true,
+            child: Text(count, style: TextStyle(fontSize: 12, color: tc.inkMuted)),
+          ),
+          IconButton(
+            tooltip: 'Older match',
+            onPressed: _hits.isEmpty ? null : () => _step(1),
+            icon: Icon(Icons.keyboard_arrow_up, color: tc.inkMuted),
+          ),
+          IconButton(
+            tooltip: 'Newer match',
+            onPressed: _hits.isEmpty ? null : () => _step(-1),
+            icon: Icon(Icons.keyboard_arrow_down, color: tc.inkMuted),
+          ),
+          IconButton(
+            tooltip: 'Close search',
+            onPressed: _closeSearch,
+            icon: Icon(Icons.close, size: 18, color: tc.inkMuted),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+class _ErrorBanner extends StatelessWidget {
+  const _ErrorBanner({required this.text});
+
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    return Semantics(
+      liveRegion: true,
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        decoration: BoxDecoration(
+          color: tc.dangerBg,
+          border: Border(bottom: BorderSide(color: tc.dangerBorder)),
+        ),
+        child: Row(children: [
+          Icon(Icons.error_outline, size: 16, color: tc.dangerInk),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(text, style: TextStyle(fontSize: 12.5, height: 1.35, color: tc.dangerInk)),
+          ),
+        ]),
+      ),
+    );
   }
 }
 
@@ -61,62 +378,92 @@ class _DayDivider extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     return Padding(
       padding: const EdgeInsets.only(top: 4, bottom: 16),
       child: Row(children: [
-        const Expanded(child: Divider(color: Tc.border)),
+        Expanded(child: Divider(color: tc.border)),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 12),
-          child: Text(formatDay(day), style: const TextStyle(fontSize: 11, color: Tc.inkFaint)),
+          child: Text(formatDay(day), style: TextStyle(fontSize: 11, color: tc.inkFaint)),
         ),
-        const Expanded(child: Divider(color: Tc.border)),
+        Expanded(child: Divider(color: tc.border)),
       ]),
     );
   }
 }
 
 class _Header extends StatelessWidget {
-  const _Header({required this.state, required this.convo, this.onBack});
+  const _Header({required this.state, required this.convo, this.onBack, required this.onSearch});
 
   final AppState state;
   final Conversation convo;
   final VoidCallback? onBack;
+  final VoidCallback onSearch;
 
   Future<void> _confirmAndBlock(BuildContext context) async {
-    if (!await confirmDialog(context,
-        title: 'Block this peer?',
-        body: '${convo.name} won\'t be able to contact you again — to them you\'ll look offline. You can undo this from the blocked peers list.',
-        action: 'Block') ||
-        !context.mounted) {
-      return;
-    }
+    if (!await confirmBlock(context, convo.displayName) || !context.mounted) return;
     showError(context, state.blockPeer(convo.id));
   }
 
   Future<void> _confirmAndDelete(BuildContext context) async {
-    if (!await confirmDeleteConversation(context, convo.name) || !context.mounted) return;
+    if (!await confirmDeleteConversation(context, convo.displayName) || !context.mounted) return;
     if (onBack != null) onBack!();
     showError(context, state.deleteConversation(convo.id));
   }
 
+  Future<void> _pickTimer(BuildContext context) async {
+    final tc = TincanColors.of(context);
+    final picked = await showDialog<(Duration?,)>(
+      context: context,
+      builder: (context) => SimpleDialog(
+        title: const Text('Disappearing messages', style: TextStyle(fontSize: 17)),
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(24, 0, 24, 8),
+            child: Text('New messages in this chat vanish from both devices after this long.',
+                style: TextStyle(fontSize: 12.5, height: 1.45, color: tc.inkMuted)),
+          ),
+          for (final (d, label) in _timerChoices)
+            SimpleDialogOption(
+              onPressed: () => Navigator.of(context).pop((d,)),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: minTap),
+                child: Row(children: [
+                  Expanded(child: Text(label, style: const TextStyle(fontSize: 14))),
+                  if (convo.disappearAfter == d)
+                    Icon(Icons.check, size: 18, color: tc.accent, semanticLabel: 'Current'),
+                ]),
+              ),
+            ),
+        ],
+      ),
+    );
+    if (picked == null || picked.$1 == convo.disappearAfter) return;
+    await state.setDisappearing(convo.id, picked.$1);
+  }
+
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    final narrow = MediaQuery.sizeOf(context).width < 700;
+    final timer = convo.disappearAfter;
     return Container(
       padding: EdgeInsets.only(
           left: onBack == null ? 20 : 6,
           right: 8,
           top: MediaQuery.paddingOf(context).top),
-      height: 64 + MediaQuery.paddingOf(context).top,
-      decoration: const BoxDecoration(
-        color: Tc.panel,
-        border: Border(bottom: BorderSide(color: Tc.border)),
+      constraints: BoxConstraints(minHeight: 64 + MediaQuery.paddingOf(context).top),
+      decoration: BoxDecoration(
+        color: tc.panel,
+        border: Border(bottom: BorderSide(color: tc.border)),
       ),
       child: Row(children: [
         if (onBack != null)
           IconButton(
             onPressed: onBack,
             tooltip: 'Back',
-            icon: const Icon(Icons.arrow_back_ios_new, size: 18, color: Tc.ink),
+            icon: Icon(Icons.arrow_back_ios_new, size: 18, color: tc.ink),
           ),
         // One Expanded for everything left of the actions keeps them
         // pinned right whatever it holds.
@@ -135,43 +482,75 @@ class _Header extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Text(convo.name,
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                      Row(mainAxisSize: MainAxisSize.min, children: [
+                        Flexible(
+                          child: Text(convo.displayName,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style:
+                                  const TextStyle(fontSize: 15, fontWeight: FontWeight.w600)),
+                        ),
+                        if (convo.verified) ...[
+                          const SizedBox(width: 4),
+                          Icon(Icons.verified, size: 15, color: tc.accent, semanticLabel: 'Verified'),
+                        ],
+                        if (convo.muted) ...[
+                          const SizedBox(width: 4),
+                          Icon(Icons.notifications_off_outlined,
+                              size: 14, color: tc.inkFaint, semanticLabel: 'Muted'),
+                        ],
+                        if (timer != null) ...[
+                          const SizedBox(width: 6),
+                          Tooltip(
+                            message: 'Messages disappear after ${_timerLabel(timer)}',
+                            child: Row(mainAxisSize: MainAxisSize.min, children: [
+                              Icon(Icons.timer_outlined, size: 14, color: tc.inkMuted),
+                              const SizedBox(width: 2),
+                              Text(_timerLabel(timer),
+                                  style: TextStyle(fontSize: 11.5, color: tc.inkMuted)),
+                            ]),
+                          ),
+                        ],
+                      ]),
                       if (convo.statusText.isNotEmpty)
                         Text(convo.statusText,
                             maxLines: 1,
                             overflow: TextOverflow.ellipsis,
-                            style: const TextStyle(fontSize: 11.5, color: Tc.inkMuted)),
+                            style: TextStyle(fontSize: 11.5, color: tc.inkMuted)),
                     ],
                   ),
                 ),
                 const SizedBox(width: 12),
-                Flexible(child: _StatusPill(convo: convo)),
+                Flexible(child: _StatusPill(convo: convo, showPath: !narrow)),
               ]),
             ),
           ),
         ),
         if (convo.blocked)
           OutlinedButton(
-            style: Tc.accentOutline,
+            style: tc.accentOutline,
             onPressed: () => showError(context, state.unblockPeer(convo.id)),
             child: const Text('Unblock'),
           )
         else if (!convo.connected && convo.token != null)
           OutlinedButton(
-            style: Tc.accentOutline,
+            style: tc.accentOutline,
             onPressed: () => showError(context, state.reconnect(convo.id)),
             child: const Text('Reconnect'),
           ),
         PopupMenuButton<String>(
           tooltip: 'Conversation options',
-          icon: const Icon(Icons.more_vert, size: 18, color: Tc.inkMuted),
+          icon: Icon(Icons.more_vert, size: 18, color: tc.inkMuted),
           onSelected: (v) async {
             switch (v) {
               case 'profile':
-                showPeerProfileDialog(context, state, convo);
+                await showPeerProfileDialog(context, state, convo);
+              case 'search':
+                onSearch();
+              case 'timer':
+                await _pickTimer(context);
+              case 'mute':
+                state.setMuted(convo.id, !convo.muted);
               case 'block':
                 await _confirmAndBlock(context);
               case 'delete':
@@ -179,225 +558,497 @@ class _Header extends StatelessWidget {
             }
           },
           itemBuilder: (context) => [
-            const PopupMenuItem(
-              value: 'profile',
-              child: Text('View profile', style: TextStyle(fontSize: 13.5)),
-            ),
-            const PopupMenuItem(
-              value: 'delete',
-              child: Text('Delete conversation', style: TextStyle(fontSize: 13.5)),
-            ),
-            if (!convo.blocked)
-              const PopupMenuItem(
-                value: 'block',
-                child: Text('Block peer', style: TextStyle(fontSize: 13.5)),
-              ),
+            _item('profile', 'Contact info'),
+            _item('search', 'Search in chat'),
+            _item('timer', 'Disappearing messages'),
+            _item('mute', convo.muted ? 'Unmute' : 'Mute'),
+            _item('delete', 'Delete conversation'),
+            if (!convo.blocked) _item('block', 'Block peer'),
           ],
         ),
       ]),
     );
   }
+
+  static PopupMenuItem<String> _item(String value, String label) =>
+      PopupMenuItem(value: value, child: Text(label, style: const TextStyle(fontSize: 13.5)));
 }
 
-/// Read-only view of a peer's shared profile.
+/// The peer's profile, with our nickname for them and the safety number.
 Future<void> showPeerProfileDialog(
     BuildContext context, AppState state, Conversation convo) {
-  return showDialog(
-    context: context,
-    builder: (context) => Dialog(
-      child: Container(
-        width: 380,
-        padding: const EdgeInsets.all(24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Row(children: [
-              PeerAvatar(state: state, convo: convo, size: 52),
-              const SizedBox(width: 14),
-              Expanded(
-                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  Text(convo.name,
-                      style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
-                  if (convo.statusText.isNotEmpty)
-                    Text(convo.statusText,
-                        style: const TextStyle(fontSize: 12.5, color: Tc.inkMuted)),
-                ]),
-              ),
-            ]),
-            if (convo.description.isNotEmpty) ...[
-              const SizedBox(height: 14),
-              Text(convo.description, style: const TextStyle(fontSize: 13, height: 1.5)),
-            ],
-            const SizedBox(height: 14),
-            SelectableText(convo.id, style: Tc.mono(11, Tc.inkFaint)),
-            const SizedBox(height: 8),
-            Align(
-              alignment: Alignment.centerRight,
-              child: TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Close', style: TextStyle(color: Tc.inkMuted)),
-              ),
-            ),
-          ],
-        ),
-      ),
-    ),
+  return showTincanDialog(
+    context,
+    (context) => Dialog(child: _PeerProfile(state: state, convo: convo)),
   );
 }
 
-class _StatusPill extends StatelessWidget {
-  const _StatusPill({required this.convo});
+class _PeerProfile extends StatefulWidget {
+  const _PeerProfile({required this.state, required this.convo});
 
+  final AppState state;
   final Conversation convo;
 
   @override
-  Widget build(BuildContext context) {
-    if (convo.blocked) {
-      return _pill(const Color(0xFFF3E4E1), const Color(0xFFE3C6C1),
-          Tc.danger, const Color(0xFF8A2E24), 'Blocked');
-    }
-    if (convo.connected && convo.remotePending) {
-      return _pill(Tc.relayAmberBg, Tc.relayAmberBorder, Tc.relayAmber,
-          Tc.relayAmberInk, 'Waiting for acceptance…');
-    }
-    const grey = (Color(0xFFEFEDE8), Tc.border, Tc.offline, Tc.inkMuted);
-    final latency = convo.latencyMs == null ? '' : ' · ${convo.latencyMs} ms';
-    final ((bg, border, dot, ink), label) = switch ((convo.connected, convo.direct)) {
-      (false, _) => (grey, convo.reconnecting ? 'Reconnecting…' : 'Disconnected'),
-      (true, null) => (grey, 'Connected'),
-      (true, true) => (
-          (Tc.directGreenBg, Tc.directGreenBorder, Tc.directGreen, Tc.directGreenInk),
-          'Direct${convo.pathAddr.isEmpty ? '' : ' · ${convo.pathAddr}'}$latency'
-        ),
-      (true, false) => (
-          (Tc.relayAmberBg, Tc.relayAmberBorder, Tc.relayAmber, Tc.relayAmberInk),
-          'Relay${convo.relay.isEmpty ? '' : ' (${convo.relay})'}$latency'
-        ),
-    };
-    return _pill(bg, border, dot, ink, label);
+  State<_PeerProfile> createState() => _PeerProfileState();
+}
+
+class _PeerProfileState extends State<_PeerProfile> {
+  late final _nickname = TextEditingController(text: widget.convo.nickname ?? '');
+  bool _busy = false;
+
+  @override
+  void dispose() {
+    _nickname.dispose();
+    super.dispose();
   }
 
-  Widget _pill(Color bg, Color border, Color dot, Color ink, String label) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
-      decoration: BoxDecoration(
-        color: bg,
-        border: Border.all(color: border),
-        borderRadius: BorderRadius.circular(999),
-      ),
-      child: Row(mainAxisSize: MainAxisSize.min, children: [
-        Container(
-            width: 7, height: 7, decoration: BoxDecoration(color: dot, shape: BoxShape.circle)),
-        const SizedBox(width: 7),
-        Flexible(
-          child: Text(label,
-              maxLines: 1, overflow: TextOverflow.ellipsis, style: Tc.mono(11.5, ink)),
-        ),
-      ]),
+  void _rename() {
+    widget.state.setNickname(widget.convo.id, _nickname.text);
+    _nickname.text = widget.convo.nickname ?? '';
+    showToast(context, widget.convo.nickname == null ? 'Name cleared' : 'Renamed');
+  }
+
+  Future<void> _verify(bool on) async {
+    setState(() => _busy = true);
+    final error = await widget.state.setVerified(widget.convo.id, on);
+    if (!mounted) return;
+    setState(() => _busy = false);
+    showToast(context, error ?? (on ? 'Marked as verified' : 'No longer verified'));
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    final state = widget.state;
+    return ListenableBuilder(
+      listenable: widget.convo,
+      builder: (context, _) {
+        final convo = widget.convo;
+        return Container(
+          width: 420,
+          padding: const EdgeInsets.all(24),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(children: [
+                  PeerAvatar(state: state, convo: convo, size: 52),
+                  const SizedBox(width: 14),
+                  Expanded(
+                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                      Row(children: [
+                        Flexible(
+                          child: Text(convo.displayName,
+                              style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
+                        ),
+                        if (convo.verified) ...[
+                          const SizedBox(width: 6),
+                          Icon(Icons.verified, size: 17, color: tc.accent, semanticLabel: 'Verified'),
+                        ],
+                      ]),
+                      if (convo.nickname != null)
+                        Text('Calls themselves ${convo.name}',
+                            style: TextStyle(fontSize: 12.5, color: tc.inkMuted)),
+                      if (convo.statusText.isNotEmpty)
+                        Text(convo.statusText,
+                            style: TextStyle(fontSize: 12.5, color: tc.inkMuted)),
+                    ]),
+                  ),
+                ]),
+                if (convo.description.isNotEmpty) ...[
+                  const SizedBox(height: 14),
+                  Text(convo.description, style: const TextStyle(fontSize: 13, height: 1.5)),
+                ],
+                const SizedBox(height: 18),
+                Text('YOUR NAME FOR THEM', style: Tc.caps(tc.label)),
+                const SizedBox(height: 6),
+                Row(children: [
+                  Expanded(
+                    child: TextField(
+                      controller: _nickname,
+                      onSubmitted: (_) => _rename(),
+                      style: TextStyle(fontSize: 13.5, color: tc.ink),
+                      decoration: InputDecoration(
+                        isDense: true,
+                        hintText: convo.name,
+                        hintStyle: TextStyle(fontSize: 13.5, color: tc.inkFaint),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  OutlinedButton(
+                      style: tc.accentOutline, onPressed: _rename, child: const Text('Rename')),
+                ]),
+                const SizedBox(height: 18),
+                Text('CONNECTION', style: Tc.caps(tc.label)),
+                const SizedBox(height: 4),
+                Text(_linkDetail(convo, withPath: true),
+                    style: TextStyle(fontSize: 12.5, color: tc.inkMuted)),
+                const SizedBox(height: 18),
+                Text('SAFETY NUMBER', style: Tc.caps(tc.label)),
+                const SizedBox(height: 4),
+                if (convo.fp.isEmpty)
+                  Text('Shown once you have connected.',
+                      style: TextStyle(fontSize: 12.5, color: tc.inkMuted))
+                else ...[
+                  Row(children: [
+                    Expanded(
+                      child: SelectableText(convo.fp,
+                          style: Tc.mono(16, tc.ink, weight: FontWeight.w600)),
+                    ),
+                    IconButton(
+                      tooltip: 'Copy safety number',
+                      onPressed: () {
+                        Clipboard.setData(ClipboardData(text: convo.fp));
+                        showToast(context, 'Safety number copied');
+                      },
+                      icon: Icon(Icons.copy_outlined, size: 16, color: tc.inkMuted),
+                    ),
+                  ]),
+                  Text('Compare this number with your contact in person or on a call.',
+                      style: TextStyle(fontSize: 12, height: 1.45, color: tc.inkMuted)),
+                  const SizedBox(height: 10),
+                  if (convo.verified)
+                    Row(children: [
+                      Icon(Icons.verified, size: 16, color: tc.accent),
+                      const SizedBox(width: 6),
+                      Expanded(
+                        child: Text('Verified',
+                            style: TextStyle(fontSize: 13, color: tc.accent, fontWeight: FontWeight.w600)),
+                      ),
+                      TextButton(
+                        onPressed: _busy ? null : () => _verify(false),
+                        child: Text('Unverify', style: TextStyle(color: tc.inkMuted)),
+                      ),
+                    ])
+                  else
+                    OutlinedButton.icon(
+                      style: tc.accentOutline,
+                      onPressed: _busy ? null : () => _verify(true),
+                      icon: const Icon(Icons.verified_outlined, size: 16),
+                      label: const Text('Mark as verified'),
+                    ),
+                ],
+                const SizedBox(height: 8),
+                Align(
+                  alignment: Alignment.centerRight,
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    child: Text('Close', style: TextStyle(color: tc.inkMuted)),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }
 
-class _MessageRow extends StatelessWidget {
-  const _MessageRow({required this.state, required this.convo, required this.msg});
+/// Direct · 203.0.113.7:41641 · 14 ms, for tooltips and the profile.
+String _linkDetail(Conversation c, {required bool withPath}) {
+  if (c.blocked) return 'Blocked';
+  if (!c.connected) return c.reconnecting ? 'Reconnecting' : 'Not connected';
+  if (c.awaitingDirect) return 'Connected through the relay, waiting for a direct path';
+  final latency = c.latencyMs == null ? '' : ' · ${c.latencyMs} ms';
+  return switch (c.direct) {
+    true => 'Direct${withPath && c.pathAddr.isNotEmpty ? ' · ${c.pathAddr}' : ''}$latency',
+    false => 'Relayed${c.relay.isEmpty ? '' : ' via ${c.relay}'}$latency',
+    null => 'Connected$latency',
+  };
+}
+
+class _StatusPill extends StatelessWidget {
+  const _StatusPill({required this.convo, required this.showPath});
+
+  final Conversation convo;
+  final bool showPath;
+
+  @override
+  Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    final grey = (tc.fieldFill, tc.border, tc.offline, tc.inkMuted);
+    final amber = (tc.relayAmberBg, tc.relayAmberBorder, tc.relayAmber, tc.relayAmberInk);
+    final ((bg, border, dot, ink), label) = switch (convo) {
+      Conversation(blocked: true) =>
+        ((tc.dangerBg, tc.dangerBorder, tc.danger, tc.dangerInk), 'Blocked'),
+      Conversation(connected: true, remotePending: true) => (amber, 'Waiting for acceptance…'),
+      Conversation(connected: true, awaitingDirect: true) => (amber, 'Waiting for a direct path'),
+      Conversation(connected: false) =>
+        (grey, convo.reconnecting ? 'Reconnecting…' : 'Disconnected'),
+      Conversation(direct: true) =>
+        ((tc.directGreenBg, tc.directGreenBorder, tc.directGreen, tc.directGreenInk), 'Direct'),
+      Conversation(direct: false) => (amber, 'Relayed'),
+      _ => (grey, 'Connected'),
+    };
+    return Tooltip(
+      message: _linkDetail(convo, withPath: showPath),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
+        decoration: BoxDecoration(
+          color: bg,
+          border: Border.all(color: border),
+          borderRadius: BorderRadius.circular(999),
+        ),
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Container(
+              width: 7, height: 7, decoration: BoxDecoration(color: dot, shape: BoxShape.circle)),
+          const SizedBox(width: 7),
+          Flexible(
+            child: Text(label,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500, color: ink)),
+          ),
+        ]),
+      ),
+    );
+  }
+}
+
+class _MessageRow extends StatefulWidget {
+  const _MessageRow({
+    required this.state,
+    required this.convo,
+    required this.msg,
+    required this.lastInGroup,
+    required this.showStatus,
+    required this.onReply,
+    required this.onJump,
+  });
 
   final AppState state;
   final Conversation convo;
   final ChatMessage msg;
 
+  /// Only the last of a run shows the avatar and the time.
+  final bool lastInGroup;
+  final bool showStatus;
+  final ValueChanged<ChatMessage> onReply;
+  final ValueChanged<String> onJump;
+
+  @override
+  State<_MessageRow> createState() => _MessageRowState();
+}
+
+class _MessageRowState extends State<_MessageRow> {
+  bool _hover = false;
+
+  ChatMessage get msg => widget.msg;
+
+  void _actions(Offset? at) => unawaited(showMessageActions(context,
+      state: widget.state, convo: widget.convo, msg: msg, onReply: widget.onReply, at: at));
+
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    final state = widget.state;
+    final convo = widget.convo;
     final maxBubble = min(460.0, MediaQuery.sizeOf(context).width * 0.72);
-    final time = Text(formatClock(msg.ts), style: const TextStyle(fontSize: 11, color: Tc.inkFaint));
+    final status = msg.outgoing ? _statusIcon(tc) : null;
+    final meta = Row(mainAxisSize: MainAxisSize.min, children: [
+      if (msg.expiresAt != null) ...[
+        Icon(Icons.timer_outlined, size: 11, color: tc.inkFaint, semanticLabel: 'Disappearing'),
+        const SizedBox(width: 3),
+      ],
+      if (widget.lastInGroup)
+        Text(formatClock(msg.ts), style: TextStyle(fontSize: 11, color: tc.inkFaint)),
+      if (status != null) ...[
+        if (widget.lastInGroup) const SizedBox(width: 4),
+        status,
+      ],
+    ]);
+    final quoted = msg.replyTo == null ? null : convo.messageById(msg.replyTo!);
+    final body = msg.kind == MessageKind.text
+        ? _TextBubble(
+            msg: msg,
+            tail: widget.lastInGroup,
+            quote: msg.replyTo == null
+                ? null
+                : ReplyQuote(
+                    convo: convo,
+                    quoted: quoted,
+                    onDark: msg.outgoing,
+                    onTap: quoted == null ? null : () => widget.onJump(quoted.id),
+                  ),
+          )
+        : _MediaBubble(state: state, convo: convo, msg: msg, width: min(280, maxBubble - 12));
     final bubble = Flexible(
       child: ConstrainedBox(
         constraints: BoxConstraints(maxWidth: maxBubble),
-        child: msg.kind == MessageKind.text
-            ? _TextBubble(msg: msg)
-            : _MediaBubble(state: state, msg: msg, width: min(280, maxBubble - 12)),
+        child: GestureDetector(
+          onLongPress: () => _actions(null),
+          onSecondaryTapUp: (d) => _actions(d.globalPosition),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: msg.outgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+            children: [
+              body,
+              if (msg.reactions.isNotEmpty)
+                Transform.translate(
+                  offset: const Offset(0, -8),
+                  child: Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    child: ReactionChips(
+                        msg: msg, onToggle: (e) => state.react(convo.id, msg.id, e)),
+                  ),
+                ),
+            ],
+          ),
+        ),
       ),
     );
+    final hoverButton = !_isDesktop
+        ? null
+        : Visibility.maintain(
+            visible: _hover,
+            child: Builder(
+              builder: (context) => IconButton(
+                visualDensity: VisualDensity.compact,
+                tooltip: 'Message actions',
+                onPressed: () {
+                  final box = context.findRenderObject()! as RenderBox;
+                  _actions(box.localToGlobal(box.size.bottomCenter(Offset.zero)));
+                },
+                icon: Icon(Icons.more_horiz, size: 18, color: tc.inkMuted),
+              ),
+            ),
+          );
     final children = msg.outgoing
-        ? [time, const SizedBox(width: 10), bubble]
+        ? [?hoverButton, meta, const SizedBox(width: 8), bubble]
         : [
-            PeerAvatar(state: state, convo: convo, size: 30),
+            if (widget.lastInGroup)
+              PeerAvatar(state: state, convo: convo, size: 30)
+            else
+              const SizedBox(width: 30),
             const SizedBox(width: 10),
             bubble,
-            const SizedBox(width: 10),
-            time,
+            const SizedBox(width: 8),
+            meta,
+            ?hoverButton,
           ];
-    return Column(
-      crossAxisAlignment: msg.outgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: msg.outgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
-          crossAxisAlignment: CrossAxisAlignment.end,
-          children: children,
-        ),
-        if (msg.status == MessageStatus.interrupted)
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
-            child: Text('Transfer interrupted',
-                style: TextStyle(fontSize: 11, color: Tc.danger)),
-          )
-        else if (msg.status == MessageStatus.failed)
-          InkWell(
-            borderRadius: BorderRadius.circular(6),
-            onTap: () => state.retry(convo.id, msg),
-            child: const Padding(
-              padding: EdgeInsets.symmetric(horizontal: 4, vertical: 3),
-              child: Text('Couldn\'t send · tap to retry',
-                  style: TextStyle(fontSize: 11, color: Tc.danger)),
-            ),
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hover = true),
+      onExit: (_) => setState(() => _hover = false),
+      child: Column(
+        crossAxisAlignment: msg.outgoing ? CrossAxisAlignment.end : CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: msg.outgoing ? MainAxisAlignment.end : MainAxisAlignment.start,
+            crossAxisAlignment: CrossAxisAlignment.end,
+            children: children,
           ),
-      ],
+          if (msg.status == MessageStatus.interrupted)
+            Padding(
+              padding: const EdgeInsets.only(left: 44, top: 3),
+              child: Text('Transfer interrupted',
+                  style: TextStyle(fontSize: 11, color: tc.danger)),
+            )
+          else if (msg.status == MessageStatus.failed)
+            InkWell(
+              borderRadius: BorderRadius.circular(6),
+              onTap: () => state.retry(convo.id, msg),
+              child: ConstrainedBox(
+                constraints: BoxConstraints(minHeight: minTap),
+                child: Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 4),
+                  child: Row(mainAxisSize: MainAxisSize.min, children: [
+                    Icon(Icons.refresh, size: 14, color: tc.danger),
+                    const SizedBox(width: 4),
+                    Text('Couldn\'t send · tap to retry',
+                        style: TextStyle(fontSize: 11.5, color: tc.danger)),
+                  ]),
+                ),
+              ),
+            ),
+        ],
+      ),
     );
+  }
+
+  /// Clock while queued, arrow while sending, check once sent, double
+  /// check once delivered. A run shows sent/delivered once, unless it differs.
+  Widget? _statusIcon(TincanColors tc) {
+    Icon icon(IconData i, String label, [Color? color]) =>
+        Icon(i, size: 13, color: color ?? tc.inkFaint, semanticLabel: label);
+    return switch (msg.status) {
+      MessageStatus.queued => icon(Icons.schedule, 'Waiting to send'),
+      MessageStatus.sending => icon(Icons.arrow_upward, 'Sending'),
+      MessageStatus.failed => icon(Icons.error_outline, 'Not sent', tc.danger),
+      MessageStatus.sent when widget.showStatus => icon(Icons.check, 'Sent'),
+      MessageStatus.delivered when widget.showStatus => icon(Icons.done_all, 'Delivered', tc.accent),
+      _ => null,
+    };
   }
 }
 
 class _TextBubble extends StatelessWidget {
-  const _TextBubble({required this.msg});
+  const _TextBubble({required this.msg, required this.tail, this.quote});
 
   final ChatMessage msg;
+  final bool tail;
+  final Widget? quote;
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     final out = msg.outgoing;
+    final corner = tail ? 5.0 : 16.0;
+    // Plain Text: long-press and right-click open the message menu, which has Copy.
+    final text = Text(
+      msg.body,
+      style: TextStyle(fontSize: 13.5, height: 1.45, color: out ? tc.bubbleOutInk : tc.ink),
+    );
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       decoration: BoxDecoration(
-        color: out ? Tc.bubbleOut : Tc.bubbleIn,
-        border: out ? null : Border.all(color: Tc.bubbleInBorder),
+        color: out ? tc.bubbleOut : tc.bubbleIn,
+        border: out ? null : Border.all(color: tc.bubbleInBorder),
         borderRadius: BorderRadius.only(
           topLeft: const Radius.circular(16),
           topRight: const Radius.circular(16),
-          bottomLeft: Radius.circular(out ? 16 : 5),
-          bottomRight: Radius.circular(out ? 5 : 16),
+          bottomLeft: Radius.circular(out ? 16 : corner),
+          bottomRight: Radius.circular(out ? corner : 16),
         ),
       ),
-      child: SelectableText(
-        msg.body,
-        style: TextStyle(fontSize: 13.5, height: 1.45, color: out ? Tc.bubbleOutInk : Tc.ink),
-      ),
+      child: quote == null
+          ? text
+          : IntrinsicWidth(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+                quote!,
+                const SizedBox(height: 6),
+                text,
+              ]),
+            ),
     );
   }
 }
 
 class _MediaBubble extends StatelessWidget {
-  const _MediaBubble({required this.state, required this.msg, required this.width});
+  const _MediaBubble({
+    required this.state,
+    required this.convo,
+    required this.msg,
+    required this.width,
+  });
 
   final AppState state;
+  final Conversation convo;
   final ChatMessage msg;
   final double width;
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
+    final out = msg.outgoing;
     return Container(
       padding: const EdgeInsets.all(6),
       decoration: BoxDecoration(
-        color: Tc.bubbleIn,
-        border: Border.all(color: Tc.bubbleInBorder),
+        color: out ? tc.mediaOut : tc.bubbleIn,
+        border: Border.all(color: out ? tc.mediaOutBorder : tc.bubbleInBorder),
         borderRadius: BorderRadius.circular(16),
       ),
       child: Column(
@@ -406,7 +1057,7 @@ class _MediaBubble extends StatelessWidget {
         children: [
           ValueListenableBuilder(
             valueListenable: msg.progress,
-            builder: (context, progress, _) => _mediaBody(context, progress),
+            builder: (context, progress, _) => _mediaBody(context, tc, progress),
           ),
           Padding(
             padding: const EdgeInsets.fromLTRB(6, 7, 6, 3),
@@ -415,11 +1066,11 @@ class _MediaBubble extends StatelessWidget {
                 child: Text(msg.name ?? 'file',
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
-                    style: Tc.mono(11, Tc.inkMuted)),
+                    style: Tc.mono(11, tc.inkMuted)),
               ),
               const SizedBox(width: 12),
               Text(msg.size == null ? '' : formatSize(msg.size!),
-                  style: Tc.mono(11, Tc.inkFaint)),
+                  style: Tc.mono(11, tc.inkFaint)),
             ]),
           ),
         ],
@@ -427,29 +1078,42 @@ class _MediaBubble extends StatelessWidget {
     );
   }
 
-  Widget _mediaBody(BuildContext context, double? progress) {
+  bool get _settled =>
+      msg.status != MessageStatus.sending &&
+      msg.status != MessageStatus.failed &&
+      msg.status != MessageStatus.interrupted;
+
+  Widget _mediaBody(BuildContext context, TincanColors tc, double? progress) {
     final sealed = msg.path;
-    if (progress != null || sealed == null || msg.status != MessageStatus.sent) {
-      return _placeholder(progress: progress);
+    if (progress != null || sealed == null || !_settled) {
+      return _placeholder(tc, progress: progress);
+    }
+    if (msg.kind == MessageKind.video) {
+      return VideoBubble(key: ValueKey(sealed), state: state, msg: msg, width: width);
     }
     if (msg.kind != MessageKind.image) {
-      // Decrypted only when opened: videos and files can be big.
-      return _placeholder(done: true, onOpen: () => showError(context, _open(sealed)));
+      // Decrypted only when opened: files can be big.
+      return _placeholder(tc, done: true, onOpen: () => showError(context, _open(sealed)));
     }
     return ValueListenableBuilder(
       valueListenable: state.plaintext(sealed),
       builder: (context, path, _) => path == null
-          ? _placeholder()
+          ? _placeholder(tc)
           : ClipRRect(
               borderRadius: BorderRadius.circular(11),
-              child: InkWell(
-                onTap: () => showError(context, openExternal(path)),
-                child: Image.file(
-                  File(path),
-                  width: width,
-                  cacheWidth: (width * MediaQuery.devicePixelRatioOf(context)).round(),
-                  fit: BoxFit.cover,
-                  errorBuilder: (_, _, _) => _placeholder(broken: true),
+              child: Semantics(
+                image: true,
+                button: true,
+                label: 'Image ${msg.name ?? ''}, open',
+                child: InkWell(
+                  onTap: () => showImageViewer(context, path: path, name: msg.name ?? 'image'),
+                  child: Image.file(
+                    File(path),
+                    width: width,
+                    cacheWidth: (width * MediaQuery.devicePixelRatioOf(context)).round(),
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, _, _) => _placeholder(tc, broken: true),
+                  ),
                 ),
               ),
             ),
@@ -461,14 +1125,16 @@ class _MediaBubble extends StatelessWidget {
     return path == null ? 'Couldn\'t decrypt this file.' : openExternal(path);
   }
 
-  Widget _placeholder({double? progress, bool done = false, bool broken = false, VoidCallback? onOpen}) {
+  Widget _placeholder(TincanColors tc,
+      {double? progress, bool done = false, bool broken = false, VoidCallback? onOpen}) {
     final isVideo = msg.kind == MessageKind.video;
+    final onDark = tc.sidebarText;
     return ClipRRect(
       borderRadius: BorderRadius.circular(11),
       child: Container(
         width: width,
         height: width * 0.565,
-        color: isVideo ? const Color(0xFF23282F) : const Color(0xFFEFEDE8),
+        color: isVideo ? tc.videoBg : tc.mediaPlaceholder,
         child: Stack(alignment: Alignment.center, children: [
           if (progress != null)
             Positioned(
@@ -479,47 +1145,37 @@ class _MediaBubble extends StatelessWidget {
                   value: progress,
                   minHeight: 5,
                   borderRadius: BorderRadius.circular(999),
-                  color: Tc.accent,
-                  backgroundColor: isVideo ? const Color(0xFF3A4049) : Tc.border,
+                  color: tc.accent,
+                  backgroundColor: isVideo ? tc.sidebarCardBorder : tc.border,
+                  semanticsLabel: msg.outgoing ? 'Sending' : 'Receiving',
                 ),
                 const SizedBox(height: 8),
                 Text('${(progress * 100).round()}%',
-                    style: Tc.mono(11, isVideo ? Tc.sidebarText : Tc.inkMuted)),
+                    style: Tc.mono(11, isVideo ? onDark : tc.inkMuted)),
               ]),
             )
           else if (broken)
-            const Icon(Icons.broken_image_outlined, size: 28, color: Tc.inkFaint)
-          else if (isVideo && done)
-            IconButton(
-              onPressed: onOpen,
-              tooltip: 'Play video',
-              style: IconButton.styleFrom(
-                backgroundColor: const Color(0x8C0F0C09),
-                side: const BorderSide(color: Color(0xD9FFF7EE), width: 1.5),
-              ),
-              icon: const Icon(Icons.play_arrow_rounded, size: 28, color: Color(0xFFF4FBFA)),
-            )
+            Icon(Icons.broken_image_outlined, size: 28, color: tc.inkFaint)
           else if (done)
             IconButton(
               onPressed: onOpen,
               tooltip: 'Open file',
-              icon: const Icon(Icons.insert_drive_file_outlined, size: 32, color: Tc.inkMuted),
+              icon: Icon(Icons.insert_drive_file_outlined, size: 32, color: tc.inkMuted),
             )
           else
-            const Icon(Icons.hourglass_empty, size: 24, color: Tc.inkFaint),
+            Icon(Icons.hourglass_empty, size: 24, color: isVideo ? onDark : tc.inkFaint),
+          if (progress != null && canCancelTransfer(msg))
+            Positioned(
+              top: 2,
+              right: 2,
+              child: IconButton(
+                tooltip: 'Cancel transfer',
+                onPressed: () => state.cancelTransfer(convo.id, msg.id),
+                icon: Icon(Icons.close, size: 18, color: isVideo ? onDark : tc.inkMuted),
+              ),
+            ),
         ]),
       ),
     );
-  }
-}
-
-/// Opens a file with the platform's default handler; the error to
-/// show, if it couldn't.
-Future<String?> openExternal(String path) async {
-  const failed = 'No app could open this file.';
-  try {
-    return (await OpenFilex.open(path)).type == ResultType.done ? null : failed;
-  } catch (_) {
-    return failed;
   }
 }

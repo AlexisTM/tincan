@@ -5,6 +5,7 @@ package main
 
 /*
 #include <stdlib.h>
+#include <string.h>
 */
 import "C"
 
@@ -13,6 +14,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 	"unsafe"
@@ -40,9 +42,13 @@ func result(v map[string]any, err error) *C.char {
 	return C.CString(string(j))
 }
 
+// decodeArg parses a JSON arg, wiping the copy it parsed: some carry
+// secrets.
 func decodeArg[T any](s *C.char) (T, error) {
 	var v T
-	err := json.Unmarshal([]byte(C.GoString(s)), &v)
+	b := cBytes(s)
+	defer clear(b)
+	err := json.Unmarshal(b, &v)
 	return v, err
 }
 
@@ -162,18 +168,48 @@ func TincanDecryptMedia(src, dst *C.char) *C.char {
 	})
 }
 
+// cBytes copies a C string into bytes we can zero, unlike a Go string.
+func cBytes(s *C.char) []byte {
+	return C.GoBytes(unsafe.Pointer(s), C.int(C.strlen(s)))
+}
+
+// TincanExportAccount writes the account to dst, sealed under password
+// unless it is empty.
+//
 //export TincanExportAccount
-func TincanExportAccount(dst *C.char) *C.char {
+func TincanExportAccount(dst, password *C.char) *C.char {
+	pw := cBytes(password)
+	defer clear(pw)
 	return withVault(func(v *bridge.Vault) (map[string]any, error) {
-		return nil, v.ExportAccount(C.GoString(dst))
+		return nil, v.ExportAccount(C.GoString(dst), pw)
 	})
 }
 
 //export TincanImportAccount
-func TincanImportAccount(src *C.char) *C.char {
+func TincanImportAccount(src, password *C.char) *C.char {
+	pw := cBytes(password)
+	defer clear(pw)
 	return withVault(func(v *bridge.Vault) (map[string]any, error) {
-		return nil, v.ImportAccount(C.GoString(src))
+		return nil, v.ImportAccount(C.GoString(src), pw)
 	})
+}
+
+// TincanSealFile and TincanOpenFile password-wrap a file such as a
+// chat backup. Opening an unsealed file copies it, so an empty password
+// works until the error says "password required".
+//
+//export TincanSealFile
+func TincanSealFile(src, dst, password *C.char) *C.char {
+	pw := cBytes(password)
+	defer clear(pw)
+	return result(nil, bridge.SealFile(C.GoString(src), C.GoString(dst), pw))
+}
+
+//export TincanOpenFile
+func TincanOpenFile(src, dst, password *C.char) *C.char {
+	pw := cBytes(password)
+	defer clear(pw)
+	return result(nil, bridge.OpenFile(C.GoString(src), C.GoString(dst), pw))
 }
 
 // TincanImportMedia seals src into dir under a free variant of name.
@@ -195,8 +231,10 @@ func TincanStart(cfgJSON *C.char) *C.char {
 		StateDir    string `json:"stateDir"`
 		DownloadDir string `json:"downloadDir"`
 		Name        string `json:"name"`
-		DERPHost    string `json:"derpHost"`
+		Relay       string `json:"relay"`
+		DERPHost    string `json:"derpHost"` // before relay
 		DERPMapURL  string `json:"derpMapUrl"`
+		DirectOnly  bool   `json:"directOnly"`
 		Verbose     bool   `json:"verbose"`
 	}](cfgJSON)
 	if err != nil {
@@ -216,6 +254,9 @@ func TincanStart(cfgJSON *C.char) *C.char {
 		mu.Unlock()
 		return result(nil, errors.New("locked: unlock before starting"))
 	}
+	if cfg.Relay != "" {
+		cfg.DERPHost, cfg.DERPMapURL = bridge.ParseRelay(cfg.Relay)
+	}
 	bcfg := bridge.Config{
 		Vault:       v,
 		StateDir:    cfg.StateDir,
@@ -223,6 +264,7 @@ func TincanStart(cfgJSON *C.char) *C.char {
 		Name:        cfg.Name,
 		DERPHost:    cfg.DERPHost,
 		DERPMapURL:  cfg.DERPMapURL,
+		DirectOnly:  cfg.DirectOnly,
 	}
 	if cfg.Verbose {
 		bcfg.Logf = log.Printf
@@ -245,7 +287,6 @@ var (
 	pumpMu  sync.Mutex
 	pumpGen int
 	pumpCut = make(chan struct{})
-	carried []string
 )
 
 const staleEvent = "stale"
@@ -281,12 +322,6 @@ func nextEvent(gen int, d time.Duration) string {
 		pumpMu.Unlock()
 		return staleEvent
 	}
-	if len(carried) > 0 {
-		ev := carried[0]
-		carried = carried[1:]
-		pumpMu.Unlock()
-		return ev
-	}
 	cut := pumpCut
 	pumpMu.Unlock()
 
@@ -308,14 +343,14 @@ func nextEvent(gen int, d time.Duration) string {
 	defer pumpMu.Unlock()
 	if gen != pumpGen {
 		// Taken just as a newer pump attached; it gets it next.
-		carried = append(carried, ev)
+		m.Requeue(ev)
 		return staleEvent
 	}
 	return ev
 }
 
-// TincanConnect starts a dial and returns the peer's id at once; the
-// outcome arrives as peer-added or connect-error.
+// TincanConnect dials and waits for the outcome, returning the peer's
+// id or why it failed.
 //
 //export TincanConnect
 func TincanConnect(token *C.char) *C.char {
@@ -325,10 +360,34 @@ func TincanConnect(token *C.char) *C.char {
 	})
 }
 
+// TincanSendText sends a text; replyTo is the quoted message's id or "".
+//
 //export TincanSendText
-func TincanSendText(peer, id, body *C.char) *C.char {
+func TincanSendText(peer, id, body, replyTo *C.char) *C.char {
 	return withManager(func(m *bridge.Manager) (map[string]any, error) {
-		return nil, m.SendText(C.GoString(peer), C.GoString(id), C.GoString(body))
+		return nil, m.SendText(C.GoString(peer), C.GoString(id), C.GoString(body), C.GoString(replyTo))
+	})
+}
+
+// TincanSendReaction reacts to message ref; an empty emoji removes it.
+//
+//export TincanSendReaction
+func TincanSendReaction(peer, id, ref, emoji *C.char) *C.char {
+	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+		return nil, m.SendReaction(C.GoString(peer), C.GoString(id), C.GoString(ref), C.GoString(emoji))
+	})
+}
+
+// TincanSendTimer sets the disappearing timer, in decimal seconds.
+//
+//export TincanSendTimer
+func TincanSendTimer(peer, id, seconds *C.char) *C.char {
+	secs, err := strconv.Atoi(C.GoString(seconds))
+	if err != nil {
+		return result(nil, err)
+	}
+	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+		return nil, m.SendTimer(C.GoString(peer), C.GoString(id), secs)
 	})
 }
 
@@ -337,6 +396,25 @@ func TincanSendFile(peer, id, path *C.char) *C.char {
 	return withManager(func(m *bridge.Manager) (map[string]any, error) {
 		f, err := m.SendFile(C.GoString(peer), C.GoString(id), C.GoString(path))
 		return map[string]any{"name": f.Name, "kind": f.Kind, "size": f.Size, "path": f.Path}, err
+	})
+}
+
+// TincanCancelTransfer stops a file going either way.
+//
+//export TincanCancelTransfer
+func TincanCancelTransfer(peer, id *C.char) *C.char {
+	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+		return nil, m.CancelTransfer(C.GoString(peer), C.GoString(id))
+	})
+}
+
+// TincanSetDirectOnly takes "true" or "false" and applies at once.
+//
+//export TincanSetDirectOnly
+func TincanSetDirectOnly(on *C.char) *C.char {
+	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+		m.SetDirectOnly(C.GoString(on) == "true")
+		return nil, nil
 	})
 }
 
@@ -357,20 +435,15 @@ func TincanSetProfile(profileJSON *C.char) *C.char {
 	})
 }
 
-// TincanSetDERP, TincanRestart and TincanResetIdentity return the new
-// server-started event.
+// TincanSetRelay, TincanRestart and TincanResetIdentity return the
+// new server-started event. relay is a hostname, or an http(s) URL of a
+// relay map.
 //
-//export TincanSetDERP
-func TincanSetDERP(cfgJSON *C.char) *C.char {
-	c, err := decodeArg[struct {
-		Host   string `json:"host"`
-		MapURL string `json:"mapUrl"`
-	}](cfgJSON)
-	if err != nil {
-		return result(nil, err)
-	}
+//export TincanSetRelay
+func TincanSetRelay(relay *C.char) *C.char {
+	host, mapURL := bridge.ParseRelay(C.GoString(relay))
 	return withManager(func(m *bridge.Manager) (map[string]any, error) {
-		return m.SetDERP(c.Host, c.MapURL)
+		return m.SetRelay(host, mapURL)
 	})
 }
 
@@ -403,6 +476,48 @@ func TincanDisconnect(peer *C.char) *C.char {
 	return withManager(func(m *bridge.Manager) (map[string]any, error) {
 		return nil, m.Disconnect(C.GoString(peer))
 	})
+}
+
+//export TincanIgnore
+func TincanIgnore(peer *C.char) *C.char {
+	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+		return nil, m.Ignore(C.GoString(peer))
+	})
+}
+
+//export TincanSetVerified
+func TincanSetVerified(peer, verified *C.char) *C.char {
+	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+		return nil, m.SetVerified(C.GoString(peer), C.GoString(verified) == "true")
+	})
+}
+
+// TincanSetActivePeer marks the chat on screen; "" for none.
+//
+//export TincanSetActivePeer
+func TincanSetActivePeer(peer *C.char) *C.char {
+	return withManager(func(m *bridge.Manager) (map[string]any, error) {
+		m.SetActivePeer(C.GoString(peer))
+		return nil, nil
+	})
+}
+
+// TincanLock stops the transport and forgets the data key; unlock and
+// start again to come back.
+//
+//export TincanLock
+func TincanLock() *C.char {
+	mu.Lock()
+	m, v := mgr, vault
+	mgr, vault = nil, nil
+	mu.Unlock()
+	if m != nil {
+		m.Close()
+	}
+	if v != nil {
+		v.Lock()
+	}
+	return result(nil, nil)
 }
 
 //export TincanUnblock

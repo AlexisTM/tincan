@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 
 import '../theme.dart';
 
@@ -23,9 +24,10 @@ const _things = <(String, String)>[
 ];
 
 class EmojiPicker extends StatefulWidget {
-  const EmojiPicker({super.key, required this.onPick});
+  const EmojiPicker({super.key, required this.onPick, this.onClose});
 
   final ValueChanged<String> onPick;
+  final VoidCallback? onClose;
 
   @override
   State<EmojiPicker> createState() => _EmojiPickerState();
@@ -36,82 +38,93 @@ class _EmojiPickerState extends State<EmojiPicker> {
 
   @override
   Widget build(BuildContext context) {
+    final tc = TincanColors.of(context);
     final q = _query.trim().toLowerCase();
     final all = [..._smileys, ..._things];
     final results =
         q.isEmpty ? null : all.where((e) => e.$2.contains(q)).map((e) => e.$1).toList();
+    // Whole rows of touch-sized cells, as wide as the screen allows.
+    final cell = minTap;
+    final room = MediaQuery.sizeOf(context).width - 32 - 24;
+    final cols = (room / cell).floor().clamp(5, 8);
 
-    return Container(
-      width: 296,
-      padding: const EdgeInsets.all(12),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        border: Border.all(color: const Color(0xFFE6DCC9)),
-        borderRadius: BorderRadius.circular(14),
-        boxShadow: const [
-          BoxShadow(color: Color(0x24503C14), blurRadius: 32, offset: Offset(0, 12)),
-        ],
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          SizedBox(
-            height: 32,
-            child: TextField(
+    return CallbackShortcuts(
+      bindings: {
+        if (widget.onClose != null)
+          const SingleActivator(LogicalKeyboardKey.escape): widget.onClose!,
+      },
+      child: Container(
+        width: cols * cell + 24,
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: tc.field,
+          border: Border.all(color: tc.border),
+          borderRadius: BorderRadius.circular(14),
+          boxShadow: [BoxShadow(color: tc.shadow, blurRadius: 32, offset: const Offset(0, 12))],
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            TextField(
               onChanged: (v) => setState(() => _query = v),
-              style: const TextStyle(fontSize: 12),
+              style: TextStyle(fontSize: 13, color: tc.ink),
               decoration: InputDecoration(
                 hintText: 'Search emoji',
-                hintStyle: const TextStyle(fontSize: 12, color: Tc.inkFaint),
-                contentPadding: const EdgeInsets.symmetric(horizontal: 12),
+                hintStyle: TextStyle(fontSize: 13, color: tc.inkFaint),
+                isDense: true,
+                contentPadding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
                 filled: true,
-                fillColor: const Color(0xFFF3F1EC),
+                fillColor: tc.fieldFill,
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(10),
-                  borderSide: const BorderSide(color: Tc.border),
+                  borderSide: BorderSide(color: tc.border),
                 ),
               ),
             ),
-          ),
-          const SizedBox(height: 10),
-          if (results != null) ...[
-            _grid(results.isEmpty ? ['🤷'] : results),
-          ] else ...[
-            _label('FREQUENTLY USED'),
-            _grid(_frequent),
-            const SizedBox(height: 8),
-            _label('SMILEYS & PEOPLE'),
-            _grid([for (final e in _smileys) e.$1]),
-            const SizedBox(height: 8),
-            _label('GESTURES & THINGS'),
-            _grid([for (final e in _things) e.$1]),
+            const SizedBox(height: 10),
+            ConstrainedBox(
+              constraints: const BoxConstraints(maxHeight: 260),
+              child: SingleChildScrollView(
+                child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                  if (results != null) ...[
+                    _grid(results.isEmpty ? ['🤷'] : results, cell),
+                  ] else ...[
+                    _label('FREQUENTLY USED', tc),
+                    _grid(_frequent, cell),
+                    const SizedBox(height: 8),
+                    _label('SMILEYS & PEOPLE', tc),
+                    _grid([for (final e in _smileys) e.$1], cell),
+                    const SizedBox(height: 8),
+                    _label('GESTURES & THINGS', tc),
+                    _grid([for (final e in _things) e.$1], cell),
+                  ],
+                ]),
+              ),
+            ),
           ],
-        ],
+        ),
       ),
     );
   }
 
-  Widget _label(String text) => Padding(
+  Widget _label(String text, TincanColors tc) => Padding(
         padding: const EdgeInsets.only(bottom: 4),
         child: Text(text,
-            style: const TextStyle(
-                fontSize: 10.5,
-                fontWeight: FontWeight.w600,
-                letterSpacing: 1,
-                color: Tc.label)),
+            style: TextStyle(
+                fontSize: 10.5, fontWeight: FontWeight.w600, letterSpacing: 1, color: tc.label)),
       );
 
-  Widget _grid(List<String> emoji) => Wrap(
+  Widget _grid(List<String> emoji, double cell) => Wrap(
         children: [
           for (final e in emoji)
             InkWell(
               borderRadius: BorderRadius.circular(6),
               onTap: () => widget.onPick(e),
               child: SizedBox(
-                width: 34,
-                height: 30,
-                child: Center(child: Text(e, style: const TextStyle(fontSize: 17))),
+                width: cell,
+                height: cell,
+                child: Center(child: Text(e, style: const TextStyle(fontSize: 20))),
               ),
             ),
         ],

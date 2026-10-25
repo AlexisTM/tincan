@@ -5,7 +5,7 @@ import '../profile.dart';
 import '../theme.dart';
 
 /// Camera QR scanner, popping with the scanned text or null. Codes that
-/// aren't tincan addresses are ignored rather than failing a connect.
+/// aren't Tincan IDs are ignored rather than failing a connect.
 class QrScanScreen extends StatefulWidget {
   const QrScanScreen({super.key});
 
@@ -33,7 +33,7 @@ class _QrScanScreenState extends State<QrScanScreen> {
       final raw = code.rawValue;
       if (raw == null) continue;
       if (parseConnectInput(raw) == null) {
-        if (mounted) setState(() => _hint = 'That QR code isn\'t a Tincan address.');
+        if (mounted) setState(() => _hint = 'That QR code isn\'t a Tincan ID.');
         continue;
       }
       _done = true;
@@ -44,8 +44,10 @@ class _QrScanScreenState extends State<QrScanScreen> {
 
   @override
   Widget build(BuildContext context) {
+    // Over a camera feed, so always the dark palette.
+    const tc = TincanColors.dark;
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: tc.videoBg,
       body: Stack(children: [
         MobileScanner(
           controller: _controller,
@@ -58,7 +60,7 @@ class _QrScanScreenState extends State<QrScanScreen> {
                     ? 'Tincan needs camera access to scan codes. Allow it in system settings, or go back and use a QR image instead.'
                     : 'The camera couldn\'t start. Go back and use a QR image instead.',
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white70, fontSize: 13, height: 1.5),
+                style: TextStyle(color: tc.inkMuted, fontSize: 13, height: 1.5),
               ),
             ),
           ),
@@ -68,7 +70,7 @@ class _QrScanScreenState extends State<QrScanScreen> {
             width: 240,
             height: 240,
             decoration: BoxDecoration(
-              border: Border.all(color: Tc.accentInk.withValues(alpha: 0.9), width: 2),
+              border: Border.all(color: tc.ink.withValues(alpha: 0.9), width: 2),
               borderRadius: BorderRadius.circular(16),
             ),
           ),
@@ -78,21 +80,21 @@ class _QrScanScreenState extends State<QrScanScreen> {
             Row(children: [
               IconButton(
                 onPressed: () => Navigator.of(context).pop(),
-                icon: const Icon(Icons.arrow_back, color: Colors.white),
+                icon: Icon(Icons.arrow_back, color: tc.ink),
                 tooltip: 'Back',
               ),
-              const Expanded(
+              Expanded(
                 child: Text('Scan a Tincan QR',
-                    style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w600)),
+                    style: TextStyle(color: tc.ink, fontSize: 16, fontWeight: FontWeight.w600)),
               ),
               IconButton(
                 onPressed: () => _controller.toggleTorch(),
-                icon: const Icon(Icons.flashlight_on_outlined, color: Colors.white),
+                icon: Icon(Icons.flashlight_on_outlined, color: tc.ink),
                 tooltip: 'Torch',
               ),
               IconButton(
                 onPressed: () => _controller.switchCamera(),
-                icon: const Icon(Icons.cameraswitch_outlined, color: Colors.white),
+                icon: Icon(Icons.cameraswitch_outlined, color: tc.ink),
                 tooltip: 'Switch camera',
               ),
             ]),
@@ -103,7 +105,7 @@ class _QrScanScreenState extends State<QrScanScreen> {
                 _hint ?? 'Point the camera at the other phone\'s code.',
                 textAlign: TextAlign.center,
                 style: TextStyle(
-                    color: _hint == null ? Colors.white70 : const Color(0xFFF0B8B0), fontSize: 13),
+                    color: _hint == null ? tc.inkMuted : tc.dangerInk, fontSize: 13),
               ),
             ),
           ]),
