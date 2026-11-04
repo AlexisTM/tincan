@@ -43,7 +43,7 @@ help:
 	@echo "                             upload the next version code to Google Play"
 	@echo "make store                   Play Store images in tool/store/build/listing/"
 	@echo "make keystore                create the Play upload key and its android/key.properties (once)"
-	@echo "make release VERSION=x.y.z [DRY_RUN=1]"
+	@echo "make release VERSION=x.y.z [DRY_RUN=1] [PLAY_KEY=<key.json> | BUILD_NUMBER=n]"
 	@echo "                             build the aab, bump, changelog, tag vx.y.z, push, GitHub release"
 	@echo "make install_linux           build and install Tincan for this user"
 	@echo "make uninstall_linux         remove it again"
@@ -137,7 +137,7 @@ keystore:
 
 release:
 	@test -n "$(VERSION)" || { echo "Set VERSION=x.y.z" >&2; exit 1; }
-	DRY_RUN=$(DRY_RUN) tool/release.sh $(VERSION)
+	DRY_RUN=$(DRY_RUN) PLAY_KEY=$(PLAY_KEY) BUILD_NUMBER=$(BUILD_NUMBER) tool/release.sh $(VERSION)
 
 # Menu entry and icon; PREFIX defaults to ~/.local.
 install_linux: linux

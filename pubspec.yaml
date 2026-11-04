@@ -1,7 +1,7 @@
 name: tincan
 description: "Peer-to-peer encrypted chat with no accounts and no server."
 publish_to: 'none'
-version: 0.0.2+7
+version: 1.0.0+8
 
 environment:
   sdk: ^3.13.0

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Usage: tool/release.sh <version>             e.g. tool/release.sh 1.0.0
 #        DRY_RUN=1 tool/release.sh <version>   builds and prints notes, no commit/tag/push
+#        PLAY_KEY=<key.json>  takes the version code after Play's highest
+#        BUILD_NUMBER=<n>     forces the version code
 #
 # Builds the Tincan Play bundle, then bumps pubspec, prepends CHANGELOG.md,
 # tags v<version>, pushes and publishes a GitHub release with the bundle.
@@ -27,7 +29,14 @@ fi
 git rev-parse -q --verify "refs/tags/$tag" >/dev/null && die "tag $tag already exists"
 [[ -f android/key.properties ]] || die "android/key.properties missing (make keystore); Play rejects the debug key"
 
+# Play keeps every version code ever uploaded, including ones pubspec never saw.
 build_number=$(( $(sed -n 's/^version: .*+\([0-9]*\)$/\1/p' pubspec.yaml) + 1 ))
+if [[ -n "${PLAY_KEY:-}" ]]; then
+	played=$(tool/play_version_code.sh "$PLAY_KEY") || die "could not read version codes from Play"
+	(( played < build_number )) || build_number=$(( played + 1 ))
+fi
+build_number="${BUILD_NUMBER:-$build_number}"
+[[ "$build_number" =~ ^[1-9][0-9]*$ ]] || die "BUILD_NUMBER must be a positive integer"
 
 # Only v-tags count; the bare 0.0.x tags predate this script.
 prev=$(git describe --tags --abbrev=0 --match "v[0-9]*.[0-9]*.[0-9]*" 2>/dev/null || true)
