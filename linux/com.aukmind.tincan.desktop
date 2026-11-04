@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Tincan
+GenericName=Chat
+Comment=Peer-to-peer chat
+Exec=@EXEC@
+Icon=com.aukmind.tincan
+Terminal=false
+Categories=Network;Chat;InstantMessaging;
+Keywords=chat;p2p;messenger;tincan;
+StartupWMClass=com.aukmind.tincan
+SingleMainWindow=true
