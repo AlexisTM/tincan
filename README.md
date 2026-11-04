@@ -117,6 +117,19 @@ shell profile, build with:
 env -u ANDROID_SDK_HOME ANDROID_USER_HOME=$HOME/.android-user flutter build apk --split-per-abi
 ```
 
+### Store images
+
+```sh
+tool/store/store.sh
+```
+
+Renders the app with demo chats (`tool/store/screens_test.dart`, people
+and photos from `tool/store/demo_chats.dart`), then frames phone,
+tablet, feature graphic and icon images for Play in
+`tool/store/build/listing/` with `tool/store/make_listing.py`, which
+needs Chromium and Pillow. Emoji use the system's Noto Color Emoji when
+installed. The listing texts are in `tool/store/listing.txt`.
+
 ## Tests
 
 ```sh

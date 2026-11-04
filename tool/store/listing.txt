@@ -1,0 +1,26 @@
+Tincan: Private P2P Chat
+
+Private chat straight between devices. No account, no phone number, no ads.
+
+---
+
+Tincan is a chat app with no account and no server in the middle. Your phone talks straight to your friend's, encrypted end to end.
+
+Chat
+• Texts, emoji, photos and videos, with replies and reactions
+• Disappearing messages, per conversation
+• See whether a chat is direct or relayed
+
+Connect
+• Your Tincan ID is all anyone needs: no phone number, no email
+• Share it as a QR code, as text or as a contact card
+• First contact is a request: accept it, ignore it or block it for good
+• Compare safety numbers to know you are talking to the right person
+
+Stay private
+• Encrypted end to end, straight between devices when your networks allow it, otherwise through a relay that can't read your messages
+• Everything on your device is stored encrypted, unlocked with your password or your fingerprint
+• Make a new Tincan ID to cut off everyone holding the old one
+• Back up your account and chats to move to a new device
+
+Nothing to sign up for, no ads, no tracking, no analytics. On Android and Linux.
