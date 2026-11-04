@@ -128,7 +128,7 @@ Future<AppState> demo(Directory dir) async {
         status: MessageStatus.delivered,
         replyTo: l.reply,
         reactions: {
-          if (l.react case final r?) r: {l.out ? peer.id : 'me'},
+          ?l.react: {l.out ? peer.id : 'me'},
         },
       ));
       if (photo != null) state.plaintext(photo);

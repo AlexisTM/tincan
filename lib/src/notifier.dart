@@ -1,7 +1,8 @@
 import 'dart:io';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
+
+import 'log.dart';
 
 /// A tapped notification: a peer's messages, or their contact request.
 typedef NotificationTap = ({String peer, bool request});
@@ -70,7 +71,7 @@ class SystemNotifier implements Notifier {
         if (launch!.notificationResponse case final r?) _launch = _tapOf(r);
       }
     } catch (e) {
-      debugPrint('tincan: notifications unavailable: $e');
+      appLog('tincan: notifications unavailable: $e');
     }
   }
 
@@ -95,7 +96,7 @@ class SystemNotifier implements Notifier {
             ?.requestPermissions(alert: true, badge: true, sound: true);
       }
     } catch (e) {
-      debugPrint('tincan: notification permission: $e');
+      appLog('tincan: notification permission: $e');
     }
   }
 
@@ -117,7 +118,7 @@ class SystemNotifier implements Notifier {
     try {
       await _plugin.cancel(id: _idFor(peer));
     } catch (e) {
-      debugPrint('tincan: clearing a notification: $e');
+      appLog('tincan: clearing a notification: $e');
     }
   }
 
@@ -128,7 +129,7 @@ class SystemNotifier implements Notifier {
     try {
       await _plugin.cancelAll();
     } catch (e) {
-      debugPrint('tincan: clearing notifications: $e');
+      appLog('tincan: clearing notifications: $e');
     }
   }
 
@@ -160,7 +161,7 @@ class SystemNotifier implements Notifier {
         ),
       );
     } catch (e) {
-      debugPrint('tincan: showing a notification: $e');
+      appLog('tincan: showing a notification: $e');
     }
   }
 

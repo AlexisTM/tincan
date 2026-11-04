@@ -1,7 +1,7 @@
-import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import 'bridge.dart';
+import 'log.dart';
 
 /// How long to keep receiving after leaving the app; 0 is off.
 const backgroundPresets = [0, 15, 60];
@@ -77,7 +77,7 @@ class Settings {
       final json = await bridge.readState(p.join(stateDir, _file));
       return json is Map ? fromJson(json.cast<String, dynamic>()) : Settings();
     } catch (e) {
-      debugPrint('tincan: unreadable settings, using defaults: $e');
+      appLog('tincan: unreadable settings, using defaults: $e');
       return Settings();
     }
   }

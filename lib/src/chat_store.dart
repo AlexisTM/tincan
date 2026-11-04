@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 
 import 'bridge.dart';
+import 'log.dart';
 import 'models.dart';
 
 /// Chat history inside the encrypted store: one file per conversation
@@ -344,7 +345,7 @@ class ChatStore {
       await _quietly(_bridge.deleteState(_legacy));
     }
     if (failure != null) {
-      stderr.writeln('tincan: saving chat history: $failure');
+      appLog('tincan: saving chat history: $failure');
       _saveError = 'Chat history isn\'t saving: $failure';
       // What failed stays unsaved, so the retry picks it up.
       final delay = Duration(seconds: 2 << _failures.clamp(0, 5));

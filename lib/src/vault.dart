@@ -2,11 +2,11 @@ import 'dart:convert';
 import 'dart:io';
 import 'dart:math';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:local_auth/local_auth.dart';
 
 import 'bridge.dart';
+import 'log.dart';
 
 /// How the data key is protected.
 enum LockMode {
@@ -134,7 +134,7 @@ class VaultManager {
       await _storage.delete(key: _deviceKeyEntry);
       await _storage.delete(key: _stagedKeyEntry);
     } catch (e) {
-      debugPrint('tincan: clearing the device key: $e');
+      appLog('tincan: clearing the device key: $e');
     }
     final dir = Directory(_stateDir);
     if (await dir.exists()) await dir.delete(recursive: true);
@@ -152,7 +152,7 @@ class VaultManager {
         await _storage.delete(key: _deviceKeyEntry);
         await _storage.delete(key: _stagedKeyEntry);
       } catch (e) {
-        debugPrint('tincan: clearing the device key: $e');
+        appLog('tincan: clearing the device key: $e');
       }
     }
     return err;
@@ -177,7 +177,7 @@ class VaultManager {
         await _storage.delete(key: _stagedKeyEntry);
       } catch (e) {
         // Unlock still finds it staged.
-        debugPrint('tincan: promoting the new device key: $e');
+        appLog('tincan: promoting the new device key: $e');
       }
       return null;
     } catch (e) {
@@ -200,7 +200,7 @@ class VaultManager {
       // A device with no lock of any kind has nothing to check against,
       // so the keystore entry alone is the key. Anything else fails.
       if (!_noDeviceLock.contains(e.code)) throw 'Unlock failed: ${e.description ?? e.code.name}';
-      debugPrint('tincan: device auth unavailable: $e');
+      appLog('tincan: device auth unavailable: $e');
       return true;
     }
   }

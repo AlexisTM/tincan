@@ -2,9 +2,9 @@
 # Usage: tool/release.sh <version>             e.g. tool/release.sh 1.0.0
 #        DRY_RUN=1 tool/release.sh <version>   builds and prints notes, no commit/tag/push
 #
-# Builds Tincan for Linux and Android (split APKs and the Play bundle), then
-# bumps pubspec, prepends CHANGELOG.md, tags v<version>, pushes and publishes
-# a GitHub release. Builds run first so a broken build never leaves a pushed tag.
+# Builds the Tincan Play bundle, then bumps pubspec, prepends CHANGELOG.md,
+# tags v<version>, pushes and publishes a GitHub release with the bundle.
+# Builds run first so a broken build never leaves a pushed tag.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,7 +13,6 @@ version="${1:?usage: tool/release.sh <version>}"
 dry="${DRY_RUN:-}"
 die() { echo "release: $*" >&2; exit 1; }
 
-abis=(arm64-v8a armeabi-v7a x86_64)
 [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "version must be X.Y.Z"
 tag="v$version"
 
@@ -43,22 +42,14 @@ fi
 unset ANDROID_SDK_HOME
 export ANDROID_USER_HOME="${ANDROID_USER_HOME:-$HOME/.android-user}"
 
-case "$(uname -m)" in aarch64 | arm64) arch=arm64 ;; *) arch=x64 ;; esac
 flags=(--release --build-name="$version" --build-number="$build_number")
 flutter analyze
 flutter test
 gobridge/build-android.sh
-flutter build linux "${flags[@]}"
-flutter build apk --split-per-abi "${flags[@]}"
 flutter build appbundle "${flags[@]}"
 
 out="build/release/$tag"
 rm -rf "$out" && mkdir -p "$out"
-tar -C "build/linux/$arch/release" -czf "$out/$app-$version-linux-$arch.tar.gz" \
-	--transform "s,^bundle,$app-$version," bundle
-for abi in "${abis[@]}"; do
-	cp "build/app/outputs/flutter-apk/app-$abi-release.apk" "$out/$app-$version-android-$abi.apk"
-done
 cp build/app/outputs/bundle/release/app-release.aab "$out/$app-$version-android.aab"
 (cd "$out" && sha256sum -- * > SHA256SUMS)
 

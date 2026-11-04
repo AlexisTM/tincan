@@ -44,7 +44,7 @@ help:
 	@echo "make store                   Play Store images in tool/store/build/listing/"
 	@echo "make keystore                create the Play upload key and its android/key.properties (once)"
 	@echo "make release VERSION=x.y.z [DRY_RUN=1]"
-	@echo "                             build, bump, changelog, tag vx.y.z, push, GitHub release"
+	@echo "                             build the aab, bump, changelog, tag vx.y.z, push, GitHub release"
 	@echo "make install_linux           build and install Tincan for this user"
 	@echo "make uninstall_linux         remove it again"
 	@echo "make deps                    flutter pub get"

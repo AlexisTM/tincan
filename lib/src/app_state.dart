@@ -16,6 +16,7 @@ import 'bridge.dart';
 import 'chat_store.dart';
 import 'files.dart';
 import 'images.dart';
+import 'log.dart';
 import 'models.dart';
 import 'notifier.dart';
 import 'profile.dart';
@@ -112,7 +113,7 @@ class AppState extends ChangeNotifier {
       if (list == null || list.isEmpty) return;
       await _bridge.setNetInterfaces(jsonEncode(list));
     } catch (e) {
-      stderr.writeln('tincan: feeding interfaces: $e');
+      appLog('tincan: feeding interfaces: $e');
     }
   }
 
@@ -164,7 +165,7 @@ class AppState extends ChangeNotifier {
       await _bridge.decryptMedia(sealed, dst);
       return dst;
     } catch (e) {
-      debugPrint('tincan: decrypting $sealed: $e');
+      appLog('tincan: decrypting $sealed: $e');
       return null;
     }
   }
@@ -181,7 +182,7 @@ class AppState extends ChangeNotifier {
       try {
         await _freshCache(dir);
       } catch (e) {
-        debugPrint('tincan: wiping the cache: $e');
+        appLog('tincan: wiping the cache: $e');
       }
     }
     // A decrypt that landed meanwhile wrote into the old dir.
@@ -278,7 +279,7 @@ class AppState extends ChangeNotifier {
       if (_notifier.takeLaunchTap() case final tap?) _openFromNotification(tap);
     } catch (e, st) {
       _transportError = 'Transport failed to start: $e';
-      debugPrint('tincan: start failed: $e\n$st');
+      appLog('tincan: start failed: $e\n$st');
     }
     starting = false;
     notifyListeners();
@@ -356,12 +357,12 @@ class AppState extends ChangeNotifier {
     } catch (e, st) {
       _transportError = 'Transport failed to start: $e';
       // Only print reaches logcat on Android.
-      debugPrint('tincan: transport start failed: $e\n$st');
+      appLog('tincan: transport start failed: $e\n$st');
     }
     try {
       await _reloadBlocked();
     } catch (e) {
-      debugPrint('tincan: listing blocked peers: $e');
+      appLog('tincan: listing blocked peers: $e');
     }
     notifyListeners();
   }
@@ -392,7 +393,7 @@ class AppState extends ChangeNotifier {
     try {
       await _bridge.stopTransport();
     } catch (e) {
-      debugPrint('tincan: stopping the transport: $e');
+      appLog('tincan: stopping the transport: $e');
     }
     final store = _store;
     await store?.flush();
@@ -402,7 +403,7 @@ class AppState extends ChangeNotifier {
     try {
       await _bridge.lock();
     } catch (e) {
-      debugPrint('tincan: locking: $e');
+      appLog('tincan: locking: $e');
     }
     locked = true;
     _locking = false;
@@ -488,7 +489,7 @@ class AppState extends ChangeNotifier {
     try {
       if (_stateDir case final dir?) await settings.save(_bridge, dir);
     } catch (e) {
-      debugPrint('tincan: saving settings: $e');
+      appLog('tincan: saving settings: $e');
     }
   }
 
@@ -827,7 +828,7 @@ class AppState extends ChangeNotifier {
           await _bridge.setVerified(peer, true);
           convo.verified = true;
         } on BridgeException catch (e) {
-          debugPrint('tincan: marking verified: $e');
+          appLog('tincan: marking verified: $e');
         }
       }
       convo.changed();
@@ -949,7 +950,7 @@ class AppState extends ChangeNotifier {
     try {
       await _bridge.cancelTransfer(peerId, msgId);
     } catch (e) {
-      debugPrint('tincan: cancelling a transfer: $e');
+      appLog('tincan: cancelling a transfer: $e');
     }
     _markCancelled(msg);
     convo.changed();
@@ -995,7 +996,7 @@ class AppState extends ChangeNotifier {
       }
       _sources.remove(msg.id);
     } catch (e) {
-      debugPrint('tincan: keeping a file: $e');
+      appLog('tincan: keeping a file: $e');
       if (msg.path == null && msg.status == MessageStatus.queued) msg.status = MessageStatus.failed;
     }
     convo.changed();
@@ -1026,7 +1027,7 @@ class AppState extends ChangeNotifier {
         convo.changed();
         _store?.scheduleSave();
       } catch (e) {
-        debugPrint('tincan: sending timer: $e');
+        appLog('tincan: sending timer: $e');
         // Retried next drain; it mustn't hold up the messages.
         if (_offline(e) || !convo.connected) return;
       }
@@ -1081,7 +1082,7 @@ class AppState extends ChangeNotifier {
       try {
         await _bridge.sendReaction(peerId, newMessageId(), ref, emoji);
       } catch (e) {
-        debugPrint('tincan: sending a reaction: $e');
+        appLog('tincan: sending a reaction: $e');
         if (_offline(e) || !convo.connected) return;
       }
       if (convo.pendingReactions[ref] == emoji) convo.pendingReactions.remove(ref);
@@ -1207,7 +1208,7 @@ class AppState extends ChangeNotifier {
         final started = ev['type'] == 'server-started';
         if (started) {
           _transportError = null;
-          stdout.writeln('tincan: listening at ${ev['address']}');
+          appLog('tincan: listening at ${ev['address']}');
         }
         selfAddress = ev['address'] as String? ?? selfAddress;
         if (ev['name'] case final String n when n.isNotEmpty) selfName = n;

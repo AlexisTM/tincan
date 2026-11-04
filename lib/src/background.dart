@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import 'log.dart';
 import 'settings.dart';
 
 /// Starts and stops the Android foreground service as the app leaves
@@ -37,7 +38,7 @@ class BackgroundController with WidgetsBindingObserver {
       WidgetsBinding.instance.removeObserver(this);
       _observing = false;
     }
-    _stopService();
+    if (supported) _stopService();
   }
 
   /// Applies a changed setting immediately.
@@ -86,19 +87,19 @@ class BackgroundController with WidgetsBindingObserver {
 
   Future<void> _startService(int stopAfterMinutes) async {
     try {
-      debugPrint('tincan: background service on (stop after ${stopAfterMinutes}m)');
+      appLog('tincan: background service on (stop after ${stopAfterMinutes}m)');
       await _channel.invokeMethod('start', {'stopAfterMinutes': stopAfterMinutes});
     } catch (e) {
-      debugPrint('tincan: starting background service: $e');
+      appLog('tincan: starting background service: $e');
     }
   }
 
   Future<void> _stopService() async {
     try {
-      debugPrint('tincan: background service off');
+      appLog('tincan: background service off');
       await _channel.invokeMethod('stop');
     } catch (e) {
-      debugPrint('tincan: stopping background service: $e');
+      appLog('tincan: stopping background service: $e');
     }
   }
 }
